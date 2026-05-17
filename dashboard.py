@@ -3,10 +3,13 @@ dashboard.py — Step 6
 Three-page Streamlit dashboard.
 Run:  streamlit run dashboard.py
 """
+import re
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from datetime import timezone
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -32,6 +35,8 @@ except Exception as e:
 OPT_CSV    = Path("optimisation_results.csv")
 TRADE_CSV  = Path("trade_log.csv")
 EQUITY_CSV = Path("equity_curve.csv")
+STATE_JSON = Path("state.json")
+LOG_FILE   = Path("trading_log.txt")
 
 PARAM_COLS = [
     "SWING_N", "MIN_SWING_SIZE", "MIN_SWING_INCR",
@@ -65,6 +70,93 @@ def load_equity():
         if c in df.columns:
             df[c] = pd.to_datetime(df[c])
     return df
+
+def load_state(refresh_key: int = 0) -> dict | None:
+    """Load state.json, refresh_key busts cache."""
+    _ = refresh_key  # used only as cache-buster via caller
+    if not STATE_JSON.exists():
+        return None
+    try:
+        with STATE_JSON.open() as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def load_log_lines(refresh_key: int = 0) -> list[str]:
+    """Load all lines from trading_log.txt."""
+    _ = refresh_key
+    if not LOG_FILE.exists():
+        return []
+    try:
+        return LOG_FILE.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+
+
+def parse_paper_trades(lines: list[str]) -> pd.DataFrame:
+    """
+    Parse [PAPER] events from trading_log.txt into a trade DataFrame.
+    Matches open lines then close lines by order of occurrence.
+    """
+    RE_TS   = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC")
+    RE_OPEN = re.compile(
+        r"\[PAPER\] Position opened: (LONG|SHORT) @ ([\d.]+)"
+        r"\s+SL=([\d.]+)\s+TP=([\d.]+)"
+    )
+    RE_CLOSE = re.compile(
+        r"\[PAPER\] Trade closed \(([^)]+)\): exit=([\d.]+)"
+        r"\s+gross=([\d.]+)pip\s+net=([-\d.]+)pip"
+        r"\s+P&L=\$?([-\d.]+)\s+balance=\$?([\d.]+)"
+    )
+    RE_LIMIT = re.compile(
+        r"\[PAPER\] Limit order placed: (LONG|SHORT) limit=([\d.]+)"
+        r"\s+sl=([\d.]+)\s+tp=([\d.]+)"
+    )
+
+    opens: list[dict]  = []
+    closes: list[dict] = []
+    pending: dict | None = None
+
+    for line in lines:
+        ts_m = RE_TS.match(line)
+        ts   = ts_m.group(1) if ts_m else None
+
+        if mo := RE_OPEN.search(line):
+            pending = dict(
+                open_ts=ts,
+                direction=mo.group(1),
+                entry_price=float(mo.group(2)),
+                stop_price=float(mo.group(3)),
+                tp_price=float(mo.group(4)),
+            )
+        elif RE_LIMIT.search(line) and pending is None:
+            # record limit placement but don't count as open yet
+            pass
+        elif (mc := RE_CLOSE.search(line)) and pending is not None:
+            row = {**pending,
+                   "close_ts":   ts,
+                   "exit_reason": mc.group(1),
+                   "exit_price":  float(mc.group(2)),
+                   "gross_pips":  float(mc.group(3)),
+                   "net_pips":    float(mc.group(4)),
+                   "pnl_usd":     float(mc.group(5)),
+                   "balance":     float(mc.group(6)),
+                   }
+            closes.append(row)
+            pending = None
+
+    records = closes
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    for col in ("open_ts", "close_ts"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    df.insert(0, "trade_#", range(1, len(df) + 1))
+    return df
+
 
 @st.cache_data
 def fetch_live(refresh_key: int):
@@ -460,12 +552,265 @@ def page_explorer() -> None:
     )
 
 
+# ── Page 4: Paper Trading Monitor ────────────────────────────────────────────
+
+def page_paper() -> None:
+    st.title("📄 Paper Trading Monitor")
+
+    # ── Refresh controls ──────────────────────────────────────────────────────
+    if "paper_refresh_key" not in st.session_state:
+        st.session_state.paper_refresh_key = 0
+
+    hdr_l, hdr_r = st.columns([5, 1])
+    with hdr_r:
+        if st.button("🔄 Refresh Now"):
+            st.session_state.paper_refresh_key += 1
+
+    rk    = st.session_state.paper_refresh_key
+    state = load_state(rk)
+    lines = load_log_lines(rk)
+
+    # ── Status banner ─────────────────────────────────────────────────────────
+    st.warning(
+        "⚠  **PAPER MODE** — All orders are simulated. "
+        "No real positions are opened in MetaTrader 5."
+    )
+
+    now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    b1, b2, b3 = st.columns(3)
+    if state:
+        pm = state.get("paper_mode", True)
+        b1.metric("Mode",       "📄 PAPER" if pm else "🔴 LIVE")
+        b2.metric("Last Update", now_utc)
+        cb = state.get("circuit_breaker_active", False)
+        b3.metric("Circuit Breaker", "🔴 TRIGGERED" if cb else "🟢 OK")
+    else:
+        b1.info("No `state.json` found — start `live_trader.py` first.")
+        b2.metric("Last Update", now_utc)
+        b3.metric("Circuit Breaker", "—")
+
+    st.divider()
+
+    # ── Section 1: Current State ───────────────────────────────────────────────
+    st.subheader("1 · Current State  (`state.json`)")
+    if not state:
+        st.info("state.json not found. Live trader has not been started yet.")
+    else:
+        s1, s2, s3, s4 = st.columns(4)
+
+        bal = state.get("session_start_balance") or state.get("balance", 0)
+        s1.metric("Session Start Balance", f"${bal:,.2f}")
+
+        # derive peak balance from trade history
+        hist = state.get("trade_history", [])
+        peak = bal
+        if hist:
+            balances = [t.get("balance", bal) for t in hist if "balance" in t]
+            if balances:
+                peak = max(balances)
+        s2.metric("Peak Balance", f"${peak:,.2f}")
+
+        dd_pct = state.get("session_drawdown_pct", 0.0)
+        s3.metric("Session Drawdown", f"{dd_pct:.2f}%",
+                  delta_color="inverse" if dd_pct > 0 else "normal")
+
+        open_trade = state.get("open_trade")
+        pending_ord = state.get("pending_order")
+        if open_trade:
+            s4.metric("Position", f"OPEN {open_trade.get('direction','').upper()}")
+        elif pending_ord:
+            s4.metric("Position", f"PENDING {pending_ord.get('direction','').upper()}")
+        else:
+            s4.metric("Position", "FLAT")
+
+        # Open trade detail
+        if open_trade:
+            st.markdown("**Open Position**")
+            oc1, oc2, oc3, oc4 = st.columns(4)
+            oc1.metric("Direction",  open_trade.get("direction", "—").upper())
+            oc2.metric("Entry",      f"{open_trade.get('entry_price', 0):.5f}")
+            oc3.metric("Stop",       f"{open_trade.get('stop_price', 0):.5f}")
+            oc4.metric("TP",         f"{open_trade.get('tp_price', 0):.5f}")
+
+        if pending_ord:
+            st.markdown("**Pending Limit Order**")
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            pc1.metric("Direction",    pending_ord.get("direction", "—").upper())
+            pc2.metric("Limit Price",  f"{pending_ord.get('limit_price', 0):.5f}")
+            pc3.metric("Stop",         f"{pending_ord.get('stop_price', 0):.5f}")
+            pc4.metric("TP",           f"{pending_ord.get('tp_price', 0):.5f}")
+
+    st.divider()
+
+    # ── Section 2: Paper Trade Log ─────────────────────────────────────────────
+    st.subheader("2 · Paper Trade Log  (parsed from `trading_log.txt`)")
+    paper_trades = parse_paper_trades(lines)
+
+    if paper_trades.empty:
+        st.info("No completed paper trades found in the log yet.")
+    else:
+        show_cols = [c for c in [
+            "trade_#", "direction", "open_ts", "close_ts",
+            "entry_price", "exit_price", "exit_reason",
+            "gross_pips", "net_pips", "pnl_usd", "balance",
+        ] if c in paper_trades.columns]
+        disp = paper_trades[show_cols].copy()
+        if "gross_pips" in disp.columns:
+            disp["gross_pips"] = disp["gross_pips"].round(1)
+        if "net_pips" in disp.columns:
+            disp["net_pips"] = disp["net_pips"].round(1)
+        st.dataframe(disp, use_container_width=True, height=320)
+
+        wins  = (paper_trades["net_pips"] > 0).sum()
+        total = len(paper_trades)
+        wr    = wins / total * 100 if total else 0
+        tot_pnl = paper_trades["pnl_usd"].sum()
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("Paper Trades",  total)
+        sm2.metric("Win Rate",      f"{wr:.1f}%")
+        sm3.metric("Total P&L",     f"${tot_pnl:+,.2f}")
+        sm4.metric("Avg Net Pips",  f"{paper_trades['net_pips'].mean():.1f}")
+
+    st.divider()
+
+    # ── Section 3: Paper Equity Curve ─────────────────────────────────────────
+    st.subheader("3 · Paper Equity Curve")
+    if paper_trades.empty:
+        st.info("No trades to plot yet.")
+    else:
+        eq_fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.70, 0.30], vertical_spacing=0.05,
+            subplot_titles=["Paper Balance (USD)", "Trade P&L (USD)"],
+        )
+        t_idx = paper_trades["trade_#"].values
+        bal_v = paper_trades["balance"].values
+        pnl_v = paper_trades["pnl_usd"].values
+        colors = ["#26c26e" if p >= 0 else "#ef5350" for p in pnl_v]
+
+        eq_fig.add_trace(
+            go.Scatter(x=t_idx, y=bal_v, name="Balance",
+                       line=dict(color="#4da6ff", width=2)),
+            row=1, col=1,
+        )
+        eq_fig.add_trace(
+            go.Bar(x=t_idx, y=pnl_v, name="P&L", marker_color=colors),
+            row=2, col=1,
+        )
+        eq_fig.update_layout(height=460, template="plotly_dark", showlegend=True,
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        eq_fig.update_xaxes(title_text="Trade #", row=2)
+        eq_fig.update_yaxes(title_text="USD", row=1)
+        eq_fig.update_yaxes(title_text="USD", row=2)
+        st.plotly_chart(eq_fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 4: Paper vs Backtest Comparison ────────────────────────────────
+    st.subheader("4 · Paper vs Backtest Comparison")
+    opt_df = load_opt()
+    if opt_df is None:
+        st.info("No optimisation_results.csv found — run the backtest first.")
+    elif paper_trades.empty:
+        st.info("No completed paper trades to compare yet.")
+    else:
+        best_row = opt_df.iloc[0]
+        metrics = [
+            ("Win Rate %",   "win_rate_pct",     "%"),
+            ("Expectancy R", "expectancy_net_r",  " R"),
+            ("Max DD %",     "max_drawdown_pct",  "%"),
+        ]
+
+        # Paper stats
+        p_wr  = wr  # computed above
+        p_exp = paper_trades["net_pips"].mean() / 10.0  # approx R using 10pip/R
+        neg_trades = paper_trades[paper_trades["balance"] < paper_trades["balance"].iloc[0]]
+        running_peak = paper_trades["balance"].cummax()
+        paper_dd = ((running_peak - paper_trades["balance"]) / running_peak * 100).max()
+
+        paper_stats  = {"win_rate_pct": p_wr, "expectancy_net_r": p_exp, "max_drawdown_pct": paper_dd}
+        bt_oos_stats = {
+            "win_rate_pct":     best_row.get("OOS_win_rate_pct", None),
+            "expectancy_net_r": best_row.get("OOS_expectancy_net_r", None),
+            "max_drawdown_pct": best_row.get("OOS_max_drawdown_pct", None),
+        }
+
+        cmp_l, cmp_r = st.columns(2)
+        with cmp_l:
+            st.markdown("**Backtest OOS  (best combo)**")
+            for label, key, unit in metrics:
+                v = bt_oos_stats.get(key)
+                st.metric(label, f"{v:.2f}{unit}" if v is not None else "—")
+        with cmp_r:
+            st.markdown("**Paper Trading (live)**")
+            for label, key, unit in metrics:
+                pv = paper_stats.get(key)
+                bv = bt_oos_stats.get(key)
+                delta = None
+                if pv is not None and bv is not None:
+                    try:
+                        delta = round(float(pv) - float(bv), 2)
+                    except Exception:
+                        pass
+                st.metric(label, f"{pv:.2f}{unit}" if pv is not None else "—", delta=delta)
+
+    st.divider()
+
+    # ── Section 5: Last 30 Log Lines ──────────────────────────────────────────
+    st.subheader("5 · Last 30 Log Lines  (`trading_log.txt`)")
+    if not lines:
+        st.info("trading_log.txt not found or empty.")
+    else:
+        last30 = "\n".join(lines[-30:])
+        st.code(last30, language=None)
+
+    st.divider()
+
+    # ── Go Live Checklist ─────────────────────────────────────────────────────
+    st.subheader("Go-Live Checklist")
+    st.markdown(
+        "Review every item before switching `paper_mode` to `false` in `config.json`."
+    )
+    checks = [
+        "Paper mode has run for at least 2 weeks with ≥ 10 completed trades",
+        "Paper win rate is within ±10% of OOS backtest win rate",
+        "Paper expectancy is positive (> 0 R)",
+        "Paper max drawdown is below `max_drawdown_pct` threshold in config.json",
+        "MT5 account has been verified as connected (check Page 2)",
+        "Risk per trade (`risk_per_trade = 0.005`) confirmed correct for live account size",
+        "Circuit breaker threshold (`max_drawdown_pct`) reviewed and accepted",
+    ]
+    all_checked = all(
+        st.checkbox(item, key=f"chk_{i}")
+        for i, item in enumerate(checks)
+    )
+    if all_checked:
+        st.success(
+            "✅ All items checked. You may set `paper_mode: false` in config.json "
+            "and restart with `--live-confirmed` flag."
+        )
+    else:
+        st.info("Complete all checklist items above before going live.")
+
+    # Auto-refresh every 60 seconds
+    st.caption(f"Auto-refreshing every 60 s · Last render: {now_utc}")
+    import time as _time
+    _time.sleep(0)  # yield to allow st.rerun scheduling
+    if "paper_auto_ts" not in st.session_state:
+        st.session_state.paper_auto_ts = _time.time()
+    if _time.time() - st.session_state.paper_auto_ts >= 60:
+        st.session_state.paper_auto_ts = _time.time()
+        st.session_state.paper_refresh_key += 1
+        st.rerun()
+
+
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 PAGES = {
-    "📊 Backtest Results":    page_backtest,
-    "📡 Live Regime Monitor": page_live,
-    "🔍 Parameter Explorer":  page_explorer,
+    "📊 Backtest Results":      page_backtest,
+    "📡 Live Regime Monitor":   page_live,
+    "🔍 Parameter Explorer":    page_explorer,
+    "📄 Paper Trading Monitor": page_paper,
 }
 
 with st.sidebar:
