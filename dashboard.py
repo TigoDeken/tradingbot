@@ -1,0 +1,480 @@
+"""
+dashboard.py — Step 6
+Three-page Streamlit dashboard.
+Run:  streamlit run dashboard.py
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+
+st.set_page_config(page_title="EURUSD Algo Trader", page_icon="📈", layout="wide")
+
+# ── Optional pipeline imports ─────────────────────────────────────────────────
+PIPELINE_OK = False
+_import_err  = ""
+try:
+    from data_pipeline  import get_data
+    from swing_engine   import build_swings, PIP
+    from trend_engine   import classify_trend
+    from trade_engine   import (_compute_setup, _confirmed_at,
+                                 _pullback_depths, run_trades)
+    from backtest_engine import build_equity, compute_metrics, _split_date
+    PIPELINE_OK = True
+except Exception as e:
+    _import_err = str(e)
+
+# ── Paths & constants ─────────────────────────────────────────────────────────
+OPT_CSV    = Path("optimisation_results.csv")
+TRADE_CSV  = Path("trade_log.csv")
+EQUITY_CSV = Path("equity_curve.csv")
+
+PARAM_COLS = [
+    "SWING_N", "MIN_SWING_SIZE", "MIN_SWING_INCR",
+    "MIN_TREND_SIZE", "TREND_RANGE_RATIO",
+    "PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE",
+]
+
+
+# ── Cached loaders ────────────────────────────────────────────────────────────
+
+@st.cache_data
+def load_opt():
+    return pd.read_csv(OPT_CSV) if OPT_CSV.exists() else None
+
+@st.cache_data
+def load_trades():
+    if not TRADE_CSV.exists():
+        return None
+    df = pd.read_csv(TRADE_CSV)
+    for c in ("entry_date", "exit_date"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c])
+    return df
+
+@st.cache_data
+def load_equity():
+    if not EQUITY_CSV.exists():
+        return None
+    df = pd.read_csv(EQUITY_CSV)
+    for c in ("entry_date", "exit_date"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c])
+    return df
+
+@st.cache_data
+def fetch_live(refresh_key: int):
+    """MT5 fetch — refresh_key busts the cache on demand."""
+    try:
+        return get_data(), None
+    except Exception as e:
+        return None, str(e)
+
+
+# ── Chart helpers ─────────────────────────────────────────────────────────────
+
+def equity_fig(eq: pd.DataFrame, split_n: int = None) -> go.Figure:
+    x  = np.arange(1, len(eq) + 1)
+    b  = eq["balance"].values
+    dd = eq["drawdown_pct"].values
+    mi = int(dd.argmin())
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.04,
+        subplot_titles=["Account Balance (USD)", "Drawdown (%)"],
+    )
+    fig.add_trace(go.Scatter(x=x, y=b, name="Balance",
+                              line=dict(color="#4da6ff", width=1.8)), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=[x[mi]], y=[b[mi]], mode="markers", name=f"Max DD {dd[mi]:.1f}%",
+        marker=dict(color="red", size=14, symbol="x-thin-open",
+                    line=dict(width=3, color="red")),
+    ), row=1, col=1)
+    if split_n:
+        for r in (1, 2):
+            fig.add_vline(x=split_n + 0.5, line=dict(color="orange", dash="dash", width=1.2),
+                           row=r, col=1)
+        fig.add_annotation(x=split_n, y=float(b.max()), text="IS | OOS",
+                            showarrow=False, font=dict(color="orange", size=11))
+    fig.add_trace(go.Scatter(x=x, y=dd, name="Drawdown", fill="tozeroy",
+                              line=dict(color="rgba(255,80,80,0.9)", width=0.5),
+                              fillcolor="rgba(255,80,80,0.25)"), row=2, col=1)
+    fig.update_layout(height=480, template="plotly_dark", showlegend=True,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_xaxes(title_text="Trade #", row=2)
+    fig.update_yaxes(title_text="USD", row=1)
+    fig.update_yaxes(title_text="%",   row=2)
+    return fig
+
+
+def _metric_row(m: dict, prefix: str = "") -> None:
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric(f"{prefix}Trades",
+              int(m["total_trades"]) if "total_trades" in m else "—")
+    c2.metric(f"{prefix}Win Rate",
+              f"{m['win_rate_pct']:.1f}%" if "win_rate_pct" in m else "—")
+    c3.metric(f"{prefix}Expectancy",
+              f"{m['expectancy_net_r']:.2f} R" if "expectancy_net_r" in m else "—")
+    c4.metric(f"{prefix}Max DD",
+              f"{m['max_drawdown_pct']:.1f}%" if "max_drawdown_pct" in m else "—")
+    dur = m.get("avg_duration_hours")
+    c5.metric(f"{prefix}Avg Duration",
+              f"{dur:.0f} h" if dur is not None else "—")
+    tpm = m.get("trades_per_month")
+    c6.metric(f"{prefix}Trades/Month",
+              f"{tpm:.1f}" if tpm is not None else "—")
+
+
+# ── Page 1: Backtest Results ──────────────────────────────────────────────────
+
+def page_backtest() -> None:
+    st.title("📊 Backtest Results")
+
+    opt_df   = load_opt()
+    trade_df = load_trades()
+    eq_df    = load_equity()
+
+    missing = (["`optimisation_results.csv`"] if opt_df   is None else [] +
+               ["`trade_log.csv`"]            if trade_df is None else [] +
+               ["`equity_curve.csv`"]         if eq_df    is None else [])
+    if missing:
+        st.error(f"Missing: {', '.join(missing)}. Run `python backtest_engine.py` first.")
+        return
+
+    # ── Combo selector ────────────────────────────────────────────────────────
+    def _label(row):
+        return (
+            f"#{int(row.name)+1}  "
+            f"N={row['SWING_N']} SZ={row['MIN_SWING_SIZE']} INC={row['MIN_SWING_INCR']} "
+            f"TR={int(row['MIN_TREND_SIZE'])} RR={row['TREND_RANGE_RATIO']} "
+            f"LB={int(row['PULLBACK_LOOKBACK'])} SB={int(row['STOP_BUFFER'])} TP={row['TP_MODE']}"
+            f"  |  IS exp={row['IS_expectancy_net_r']:.3f}R"
+        )
+
+    labels  = [_label(row) for _, row in opt_df.iterrows()]
+    sel_idx = st.selectbox("Parameter combination", range(len(labels)),
+                            format_func=lambda i: labels[i])
+    sel     = opt_df.iloc[sel_idx]
+
+    is_m  = {k[3:]: sel[k] for k in opt_df.columns if k.startswith("IS_")}
+    oos_m = {k[4:]: sel[k] for k in opt_df.columns if k.startswith("OOS_")}
+
+    # ── Metric rows ───────────────────────────────────────────────────────────
+    st.subheader("In-Sample  (first 70% by date)")
+    _metric_row(is_m)
+    st.subheader("Out-of-Sample  (last 30% by date)")
+    _metric_row(oos_m)
+
+    # ── IS vs OOS side by side with delta ─────────────────────────────────────
+    st.subheader("Comparison")
+    compare = [
+        ("total_trades",     "Total Trades",    ""),
+        ("win_rate_pct",     "Win Rate",        "%"),
+        ("expectancy_net_r", "Expectancy",      " R"),
+        ("net_r",            "Total Net R",     " R"),
+        ("max_drawdown_pct", "Max Drawdown",    "%"),
+        ("trades_per_month", "Trades / Month",  ""),
+    ]
+    col_is, col_oos = st.columns(2)
+    with col_is:
+        st.markdown("**In-Sample**")
+        for key, label, unit in compare:
+            v = is_m.get(key)
+            st.metric(label, f"{v}{unit}" if v is not None else "—")
+    with col_oos:
+        st.markdown("**Out-of-Sample**")
+        for key, label, unit in compare:
+            iv  = is_m.get(key)
+            ov  = oos_m.get(key)
+            delta = None
+            if iv is not None and ov is not None:
+                try:
+                    delta = round(float(ov) - float(iv), 3)
+                except Exception:
+                    pass
+            st.metric(label, f"{ov}{unit}" if ov is not None else "—", delta=delta)
+
+    # ── Equity curve ──────────────────────────────────────────────────────────
+    st.subheader("Equity Curve  (default-parameter run)")
+    split_n = int(is_m.get("total_trades", 0)) or None
+    st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
+
+    # ── Trade log ─────────────────────────────────────────────────────────────
+    st.subheader("Trade Log  (default-parameter run)")
+    show_cols = [c for c in [
+        "trade_id", "direction", "entry_date", "entry_price",
+        "exit_date", "exit_price", "exit_reason",
+        "net_pips", "net_r", "duration_hours",
+    ] if c in trade_df.columns]
+    show = trade_df[show_cols].copy()
+    if "net_pips" in show.columns:
+        show["net_pips"] = show["net_pips"].round(0).astype("Int64")
+    st.dataframe(show, use_container_width=True, height=360)
+
+    st.download_button(
+        "⬇  Download trade log",
+        data=trade_df.to_csv(index=False).encode(),
+        file_name="trade_log.csv",
+        mime="text/csv",
+    )
+
+
+# ── Page 2: Live Regime Monitor ───────────────────────────────────────────────
+
+def page_live() -> None:
+    st.title("📡 Live Regime Monitor")
+
+    if not PIPELINE_OK:
+        st.error(f"Pipeline modules unavailable: {_import_err}")
+        return
+
+    # Load best params from optimisation results
+    opt_df = load_opt()
+    if opt_df is not None:
+        best   = opt_df.iloc[0]
+        params = {c: best[c] for c in PARAM_COLS}
+        st.caption(f"Using best in-sample parameters (rank #1): {dict(params)}")
+    else:
+        # Fall back to module defaults
+        from swing_engine  import SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
+        from trend_engine  import MIN_TREND_SIZE, TREND_RANGE_RATIO
+        from trade_engine  import PULLBACK_LOOKBACK, STOP_BUFFER, TP_MODE
+        params = dict(
+            SWING_N=SWING_N, MIN_SWING_SIZE=MIN_SWING_SIZE,
+            MIN_SWING_INCR=MIN_SWING_INCREMENT, MIN_TREND_SIZE=MIN_TREND_SIZE,
+            TREND_RANGE_RATIO=TREND_RANGE_RATIO, PULLBACK_LOOKBACK=PULLBACK_LOOKBACK,
+            STOP_BUFFER=STOP_BUFFER, TP_MODE=TP_MODE,
+        )
+        st.info("No optimisation results found — using default parameters.")
+
+    # Refresh button (bumps cache key)
+    if "refresh_key" not in st.session_state:
+        st.session_state.refresh_key = 0
+    _, btn_col = st.columns([5, 1])
+    with btn_col:
+        if st.button("🔄 Refresh"):
+            st.session_state.refresh_key += 1
+
+    with st.spinner("Fetching data from MT5…"):
+        df_raw, err = fetch_live(st.session_state.refresh_key)
+
+    if err or df_raw is None:
+        st.warning(
+            f"⚠  MT5 not connected or data unavailable.  "
+            f"Make sure MetaTrader 5 is open and logged in.  "
+            f"Error: {err or 'unknown'}"
+        )
+        return
+
+    st.caption(f"Last update: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')} "
+               f"| {len(df_raw)} bars")
+
+    # Run pipeline with best params
+    swings = build_swings(
+        df_raw,
+        swing_n=int(params["SWING_N"]),
+        min_swing_size=float(params["MIN_SWING_SIZE"]),
+        min_swing_increment=float(params["MIN_SWING_INCR"]),
+        pip=PIP,
+    )
+    df_cls = classify_trend(
+        df_raw, swings,
+        swing_n=int(params["SWING_N"]),
+        min_swing_increment=float(params["MIN_SWING_INCR"]),
+        min_trend_size=float(params["MIN_TREND_SIZE"]),
+        trend_range_ratio=float(params["TREND_RANGE_RATIO"]),
+        pip=PIP,
+    )
+
+    last      = df_cls.iloc[-1]
+    regime    = str(last["regime"])
+    close_px  = float(last["Close"])
+    strength  = last.get("trend_strength_score")
+    last_time = df_cls.index[-1]
+
+    # ── Status banner ─────────────────────────────────────────────────────────
+    banner = {"UPTREND": "🟢 UPTREND", "DOWNTREND": "🔴 DOWNTREND", "AMBIGUOUS": "⚫ AMBIGUOUS"}
+    st.markdown(f"## {banner.get(regime, regime)}")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Close Price",    f"{close_px:.5f}")
+    c2.metric("Last Candle",    str(last_time)[:16])
+    str_val = (f"{float(strength):.1f} pips"
+               if strength is not None and not (isinstance(strength, float) and np.isnan(strength))
+               else "—")
+    c3.metric("Trend Strength", str_val)
+    st.divider()
+
+    # ── Swings & pullbacks ────────────────────────────────────────────────────
+    bar_i     = len(df_raw) - 1
+    confirmed = _confirmed_at(swings, bar_i, int(params["SWING_N"]))
+    direction = "long" if regime == "UPTREND" else "short"
+
+    col_sw, col_pb = st.columns(2)
+
+    with col_sw:
+        st.subheader("Last 10 Confirmed Swing Points")
+        if confirmed.empty:
+            st.info("No confirmed swings yet.")
+        else:
+            disp = confirmed.tail(10)[["date", "price", "type"]].copy()
+            disp["price"] = disp["price"].round(5)
+            st.dataframe(disp.reset_index(drop=True), use_container_width=True)
+
+    with col_pb:
+        st.subheader("Pullback Depths")
+        depths = _pullback_depths(confirmed, direction, PIP) if not confirmed.empty else []
+        last5  = depths[-5:]
+        if last5:
+            pb_df = pd.DataFrame(
+                {"pullback_pips": [int(round(d)) for d in last5]},
+                index=range(1, len(last5) + 1),
+            )
+            st.dataframe(pb_df, use_container_width=True)
+            med = float(np.median(last5))
+            st.metric("Median Pullback (entry offset)", f"{int(round(med))} pips")
+        else:
+            st.info("Fewer than 2 pullbacks — fallback to 20-bar range median.")
+
+    st.divider()
+
+    # ── Projected signal ──────────────────────────────────────────────────────
+    st.subheader("Projected Signal  (if triggered now)")
+    if regime not in ("UPTREND", "DOWNTREND"):
+        st.info("Market is AMBIGUOUS — no signal.")
+    else:
+        df_window = df_raw.iloc[max(0, bar_i - 19): bar_i + 1]
+        setup = _compute_setup(
+            confirmed, direction, df_window,
+            int(params["PULLBACK_LOOKBACK"]),
+            float(params["STOP_BUFFER"]), PIP,
+        )
+        if setup:
+            entry, stop, tp1 = setup
+            rr = abs(tp1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Entry",  f"{entry:.5f}")
+            p2.metric("Stop",   f"{stop:.5f}",
+                      delta=f"{int(round(abs(entry - stop) / PIP))} pip risk")
+            p3.metric("TP1",    f"{tp1:.5f}",
+                      delta=f"{int(round(abs(tp1 - entry) / PIP))} pip target")
+            p4.metric("R:R",    f"1 : {rr:.2f}")
+        else:
+            st.info("Structure incomplete for a valid setup at current bar.")
+
+
+# ── Page 3: Parameter Explorer ────────────────────────────────────────────────
+
+def page_explorer() -> None:
+    st.title("🔍 Parameter Explorer")
+
+    opt_df = load_opt()
+    if opt_df is None:
+        st.error("No optimisation results. Run `python backtest_engine.py` first.")
+        return
+
+    best_oos_idx = int(opt_df["OOS_expectancy_net_r"].idxmax())
+
+    # ── Sidebar filters ───────────────────────────────────────────────────────
+    with st.sidebar:
+        st.subheader("Filters")
+        swing_n_f = st.multiselect("SWING_N",            [2, 3],            default=[2, 3])
+        size_r    = st.slider("MIN_SWING_SIZE",  15, 25, (15, 25), step=5)
+        incr_r    = st.slider("MIN_SWING_INCR",   8, 15,  (8, 15))
+        trend_r   = st.slider("MIN_TREND_SIZE",  40, 60, (40, 60), step=10)
+        ratio_r   = st.slider("TREND_RANGE_RATIO", 0.30, 0.50, (0.30, 0.50), step=0.05)
+        lb_r      = st.slider("PULLBACK_LOOKBACK",  3,  5, (3, 5))
+        sb_r      = st.slider("STOP_BUFFER",        3,  8, (3, 8))
+        tp_f      = st.multiselect("TP_MODE", ["full", "partial"], default=["full", "partial"])
+
+    mask = (
+        opt_df["SWING_N"].isin(swing_n_f) &
+        opt_df["MIN_SWING_SIZE"].between(*size_r) &
+        opt_df["MIN_SWING_INCR"].between(*incr_r) &
+        opt_df["MIN_TREND_SIZE"].between(*trend_r) &
+        opt_df["TREND_RANGE_RATIO"].between(*ratio_r) &
+        opt_df["PULLBACK_LOOKBACK"].between(*lb_r) &
+        opt_df["STOP_BUFFER"].between(*sb_r) &
+        opt_df["TP_MODE"].isin(tp_f)
+    )
+    filt = opt_df[mask].copy()
+    st.write(f"Showing **{len(filt)}** of {len(opt_df)} combinations")
+
+    if filt.empty:
+        st.warning("No combinations match the current filters.")
+        return
+
+    # ── Scatter plot ──────────────────────────────────────────────────────────
+    hover_cols = [c for c in PARAM_COLS + [
+        "IS_win_rate_pct", "IS_expectancy_net_r", "IS_max_drawdown_pct", "IS_total_trades",
+        "OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct","OOS_total_trades",
+    ] if c in filt.columns]
+
+    # Cast SWING_N to string so plotly treats it as categorical
+    plot_df = filt.copy()
+    plot_df["SWING_N"] = plot_df["SWING_N"].astype(str)
+
+    fig = px.scatter(
+        plot_df,
+        x="IS_win_rate_pct", y="IS_expectancy_net_r",
+        size="IS_total_trades", size_max=20,
+        color="SWING_N",
+        color_discrete_map={"2": "#4da6ff", "3": "#ff884d"},
+        hover_data=hover_cols,
+        template="plotly_dark",
+        title="IS Win Rate % vs IS Expectancy R  (bubble size = trade count, colour = SWING_N)",
+        labels={
+            "IS_win_rate_pct":     "Win Rate % (IS)",
+            "IS_expectancy_net_r": "Expectancy R (IS)",
+        },
+    )
+
+    # Highlight best OOS combo
+    if best_oos_idx in filt.index:
+        bo = filt.loc[best_oos_idx]
+        fig.add_trace(go.Scatter(
+            x=[bo["IS_win_rate_pct"]], y=[bo["IS_expectancy_net_r"]],
+            mode="markers+text", text=["★ Best OOS"],
+            textposition="top center",
+            marker=dict(color="yellow", size=18, symbol="star",
+                        line=dict(color="white", width=1)),
+            name="Best OOS combo",
+        ))
+
+    fig.add_hline(y=0, line=dict(color="white", dash="dot", width=0.8))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Filtered table ────────────────────────────────────────────────────────
+    tbl_cols = [c for c in PARAM_COLS + [
+        "IS_total_trades", "IS_win_rate_pct", "IS_expectancy_net_r", "IS_max_drawdown_pct",
+        "OOS_total_trades","OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct",
+    ] if c in filt.columns]
+    st.dataframe(
+        filt[tbl_cols].sort_values("IS_expectancy_net_r", ascending=False).reset_index(drop=True),
+        use_container_width=True, height=400,
+    )
+
+
+# ── Navigation ────────────────────────────────────────────────────────────────
+
+PAGES = {
+    "📊 Backtest Results":    page_backtest,
+    "📡 Live Regime Monitor": page_live,
+    "🔍 Parameter Explorer":  page_explorer,
+}
+
+with st.sidebar:
+    st.title("EURUSD Algo Trader")
+    st.divider()
+    page = st.radio("", list(PAGES.keys()), label_visibility="collapsed")
+    st.divider()
+    st.caption("Run `python backtest_engine.py` to generate data files.")
+    if not PIPELINE_OK:
+        st.warning(f"Pipeline import error:\n{_import_err}")
+
+PAGES[page]()
