@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import sys
+import threading
 import time
 import traceback
 from datetime import timezone
@@ -684,6 +685,62 @@ def wait_for_next_candle(last_bar_time: pd.Timestamp, logger: logging.Logger) ->
     logger.info("Waking up — polling for new candle…")
 
 
+# ── Live mode confirmation ────────────────────────────────────────────────────
+
+def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
+    """
+    Print and log a live-mode summary, then require the operator to type 'yes'
+    within 30 seconds. Exits safely if confirmation is not received in time.
+    """
+    account_num = "N/A"
+    try:
+        if _is_connected():
+            info = mt5.account_info()
+            if info:
+                account_num = str(info.login)
+    except Exception:
+        pass
+
+    banner = (
+        "\n" + "=" * 60 + "\n"
+        "  LIVE TRADING MODE ACTIVE\n"
+        f"  Symbol:          {config['symbol']}\n"
+        f"  Risk per trade:  {config['risk_per_trade'] * 100:.1f}%\n"
+        f"  Max drawdown:    {config['max_drawdown_pct']}%\n"
+        "  Circuit breaker: ACTIVE\n"
+        f"  Confirm MT5 account number: {account_num}\n"
+        "=" * 60
+    )
+    print(banner)
+    logger.critical("LIVE TRADING MODE ACTIVE — awaiting terminal confirmation")
+
+    answer: list[str] = []
+    confirmed = threading.Event()
+
+    def _read() -> None:
+        try:
+            answer.append(input("\nType 'yes' and press Enter to confirm (30s timeout): ").strip().lower())
+        except Exception:
+            pass
+        confirmed.set()
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    confirmed.wait(timeout=30)
+
+    if not answer or answer[0] != "yes":
+        logger.critical("Live mode confirmation not received within 30 s — shutting down safely.")
+        print("\n⚠  Confirmation not received. Shutting down safely.\n")
+        try:
+            dp_disconnect()
+        except Exception:
+            pass
+        sys.exit(1)
+
+    logger.info("Live mode confirmed by operator.")
+    print("\n✓ Confirmed. Starting live trading engine…\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -727,6 +784,10 @@ def main() -> None:
         if not triggered:
             logger.error("Circuit breaker DID NOT trigger — check logic!")
         sys.exit(0)
+
+    # ── Live mode confirmation (terminal prompt, 30s timeout) ─────────────────
+    if not config["paper_mode"]:
+        _live_mode_confirmation(config, logger)
 
     # ── Connect to MT5 ────────────────────────────────────────────────────────
     if not dp_connect():

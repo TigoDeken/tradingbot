@@ -552,6 +552,148 @@ def page_explorer() -> None:
     )
 
 
+# ── Live-trade helpers (used by pages 4 & 5) ─────────────────────────────────
+
+def _load_config_fresh() -> dict | None:
+    p = Path("config.json")
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def parse_live_trades(lines: list[str]) -> pd.DataFrame:
+    """
+    Parse live (non-paper) trade events from trading_log.txt.
+    Matches Entry-signal → Limit-filled → Position-closed triples.
+    """
+    RE_TS     = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC")
+    RE_SIG    = re.compile(
+        r"Entry signal: (LONG|SHORT)\s+entry=([\d.]+)\s+stop=([\d.]+)\s+tp1=([\d.]+)"
+    )
+    RE_FILL   = re.compile(r"Limit order filled\. Position #(\d+) opened\.")
+    RE_CLOSE  = re.compile(r"Position was closed by MT5")
+
+    records: list[dict] = []
+    pending_signal: dict | None = None
+    open_trade: dict | None = None
+    trade_num = 0
+
+    for line in lines:
+        if "[PAPER]" in line:
+            continue
+        ts_m = RE_TS.match(line)
+        ts   = ts_m.group(1) if ts_m else None
+
+        if ms := RE_SIG.search(line):
+            pending_signal = dict(
+                direction=ms.group(1),
+                entry_price=float(ms.group(2)),
+                stop_price=float(ms.group(3)),
+                tp_price=float(ms.group(4)),
+                signal_ts=ts,
+            )
+        elif (mf := RE_FILL.search(line)) and pending_signal:
+            trade_num += 1
+            open_trade = {**pending_signal, "open_ts": ts,
+                          "ticket": mf.group(1), "trade_#": trade_num}
+            pending_signal = None
+        elif RE_CLOSE.search(line) and open_trade:
+            open_trade["close_ts"]    = ts
+            open_trade["exit_reason"] = "mt5_close"
+            records.append(dict(open_trade))
+            open_trade = None
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    for col in ("open_ts", "close_ts"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    return df
+
+
+def _mt5_account_info() -> dict | None:
+    """Return live MT5 account fields or None if unavailable."""
+    try:
+        import MetaTrader5 as _mt5
+        info = _mt5.account_info()
+        if info is None:
+            return None
+        return {
+            "balance":     float(info.balance),
+            "equity":      float(info.equity),
+            "margin":      float(info.margin),
+            "free_margin": float(info.margin_free),
+            "login":       str(info.login),
+            "server":      str(info.server),
+            "currency":    str(info.currency),
+        }
+    except Exception:
+        return None
+
+
+def _emergency_stop_execute() -> tuple[bool, list[str]]:
+    """Close all MT5 positions and switch config to paper mode. Returns (ok, messages)."""
+    msgs: list[str] = []
+    closed = 0
+    try:
+        import MetaTrader5 as _mt5
+        positions = _mt5.positions_get() or []
+        for p in positions:
+            side = _mt5.ORDER_TYPE_SELL if p.type == 0 else _mt5.ORDER_TYPE_BUY
+            req = {
+                "action":       _mt5.TRADE_ACTION_DEAL,
+                "symbol":       p.symbol,
+                "volume":       p.volume,
+                "type":         side,
+                "position":     p.ticket,
+                "deviation":    30,
+                "comment":      "EMERGENCY_STOP_DASHBOARD",
+                "type_time":    _mt5.ORDER_TIME_GTC,
+                "type_filling": _mt5.ORDER_FILLING_IOC,
+            }
+            res = _mt5.order_send(req)
+            if res and res.retcode == _mt5.TRADE_RETCODE_DONE:
+                closed += 1
+                msgs.append(f"✓ Closed position #{p.ticket} {p.symbol} {p.volume} lots")
+            else:
+                msgs.append(
+                    f"✗ Failed #{p.ticket}: {getattr(res, 'comment', '?')}"
+                )
+        if not positions:
+            msgs.append("No open positions found in MT5.")
+    except ImportError:
+        msgs.append("MetaTrader5 not importable — positions not closed via API.")
+    except Exception as e:
+        msgs.append(f"MT5 error: {e}")
+
+    cfg_path = Path("config.json")
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        cfg["paper_mode"] = True
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+        msgs.append("✓ paper_mode set to true in config.json")
+    except Exception as e:
+        msgs.append(f"✗ Failed to update config.json: {e}")
+
+    try:
+        ts = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+        with LOG_FILE.open("a", encoding="utf-8") as lf:
+            lf.write(
+                f"{ts} UTC [CRITICAL] EMERGENCY STOP executed from dashboard. "
+                f"Positions closed: {closed}. paper_mode set to true.\n"
+            )
+        msgs.append("✓ Action logged to trading_log.txt")
+    except Exception as e:
+        msgs.append(f"Log write failed: {e}")
+
+    return True, msgs
+
+
 # ── Page 4: Paper Trading Monitor ────────────────────────────────────────────
 
 def page_paper() -> None:
@@ -804,6 +946,394 @@ def page_paper() -> None:
         st.rerun()
 
 
+# ── Page 5: Live Trading ──────────────────────────────────────────────────────
+
+def page_live_trading() -> None:
+    st.title("🔴 Live Trading")
+
+    # ── Refresh controls ──────────────────────────────────────────────────────
+    if "live_refresh_key" not in st.session_state:
+        st.session_state.live_refresh_key = 0
+    if "estop_armed" not in st.session_state:
+        st.session_state.estop_armed = False
+    if "estop_done" not in st.session_state:
+        st.session_state.estop_done = False
+    if "live_auto_ts" not in st.session_state:
+        import time as _t
+        st.session_state.live_auto_ts = _t.time()
+
+    hdr_l, hdr_r = st.columns([5, 1])
+    with hdr_r:
+        if st.button("🔄 Refresh", key="live_refresh_btn"):
+            st.session_state.live_refresh_key += 1
+
+    cfg   = _load_config_fresh()
+    rk    = st.session_state.live_refresh_key
+    state = load_state(rk)
+    lines = load_log_lines(rk)
+    now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+
+    is_live = cfg is not None and not cfg.get("paper_mode", True)
+
+    # ── Emergency stop ────────────────────────────────────────────────────────
+    if st.session_state.estop_done:
+        st.success(
+            "🛑 Emergency stop executed. All positions closed. "
+            "paper_mode is now active. Restart live_trader.py to resume paper trading."
+        )
+    elif st.session_state.estop_armed:
+        st.error(
+            "⚠️  CONFIRM EMERGENCY STOP\n\n"
+            "This will immediately close ALL open MT5 positions and switch config.json "
+            "to paper_mode=true. This action cannot be undone."
+        )
+        ea_col, ec_col = st.columns(2)
+        with ea_col:
+            if st.button("✅ YES — EXECUTE EMERGENCY STOP", type="primary",
+                         key="estop_confirm_btn"):
+                _, msgs = _emergency_stop_execute()
+                st.session_state.estop_armed = False
+                st.session_state.estop_done  = True
+                for m in msgs:
+                    st.write(m)
+                st.rerun()
+        with ec_col:
+            if st.button("❌ Cancel", key="estop_cancel_btn"):
+                st.session_state.estop_armed = False
+                st.rerun()
+    else:
+        if st.button("🔴 EMERGENCY STOP", type="primary", key="estop_arm_btn"):
+            st.session_state.estop_armed = True
+            st.rerun()
+
+    st.divider()
+
+    # ── Status banner ─────────────────────────────────────────────────────────
+    if is_live:
+        st.success("## 🟢  LIVE TRADING ACTIVE")
+        st.caption(f"paper_mode = false · Last render: {now_utc}")
+    else:
+        st.warning("## 📄  PAPER MODE")
+        st.caption(
+            "paper_mode = true · Set paper_mode=false in config.json and restart "
+            "live_trader.py with --live-confirmed to go live."
+        )
+
+    st.divider()
+
+    # ── Section 1: MT5 Account ────────────────────────────────────────────────
+    st.subheader("1 · MT5 Account")
+    acct = _mt5_account_info()
+    if acct is None:
+        st.warning(
+            "MT5 account data unavailable. "
+            "MetaTrader 5 must be open and connected to display account information."
+        )
+    else:
+        st.caption(
+            f"Account: {acct['login']} · Server: {acct['server']} · "
+            f"Currency: {acct['currency']}"
+        )
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Balance",      f"${acct['balance']:,.2f}")
+        a2.metric("Equity",       f"${acct['equity']:,.2f}")
+        a3.metric("Margin Used",  f"${acct['margin']:,.2f}")
+        a4.metric("Free Margin",  f"${acct['free_margin']:,.2f}")
+
+        # Balance changes
+        sb = state.get("session_starting_balance") if state else None
+        if sb and sb > 0:
+            delta_usd = acct["balance"] - sb
+            delta_pct = delta_usd / sb * 100
+            ch1, ch2 = st.columns(2)
+            ch1.metric(
+                "Change Since Session Start",
+                f"${delta_usd:+,.2f}",
+                delta=f"{delta_pct:+.2f}%",
+                delta_color="normal" if delta_usd >= 0 else "inverse",
+            )
+            # Today approximation — use equity vs balance as proxy for open P&L
+            open_pnl = acct["equity"] - acct["balance"]
+            ch2.metric(
+                "Open P&L (equity − balance)",
+                f"${open_pnl:+,.2f}",
+                delta_color="normal" if open_pnl >= 0 else "inverse",
+            )
+
+    st.divider()
+
+    # ── Section 2: Current State ───────────────────────────────────────────────
+    st.subheader("2 · Current State")
+    if not state:
+        st.info("state.json not found. Start live_trader.py first.")
+    else:
+        regime   = state.get("last_regime", "—")
+        cb_on    = state.get("circuit_breaker_active", False)
+        cb_rsn   = state.get("circuit_breaker_reason", "")
+        last_upd = state.get("last_updated", "—")
+        open_t   = state.get("open_trade")
+        pending  = state.get("pending_limit")
+
+        r_map = {"UPTREND": "🟢 UPTREND", "DOWNTREND": "🔴 DOWNTREND",
+                 "AMBIGUOUS": "⚫ AMBIGUOUS"}
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Regime",          r_map.get(regime, regime))
+        s2.metric("Circuit Breaker", "🔴 TRIGGERED" if cb_on else "🟢 ACTIVE")
+        s3.metric("Last Candle",     str(last_upd)[:19])
+
+        if cb_on and cb_rsn:
+            st.error(f"CB reason: {cb_rsn}")
+
+        if open_t:
+            st.markdown("**Open Live Position**")
+            direction = open_t.get("direction", "").upper()
+            entry_px  = open_t.get("entry", 0)
+            stop_px   = open_t.get("stop", 0)
+            tp_px     = open_t.get("tp1", 0)
+            lot       = open_t.get("lot", 0)
+            entry_ts  = open_t.get("entry_time", "—")
+
+            # Current price from MT5 if available
+            cur_px = None
+            cur_pips = "—"
+            cur_r    = "—"
+            try:
+                import MetaTrader5 as _mt5
+                tick = _mt5.symbol_info_tick(cfg["symbol"] if cfg else "EURUSD")
+                if tick:
+                    cur_px    = float(tick.bid if direction == "LONG" else tick.ask)
+                    pip       = 0.0001
+                    sign      = 1 if direction == "LONG" else -1
+                    gross     = sign * (cur_px - entry_px) / pip
+                    cur_pips  = f"{gross:.1f}"
+                    stop_dist = abs(entry_px - stop_px) / pip
+                    cur_r     = f"{gross / stop_dist:.2f}" if stop_dist > 0 else "—"
+            except Exception:
+                pass
+
+            ot1, ot2, ot3, ot4, ot5, ot6 = st.columns(6)
+            ot1.metric("Direction",    direction)
+            ot2.metric("Entry",        f"{entry_px:.5f}")
+            cur_str = f"{cur_px:.5f}" if cur_px else "—"
+            ot3.metric("Current Price", cur_str, delta=cur_pips + " pips" if cur_px else None)
+            ot4.metric("Current R",    cur_r)
+            ot5.metric("Stop",         f"{stop_px:.5f}")
+            ot6.metric("TP1",          f"{tp_px:.5f}")
+            st.caption(f"Entry time: {entry_ts}  |  Lots: {lot}")
+
+        elif pending:
+            st.markdown("**Pending Limit Order**")
+            pd1, pd2, pd3, pd4 = st.columns(4)
+            pd1.metric("Direction",   pending.get("direction", "—").upper())
+            pd2.metric("Limit Price", f"{pending.get('price', 0):.5f}")
+            pd3.metric("Stop",        f"{pending.get('stop', 0):.5f}")
+            pd4.metric("TP1",         f"{pending.get('tp1', 0):.5f}")
+        else:
+            st.info("No open position or pending order.")
+
+    st.divider()
+
+    # ── Section 3: Live Trade Log ──────────────────────────────────────────────
+    st.subheader("3 · Live Trade Log")
+    live_trades = parse_live_trades(lines)
+
+    if is_live and live_trades.empty:
+        st.info("No live trades recorded yet in trading_log.txt.")
+    elif not is_live and live_trades.empty:
+        st.info(
+            "No live trades found — system is in paper mode. "
+            "Live trades will appear here after switching to live mode."
+        )
+    else:
+        show_cols = [c for c in [
+            "trade_#", "direction", "open_ts", "close_ts",
+            "entry_price", "stop_price", "tp_price", "exit_reason", "ticket",
+        ] if c in live_trades.columns]
+        st.dataframe(live_trades[show_cols], use_container_width=True, height=300)
+
+        total = len(live_trades)
+        st.caption(f"Total live trades recorded: {total}")
+
+    st.divider()
+
+    # ── Section 4: Three Equity Curves ────────────────────────────────────────
+    st.subheader("4 · Equity Curves  (Backtest · Paper · Live)")
+
+    eq_bt     = load_equity()
+    paper_trd = parse_paper_trades(lines)
+    live_trd  = live_trades  # already parsed above
+
+    fig4 = go.Figure()
+    has_any = False
+
+    if eq_bt is not None and "balance" in eq_bt.columns:
+        x_bt = np.arange(1, len(eq_bt) + 1)
+        fig4.add_trace(go.Scatter(
+            x=x_bt, y=eq_bt["balance"].values,
+            name="Backtest", line=dict(color="#888888", width=1.5, dash="dot"),
+        ))
+        has_any = True
+
+    if not paper_trd.empty and "balance" in paper_trd.columns:
+        x_p = paper_trd["trade_#"].values
+        fig4.add_trace(go.Scatter(
+            x=x_p, y=paper_trd["balance"].values,
+            name="Paper", line=dict(color="#4da6ff", width=2),
+        ))
+        has_any = True
+
+    if not live_trd.empty:
+        # Live trades don't carry balance from logs — annotate count only
+        st.caption(
+            f"Live curve: {len(live_trd)} trade(s) logged. "
+            "Full balance tracking requires live_trader to be running."
+        )
+
+    if not has_any:
+        st.info("No equity data available yet. Run backtest and/or start paper trading.")
+    else:
+        fig4.update_layout(
+            height=400, template="plotly_dark",
+            xaxis_title="Trade #", yaxis_title="Balance (USD)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            title="Normalised equity curves — all starting from respective initial balance",
+        )
+        fig4.add_hline(y=10_000, line=dict(color="white", dash="dot", width=0.6))
+        st.plotly_chart(fig4, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 5: Live vs Paper vs Backtest Comparison ───────────────────────
+    st.subheader("5 · Live vs Paper vs Backtest Comparison")
+
+    opt_df = load_opt()
+
+    def _safe_metric(df: pd.DataFrame, col: str, fn):
+        try:
+            return float(fn(df[col])) if not df.empty and col in df.columns else None
+        except Exception:
+            return None
+
+    def _paper_stats(trd: pd.DataFrame) -> dict:
+        if trd.empty:
+            return {}
+        wins   = (trd["net_pips"] > 0).sum()
+        total  = len(trd)
+        wr     = wins / total * 100 if total else 0
+        exp    = trd["net_pips"].mean() / 10.0
+        avg_w  = trd.loc[trd["net_pips"] > 0, "net_pips"].mean() / 10.0 if wins else None
+        avg_l  = trd.loc[trd["net_pips"] <= 0, "net_pips"].mean() / 10.0 if (total - wins) else None
+        peak   = trd["balance"].cummax()
+        max_dd = ((peak - trd["balance"]) / peak * 100).max()
+        return dict(win_rate=wr, expectancy=exp, avg_win_r=avg_w,
+                    avg_loss_r=avg_l, max_dd=max_dd, trades=total)
+
+    def _bt_oos_stats(od: pd.DataFrame | None) -> dict:
+        if od is None or od.empty:
+            return {}
+        best = od.iloc[0]
+        return dict(
+            win_rate=best.get("OOS_win_rate_pct"),
+            expectancy=best.get("OOS_expectancy_net_r"),
+            max_dd=best.get("OOS_max_drawdown_pct"),
+        )
+
+    paper_s  = _paper_stats(paper_trd)
+    live_s   = _paper_stats(parse_paper_trades([])) if live_trd.empty else {}
+    bt_s     = _bt_oos_stats(opt_df)
+
+    metrics_def = [
+        ("Win Rate %",       "win_rate",    "win_rate",    "%",  False),
+        ("Expectancy R",     "expectancy",  "expectancy",  " R", False),
+        ("Avg Win R",        "avg_win_r",   None,          " R", False),
+        ("Avg Loss R",       "avg_loss_r",  None,          " R", True),
+        ("Max Drawdown %",   "max_dd",      "max_dd",      "%",  True),
+    ]
+
+    def _fmt(v, unit):
+        return f"{v:.2f}{unit}" if v is not None else "—"
+
+    red_count = 0
+    col_bt, col_paper, col_live = st.columns(3)
+    with col_bt:
+        st.markdown("**📊 Backtest OOS**")
+        for label, key, bt_key, unit, higher_is_worse in metrics_def:
+            v = bt_s.get(bt_key or key)
+            st.metric(label, _fmt(v, unit))
+
+    with col_paper:
+        st.markdown("**📄 Paper Trading**")
+        for label, key, bt_key, unit, higher_is_worse in metrics_def:
+            pv = paper_s.get(key)
+            bv = bt_s.get(bt_key or key)
+            is_red = False
+            if pv is not None and bv is not None:
+                try:
+                    if not higher_is_worse and float(pv) < float(bv) * 0.80:
+                        is_red = True
+                    elif higher_is_worse and float(pv) > float(bv) * 1.20:
+                        is_red = True
+                except Exception:
+                    pass
+            label_str = f"🔴 {label}" if is_red else label
+            st.metric(label_str, _fmt(pv, unit))
+
+    with col_live:
+        st.markdown(f"**🔴 Live Trading {'(ACTIVE)' if is_live else '(no trades yet)'}**")
+        live_warns = 0
+        for label, key, bt_key, unit, higher_is_worse in metrics_def:
+            lv = live_s.get(key)
+            bv = bt_s.get(bt_key or key)
+            is_red = False
+            if lv is not None and bv is not None:
+                try:
+                    if not higher_is_worse and float(lv) < float(bv) * 0.80:
+                        is_red = True
+                        live_warns += 1
+                    elif higher_is_worse and float(lv) > float(bv) * 1.20:
+                        is_red = True
+                        live_warns += 1
+                except Exception:
+                    pass
+            label_str = f"🔴 {label}" if is_red else label
+            st.metric(label_str, _fmt(lv, unit))
+
+        if live_warns >= 2:
+            st.error(
+                "⚠️  System behavior has changed significantly. "
+                "2 or more live metrics are worse than backtest by >20%. "
+                "Review live trades before continuing."
+            )
+
+    st.divider()
+
+    # ── Section 6: Recent Log Entries ─────────────────────────────────────────
+    st.subheader("6 · Recent Log Entries")
+    if not lines:
+        st.info("trading_log.txt not found or empty.")
+    else:
+        def _tag(line: str) -> str:
+            if "[PAPER]" in line:
+                return f"[PAPER] {line}"
+            for kw in ("Position", "Limit order", "Entry signal", "Trade", "Stop modified",
+                        "Circuit", "HALT"):
+                if kw in line:
+                    return f"[LIVE]  {line}"
+            return line
+
+        last30 = [_tag(l) for l in lines[-30:]]
+        last30.reverse()
+        st.code("\n".join(last30), language=None)
+
+    # Auto-refresh every 60 s
+    st.caption(f"Auto-refreshing every 60 s · {now_utc}")
+    import time as _time2
+    if _time2.time() - st.session_state.live_auto_ts >= 60:
+        st.session_state.live_auto_ts = _time2.time()
+        st.session_state.live_refresh_key += 1
+        st.rerun()
+
+
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 PAGES = {
@@ -811,6 +1341,7 @@ PAGES = {
     "📡 Live Regime Monitor":   page_live,
     "🔍 Parameter Explorer":    page_explorer,
     "📄 Paper Trading Monitor": page_paper,
+    "🔴 Live Trading":          page_live_trading,
 }
 
 with st.sidebar:
