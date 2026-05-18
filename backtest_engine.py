@@ -111,6 +111,16 @@ def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
     span_days = (trades[-1].exit_date - trades[0].entry_date).days if n >= 2 else 0
     tpm = round(n / (span_days / 30), 1) if span_days > 0 else 0.0
 
+    # EV decomposition: EV = WR × avg_win_R − LR × |avg_loss_R|
+    wr_f = len(wins) / n
+    lr_f = len(losses) / n
+    _avg_net_win    = float(np.mean([t.net_r   or 0 for t in wins]))   if wins   else 0.0
+    _avg_net_loss   = float(np.mean([t.net_r   or 0 for t in losses])) if losses else 0.0
+    _avg_gross_win  = float(np.mean([t.gross_r or 0 for t in wins]))   if wins   else 0.0
+    _avg_gross_loss = float(np.mean([t.gross_r or 0 for t in losses])) if losses else 0.0
+    gross_ev = round(wr_f * _avg_gross_win - lr_f * abs(_avg_gross_loss), 4)
+    net_ev   = round(wr_f * _avg_net_win   - lr_f * abs(_avg_net_loss),   4)
+
     return {
         # Summary
         "total_trades":       n,
@@ -131,6 +141,8 @@ def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
         "worst_pips":         round(min((t.net_pips or 0 for t in losses), default=0), 1),
         "worst_r":            round(min((t.net_r    or 0 for t in losses), default=0), 2),
         "expectancy_net_r":   round(net_r_total / n, 4),
+        "gross_ev":           gross_ev,
+        "net_ev":             net_ev,
         # Risk
         "max_consec_wins":    max_w,
         "max_consec_losses":  max_l,
@@ -148,16 +160,25 @@ def _quick_metrics(trades: list) -> dict:
     """Lightweight subset used inside the optimisation loop."""
     if not trades:
         return {"total_trades": 0, "win_rate_pct": 0, "expectancy_net_r": 0.0,
-                "max_drawdown_pct": 0.0}
-    n = len(trades)
-    wins = sum(1 for t in trades if (t.net_pips or 0) > 0)
+                "max_drawdown_pct": 0.0, "gross_ev": 0.0, "net_ev": 0.0}
+    n     = len(trades)
+    wins  = [t for t in trades if (t.net_pips or 0) > 0]
+    losses= [t for t in trades if (t.net_pips or 0) <= 0]
     net_r = sum(t.net_r or 0 for t in trades)
+    wr_f  = len(wins)   / n
+    lr_f  = len(losses) / n
+    avg_gw = float(np.mean([t.gross_r or 0 for t in wins]))   if wins   else 0.0
+    avg_gl = float(np.mean([t.gross_r or 0 for t in losses])) if losses else 0.0
+    avg_nw = float(np.mean([t.net_r   or 0 for t in wins]))   if wins   else 0.0
+    avg_nl = float(np.mean([t.net_r   or 0 for t in losses])) if losses else 0.0
     eq = build_equity(trades, risk_pct=RISK_PCT)
     return {
         "total_trades":     n,
-        "win_rate_pct":     round(wins / n * 100, 1),
+        "win_rate_pct":     round(wr_f * 100, 1),
         "expectancy_net_r": round(net_r / n, 4),
         "max_drawdown_pct": round(eq["drawdown_pct"].min(), 2) if not eq.empty else 0.0,
+        "gross_ev":         round(wr_f * avg_gw - lr_f * abs(avg_gl), 4),
+        "net_ev":           round(wr_f * avg_nw - lr_f * abs(avg_nl), 4),
     }
 
 
@@ -190,6 +211,8 @@ def print_metrics(m: dict, label: str = "") -> None:
     print(f"  Largest winner           {m['best_pips']} pips  /  {m['best_r']} R")
     print(f"  Largest loser            {m['worst_pips']} pips  /  {m['worst_r']} R")
     print(f"  Expectancy (net R)       {m['expectancy_net_r']}")
+    print(f"  Gross EV per trade       {m.get('gross_ev', '—')} R")
+    print(f"  Net EV per trade         {m.get('net_ev',   '—')} R")
 
     print(f"\nRISK")
     print(SEP)
@@ -216,6 +239,8 @@ def compare_is_oos(is_m: dict, oos_m: dict) -> None:
         ("total_trades",     "Total trades"),
         ("win_rate_pct",     "Win rate %"),
         ("expectancy_net_r", "Expectancy (net R)"),
+        ("gross_ev",         "Gross EV (R/trade)"),
+        ("net_ev",           "Net EV (R/trade)"),
         ("net_r",            "Total net R"),
         ("max_drawdown_pct", "Max drawdown %"),
         ("trades_per_month", "Trades / month"),
@@ -445,12 +470,14 @@ if __name__ == "__main__":
 
     param_cols   = list(PARAM_GRID.keys())
     display_cols = param_cols + [
-        "IS_total_trades", "IS_win_rate_pct", "IS_expectancy_net_r", "IS_max_drawdown_pct",
-        "OOS_total_trades","OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct",
+        "IS_total_trades",  "IS_win_rate_pct",  "IS_expectancy_net_r",
+        "IS_gross_ev",      "IS_net_ev",         "IS_max_drawdown_pct",
+        "OOS_total_trades", "OOS_win_rate_pct", "OOS_expectancy_net_r",
+        "OOS_gross_ev",     "OOS_net_ev",        "OOS_max_drawdown_pct",
     ]
-    print(f"\n{'═'*80}")
+    print(f"\n{'═'*90}")
     print("  TOP 10 COMBINATIONS BY OUT-OF-SAMPLE EXPECTANCY")
-    print(f"{'═'*80}")
+    print(f"{'═'*90}")
     print(opt[display_cols].head(10).to_string())
 
     best = opt.iloc[0]
@@ -461,10 +488,12 @@ if __name__ == "__main__":
         print(f"  {k:<25} {best[k]}")
 
     # 6. OOS result for best combo (no re-run — already computed during opt)
-    best_oos_exp = best["OOS_expectancy_net_r"]
-    best_is_exp  = best["IS_expectancy_net_r"]
-    print(f"\n  IS  expectancy: {best_is_exp} R/trade")
-    print(f"  OOS expectancy: {best_oos_exp} R/trade")
+    best_oos_exp    = best["OOS_expectancy_net_r"]
+    best_is_exp     = best["IS_expectancy_net_r"]
+    best_oos_net_ev = best.get("OOS_net_ev", "—")
+    best_is_net_ev  = best.get("IS_net_ev",  "—")
+    print(f"\n  IS  expectancy: {best_is_exp} R/trade    IS  net EV: {best_is_net_ev} R/trade")
+    print(f"  OOS expectancy: {best_oos_exp} R/trade    OOS net EV: {best_oos_net_ev} R/trade")
 
     # Confirm: selection was IS-only (no peeking)
     print(f"\n  [Confirmed] Best combo selected on OOS expectancy (unseen data performance).")
@@ -478,4 +507,26 @@ if __name__ == "__main__":
     else:
         print(f"  FINAL: NEGATIVE OOS EXPECTANCY — {best_oos_exp} R/trade  ✗")
         print(f"  No confirmed edge on out-of-sample data. Parameters likely overfit.")
+    print(f"{'═'*65}")
+
+    # 7. Worked EV example using all_m
+    print(f"\n{'═'*65}")
+    print("  EV CALCULATION — WORKED EXAMPLE (full dataset)")
+    print(f"{'═'*65}")
+    _n  = all_m["total_trades"]
+    _w  = all_m["winning_trades"]
+    _l  = all_m["losing_trades"]
+    _wr = _w / _n
+    _lr = _l / _n
+    _ag = all_m["avg_win_r"]
+    _al = all_m["avg_loss_r"]
+    print(f"  Win rate (WR)           = {_w} / {_n} = {_wr:.4f}")
+    print(f"  Loss rate (LR)          = {_l} / {_n} = {_lr:.4f}")
+    print(f"  Avg net win  (R)        = {_ag}")
+    print(f"  Avg net loss (R)        = {_al}")
+    print(f"  Net EV = WR×avg_win − LR×|avg_loss|")
+    print(f"         = {_wr:.4f}×{_ag} − {_lr:.4f}×{abs(_al):.4f}")
+    print(f"         = {round(_wr*_ag, 4)} − {round(_lr*abs(_al), 4)}")
+    print(f"         = {all_m.get('net_ev', '—')} R/trade")
+    print(f"  (Same as expectancy = total_net_R / n = {all_m['expectancy_net_r']} R/trade)")
     print(f"{'═'*65}")

@@ -272,18 +272,27 @@ def page_backtest() -> None:
     # ── Metric rows ───────────────────────────────────────────────────────────
     st.subheader("In-Sample  (first 70% by date)")
     _metric_row(is_m)
+    _ev_col1, _ev_col2, *_ = st.columns(6)
+    _ev_col1.metric("Gross EV", f"{is_m['gross_ev']:.4f} R" if "gross_ev" in is_m else "—")
+    _ev_col2.metric("Net EV",   f"{is_m['net_ev']:.4f} R"   if "net_ev"   in is_m else "—")
+
     st.subheader("Out-of-Sample  (last 30% by date)")
     _metric_row(oos_m)
+    _ev_col3, _ev_col4, *_ = st.columns(6)
+    _ev_col3.metric("Gross EV", f"{oos_m['gross_ev']:.4f} R" if "gross_ev" in oos_m else "—")
+    _ev_col4.metric("Net EV",   f"{oos_m['net_ev']:.4f} R"   if "net_ev"   in oos_m else "—")
 
     # ── IS vs OOS side by side with delta ─────────────────────────────────────
     st.subheader("Comparison")
     compare = [
-        ("total_trades",     "Total Trades",    ""),
-        ("win_rate_pct",     "Win Rate",        "%"),
-        ("expectancy_net_r", "Expectancy",      " R"),
-        ("net_r",            "Total Net R",     " R"),
-        ("max_drawdown_pct", "Max Drawdown",    "%"),
-        ("trades_per_month", "Trades / Month",  ""),
+        ("total_trades",     "Total Trades",      ""),
+        ("win_rate_pct",     "Win Rate",          "%"),
+        ("expectancy_net_r", "Expectancy",        " R"),
+        ("gross_ev",         "Gross EV",          " R"),
+        ("net_ev",           "Net EV",            " R"),
+        ("net_r",            "Total Net R",       " R"),
+        ("max_drawdown_pct", "Max Drawdown",      "%"),
+        ("trades_per_month", "Trades / Month",    ""),
     ]
     col_is, col_oos = st.columns(2)
     with col_is:
@@ -303,6 +312,25 @@ def page_backtest() -> None:
                 except Exception:
                     pass
             st.metric(label, f"{ov}{unit}" if ov is not None else "—", delta=delta)
+
+    # Net EV color callout
+    ev_is_n  = is_m.get("net_ev")
+    ev_oos_n = oos_m.get("net_ev")
+    if ev_is_n is not None or ev_oos_n is not None:
+        st.markdown("**Net EV summary**")
+        _nev1, _nev2 = st.columns(2)
+        with _nev1:
+            if ev_is_n is not None:
+                if float(ev_is_n) >= 0:
+                    st.success(f"IS Net EV: **+{ev_is_n:.4f} R/trade** ✅")
+                else:
+                    st.error(f"IS Net EV: **{ev_is_n:.4f} R/trade** ❌")
+        with _nev2:
+            if ev_oos_n is not None:
+                if float(ev_oos_n) >= 0:
+                    st.success(f"OOS Net EV: **+{ev_oos_n:.4f} R/trade** ✅")
+                else:
+                    st.error(f"OOS Net EV: **{ev_oos_n:.4f} R/trade** ❌")
 
     # ── Equity curve ──────────────────────────────────────────────────────────
     st.subheader("Equity Curve  (default-parameter run)")
@@ -632,6 +660,23 @@ def parse_live_trades(lines: list[str]) -> pd.DataFrame:
     return df
 
 
+def _rolling_ev_df(trd_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-trade R and rolling EV series from a paper-trade DataFrame."""
+    if trd_df.empty:
+        return pd.DataFrame()
+    _sp = (trd_df["entry_price"] - trd_df["stop_price"]).abs() / 0.0001
+    nr  = (trd_df["net_pips"] / _sp.replace(0, float("nan"))).values
+    idx = trd_df["trade_#"].values if "trade_#" in trd_df.columns else np.arange(1, len(trd_df) + 1)
+    s   = pd.Series(nr)
+    return pd.DataFrame({
+        "trade_#":    idx,
+        "net_r":      nr,
+        "ev_all":     s.expanding().mean().values,
+        "ev_last20":  s.rolling(20, min_periods=1).mean().values,
+        "ev_last10":  s.rolling(10, min_periods=1).mean().values,
+    })
+
+
 def _mt5_account_info() -> dict | None:
     """Return live MT5 account fields or None if unavailable."""
     try:
@@ -650,6 +695,42 @@ def _mt5_account_info() -> dict | None:
         }
     except Exception:
         return None
+
+
+def _sidebar_kpis() -> dict:
+    """Return net_ev, max_dd, win_rate from best available source.
+    Priority: paper trades > backtest OOS CSV.
+    (Live trades lack net_pips in current log format.)
+    """
+    rk    = st.session_state.get("paper_refresh_key",
+            st.session_state.get("live_refresh_key", 0))
+    lines = load_log_lines(rk)
+    paper = parse_paper_trades(lines)
+
+    if not paper.empty:
+        wins  = (paper["net_pips"] > 0).sum()
+        total = len(paper)
+        _sp   = (paper["entry_price"] - paper["stop_price"]).abs() / 0.0001
+        _nr   = paper["net_pips"] / _sp.replace(0, float("nan"))
+        wr_f  = wins / total
+        lr_f  = (total - wins) / total
+        avg_nw = float(_nr[paper["net_pips"] > 0].mean())   if wins            else 0.0
+        avg_nl = float(_nr[paper["net_pips"] <= 0].mean())  if (total - wins)  else 0.0
+        ev     = wr_f * avg_nw - lr_f * abs(avg_nl)
+        pk     = paper["balance"].cummax()
+        dd     = float(((pk - paper["balance"]) / pk * 100).max())
+        return {"net_ev": ev, "max_dd": dd, "win_rate": wr_f * 100, "source": "paper"}
+
+    opt_df = load_opt()
+    if opt_df is not None and not opt_df.empty:
+        best = opt_df.iloc[0]
+        return {
+            "net_ev":   best.get("OOS_net_ev"),
+            "max_dd":   best.get("OOS_max_drawdown_pct"),
+            "win_rate": best.get("OOS_win_rate_pct"),
+            "source":   "backtest",
+        }
+    return {}
 
 
 def _emergency_stop_execute() -> tuple[bool, list[str]]:
@@ -864,9 +945,68 @@ def page_paper() -> None:
 
     st.divider()
 
-    # ── Section 4: Paper vs Backtest Comparison ────────────────────────────────
-    st.subheader("4 · Paper vs Backtest Comparison")
+    # ── Section 4: Rolling EV ─────────────────────────────────────────────────
+    st.subheader("4 · Rolling Expected Value (EV)")
     opt_df = load_opt()
+    bt_ev = None
+    if opt_df is not None and not opt_df.empty:
+        bt_ev = opt_df.iloc[0].get("OOS_net_ev")
+
+    if paper_trades.empty:
+        st.info("No completed paper trades to compute rolling EV yet.")
+    else:
+        rev_df = _rolling_ev_df(paper_trades)
+        if not rev_df.empty:
+            # Summary metrics
+            rev1, rev2, rev3 = st.columns(3)
+            rev1.metric("EV all trades",  f"{rev_df['ev_all'].iloc[-1]:.4f} R")
+            rev2.metric("EV last 20",     f"{rev_df['ev_last20'].iloc[-1]:.4f} R")
+            rev3.metric("EV last 10",     f"{rev_df['ev_last10'].iloc[-1]:.4f} R")
+
+            # Rolling EV chart
+            ev_fig = go.Figure()
+            x = rev_df["trade_#"].values
+            ev_fig.add_trace(go.Scatter(
+                x=x, y=rev_df["ev_all"].values,
+                name="EV all trades", line=dict(color="#4da6ff", width=2),
+            ))
+            ev_fig.add_trace(go.Scatter(
+                x=x, y=rev_df["ev_last20"].values,
+                name="EV last 20", line=dict(color="#26c26e", width=1.8, dash="dash"),
+            ))
+            ev_fig.add_trace(go.Scatter(
+                x=x, y=rev_df["ev_last10"].values,
+                name="EV last 10", line=dict(color="#ffd700", width=1.5, dash="dot"),
+            ))
+            ev_fig.add_hline(y=0, line=dict(color="white", dash="dot", width=0.7))
+
+            if bt_ev is not None:
+                ev_fig.add_hline(
+                    y=float(bt_ev),
+                    line=dict(color="orange", dash="longdash", width=1.2),
+                    annotation_text=f"Backtest OOS EV ({bt_ev:.4f} R)",
+                    annotation_position="bottom right",
+                )
+                # Red shading if any rolling EV drops >20% below backtest EV
+                threshold = float(bt_ev) * 0.80
+                if bt_ev > 0 and rev_df[["ev_all","ev_last20","ev_last10"]].min().min() < threshold:
+                    st.error(
+                        f"⚠️  Rolling EV has dropped more than 20% below backtest EV "
+                        f"({bt_ev:.4f} R). Review recent trades."
+                    )
+
+            ev_fig.update_layout(
+                height=380, template="plotly_dark",
+                xaxis_title="Trade #", yaxis_title="EV (R/trade)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                title="Rolling Expected Value vs Backtest Reference",
+            )
+            st.plotly_chart(ev_fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 5: Paper vs Backtest Comparison ────────────────────────────────
+    st.subheader("5 · Paper vs Backtest Comparison")
     if opt_df is None:
         st.info("No optimisation_results.csv found — run the backtest first.")
     elif paper_trades.empty:
@@ -876,6 +1016,7 @@ def page_paper() -> None:
         metrics = [
             ("Win Rate %",   "win_rate_pct",     "%"),
             ("Expectancy R", "expectancy_net_r",  " R"),
+            ("Net EV",       "net_ev",            " R"),
             ("Max DD %",     "max_drawdown_pct",  "%"),
         ]
 
@@ -884,13 +1025,25 @@ def page_paper() -> None:
         _sp   = (paper_trades["entry_price"] - paper_trades["stop_price"]).abs() / 0.0001
         _nr   = paper_trades["net_pips"] / _sp.replace(0, float("nan"))
         p_exp = float(_nr.mean()) if not _nr.empty else 0.0
+        _wins_mask = paper_trades["net_pips"] > 0
+        _wr_f = p_wr / 100
+        _lr_f = 1 - _wr_f
+        _avg_nw = float(_nr[_wins_mask].mean())   if _wins_mask.any()  else 0.0
+        _avg_nl = float(_nr[~_wins_mask].mean())  if (~_wins_mask).any() else 0.0
+        p_net_ev = round(_wr_f * _avg_nw - _lr_f * abs(_avg_nl), 4)
         running_peak = paper_trades["balance"].cummax()
         paper_dd = ((running_peak - paper_trades["balance"]) / running_peak * 100).max()
 
-        paper_stats  = {"win_rate_pct": p_wr, "expectancy_net_r": p_exp, "max_drawdown_pct": paper_dd}
+        paper_stats  = {
+            "win_rate_pct":     p_wr,
+            "expectancy_net_r": p_exp,
+            "net_ev":           p_net_ev,
+            "max_drawdown_pct": paper_dd,
+        }
         bt_oos_stats = {
-            "win_rate_pct":     best_row.get("OOS_win_rate_pct", None),
+            "win_rate_pct":     best_row.get("OOS_win_rate_pct",     None),
             "expectancy_net_r": best_row.get("OOS_expectancy_net_r", None),
+            "net_ev":           best_row.get("OOS_net_ev",           None),
             "max_drawdown_pct": best_row.get("OOS_max_drawdown_pct", None),
         }
 
@@ -899,7 +1052,7 @@ def page_paper() -> None:
             st.markdown("**Backtest OOS  (best combo)**")
             for label, key, unit in metrics:
                 v = bt_oos_stats.get(key)
-                st.metric(label, f"{v:.2f}{unit}" if v is not None else "—")
+                st.metric(label, f"{v:.4f}{unit}" if v is not None else "—")
         with cmp_r:
             st.markdown("**Paper Trading (live)**")
             for label, key, unit in metrics:
@@ -908,15 +1061,15 @@ def page_paper() -> None:
                 delta = None
                 if pv is not None and bv is not None:
                     try:
-                        delta = round(float(pv) - float(bv), 2)
+                        delta = round(float(pv) - float(bv), 4)
                     except Exception:
                         pass
-                st.metric(label, f"{pv:.2f}{unit}" if pv is not None else "—", delta=delta)
+                st.metric(label, f"{pv:.4f}{unit}" if pv is not None else "—", delta=delta)
 
     st.divider()
 
-    # ── Section 5: Last 30 Log Lines ──────────────────────────────────────────
-    st.subheader("5 · Last 30 Log Lines  (`trading_log.txt`)")
+    # ── Section 6: Last 30 Log Lines ──────────────────────────────────────────
+    st.subheader("6 · Last 30 Log Lines  (`trading_log.txt`)")
     if not lines:
         st.info("trading_log.txt not found or empty.")
     else:
@@ -1170,8 +1323,74 @@ def page_live_trading() -> None:
 
     st.divider()
 
-    # ── Section 4: Three Equity Curves ────────────────────────────────────────
-    st.subheader("4 · Equity Curves  (Backtest · Paper · Live)")
+    # ── Section 4: Rolling EV (Paper trades — proxy for live performance) ─────
+    st.subheader("4 · Rolling Expected Value")
+    _live_opt_df = load_opt()
+    _live_bt_ev  = None
+    if _live_opt_df is not None and not _live_opt_df.empty:
+        _live_bt_ev = _live_opt_df.iloc[0].get("OOS_net_ev")
+
+    _paper_for_ev = parse_paper_trades(lines)
+
+    if live_trd.empty and _paper_for_ev.empty:
+        st.info(
+            "No paper or live trades with sufficient data to compute rolling EV. "
+            "Live trade R is derived from paper trading logs (net_pips required)."
+        )
+    else:
+        _ev_src = _paper_for_ev if not _paper_for_ev.empty else pd.DataFrame()
+        _rev2   = _rolling_ev_df(_ev_src) if not _ev_src.empty else pd.DataFrame()
+
+        if _rev2.empty:
+            st.info("Insufficient data for rolling EV chart.")
+        else:
+            rev_l1, rev_l2, rev_l3 = st.columns(3)
+            rev_l1.metric("EV all trades", f"{_rev2['ev_all'].iloc[-1]:.4f} R")
+            rev_l2.metric("EV last 20",    f"{_rev2['ev_last20'].iloc[-1]:.4f} R")
+            rev_l3.metric("EV last 10",    f"{_rev2['ev_last10'].iloc[-1]:.4f} R")
+
+            _ev_fig2 = go.Figure()
+            _x2 = _rev2["trade_#"].values
+            _ev_fig2.add_trace(go.Scatter(
+                x=_x2, y=_rev2["ev_all"].values,
+                name="EV all trades", line=dict(color="#4da6ff", width=2),
+            ))
+            _ev_fig2.add_trace(go.Scatter(
+                x=_x2, y=_rev2["ev_last20"].values,
+                name="EV last 20", line=dict(color="#26c26e", width=1.8, dash="dash"),
+            ))
+            _ev_fig2.add_trace(go.Scatter(
+                x=_x2, y=_rev2["ev_last10"].values,
+                name="EV last 10", line=dict(color="#ffd700", width=1.5, dash="dot"),
+            ))
+            _ev_fig2.add_hline(y=0, line=dict(color="white", dash="dot", width=0.7))
+
+            if _live_bt_ev is not None:
+                _ev_fig2.add_hline(
+                    y=float(_live_bt_ev),
+                    line=dict(color="orange", dash="longdash", width=1.2),
+                    annotation_text=f"Backtest OOS EV ({_live_bt_ev:.4f} R)",
+                    annotation_position="bottom right",
+                )
+                _thr2 = float(_live_bt_ev) * 0.80
+                if _live_bt_ev > 0 and _rev2[["ev_all","ev_last20","ev_last10"]].min().min() < _thr2:
+                    st.error(
+                        f"⚠️  Rolling EV has dropped more than 20% below backtest EV "
+                        f"({_live_bt_ev:.4f} R). Review recent trades."
+                    )
+
+            _ev_fig2.update_layout(
+                height=360, template="plotly_dark",
+                xaxis_title="Trade #", yaxis_title="EV (R/trade)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                title="Rolling EV (from paper trading log) vs Backtest Reference",
+            )
+            st.plotly_chart(_ev_fig2, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 5: Three Equity Curves ────────────────────────────────────────
+    st.subheader("5 · Equity Curves  (Backtest · Paper · Live)")
     st.caption("Backtest curve loads from CSV — no MT5 connection required.")
 
     eq_bt     = load_equity()
@@ -1218,8 +1437,8 @@ def page_live_trading() -> None:
 
     st.divider()
 
-    # ── Section 5: Live vs Paper vs Backtest Comparison ───────────────────────
-    st.subheader("5 · Live vs Paper vs Backtest Comparison")
+    # ── Section 6: Live vs Paper vs Backtest Comparison ───────────────────────
+    st.subheader("6 · Live vs Paper vs Backtest Comparison")
 
     opt_df = load_opt()
 
@@ -1252,6 +1471,7 @@ def page_live_trading() -> None:
         return dict(
             win_rate=best.get("OOS_win_rate_pct"),
             expectancy=best.get("OOS_expectancy_net_r"),
+            net_ev=best.get("OOS_net_ev"),
             max_dd=best.get("OOS_max_drawdown_pct"),
         )
 
@@ -1259,9 +1479,16 @@ def page_live_trading() -> None:
     live_s   = _paper_stats(parse_paper_trades([])) if live_trd.empty else {}
     bt_s     = _bt_oos_stats(opt_df)
 
+    # Paper net EV
+    if not paper_trd.empty:
+        _rev = _rolling_ev_df(paper_trd)
+        if not _rev.empty:
+            paper_s["net_ev"] = float(_rev["ev_all"].iloc[-1])
+
     metrics_def = [
         ("Win Rate %",       "win_rate",    "win_rate",    "%",  False),
         ("Expectancy R",     "expectancy",  "expectancy",  " R", False),
+        ("Net EV",           "net_ev",      "net_ev",      " R", False),
         ("Avg Win R",        "avg_win_r",   None,          " R", False),
         ("Avg Loss R",       "avg_loss_r",  None,          " R", True),
         ("Max Drawdown %",   "max_dd",      "max_dd",      "%",  True),
@@ -1324,8 +1551,8 @@ def page_live_trading() -> None:
 
     st.divider()
 
-    # ── Section 6: Recent Log Entries ─────────────────────────────────────────
-    st.subheader("6 · Recent Log Entries")
+    # ── Section 7: Recent Log Entries ─────────────────────────────────────────
+    st.subheader("7 · Recent Log Entries")
     if not lines:
         st.info("trading_log.txt not found or empty.")
     else:
@@ -1370,5 +1597,39 @@ with st.sidebar:
     else:
         st.error("🔴 MT5 not connected")
     st.caption("Run `python backtest_engine.py` to generate data files.")
+
+    # ── KPI indicators ────────────────────────────────────────────────────────
+    st.divider()
+    _kpis = _sidebar_kpis()
+    if _kpis:
+        _src_label = "paper" if _kpis.get("source") == "paper" else "backtest OOS"
+        st.caption(f"KPIs from {_src_label}")
+
+        _ev = _kpis.get("net_ev")
+        if _ev is not None:
+            if _ev >= 0:
+                st.success(f"EV: **+{_ev:.4f} R/trade**")
+            else:
+                st.error(f"EV: **{_ev:.4f} R/trade**")
+
+        _dd = _kpis.get("max_dd")
+        if _dd is not None:
+            _dd = float(_dd)
+            if _dd < 5:
+                st.success(f"Max DD: **{_dd:.1f}%**")
+            elif _dd < 10:
+                st.warning(f"Max DD: **{_dd:.1f}%**")
+            else:
+                st.error(f"Max DD: **{_dd:.1f}%**")
+
+        _wr = _kpis.get("win_rate")
+        if _wr is not None:
+            _wr = float(_wr)
+            if _wr >= 40:
+                st.success(f"Win Rate: **{_wr:.1f}%**")
+            elif _wr >= 30:
+                st.warning(f"Win Rate: **{_wr:.1f}%**")
+            else:
+                st.error(f"Win Rate: **{_wr:.1f}%**")
 
 PAGES[page]()
