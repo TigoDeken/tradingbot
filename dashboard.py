@@ -237,6 +237,46 @@ def _metric_row(m: dict, prefix: str = "") -> None:
 
 # ── Page 1: Backtest Results ──────────────────────────────────────────────────
 
+# Parameter grid exactly as defined in backtest_engine.py
+_BT_PARAM_DEFS = [
+    # (csv_col,            state_key,         options,             cast)
+    ("SWING_N",            "bt_swing_n",      [2, 3],              int),
+    ("MIN_SWING_SIZE",     "bt_min_sz",       [15, 20, 25],        int),
+    ("MIN_SWING_INCR",     "bt_min_incr",     [8, 10, 15],         int),
+    ("MIN_TREND_SIZE",     "bt_trend_sz",     [40, 50, 60],        int),
+    ("TREND_RANGE_RATIO",  "bt_trend_rr",     [0.30, 0.40, 0.50], float),
+    ("PULLBACK_LOOKBACK",  "bt_pb_lb",        [3, 4, 5],           int),
+    ("STOP_BUFFER",        "bt_sb",           [3, 5, 8],           int),
+    ("TP_MODE",            "bt_tp",           ["full", "partial"], str),
+]
+
+
+def _bt_init_state() -> None:
+    for _, sk, opts, _ in _BT_PARAM_DEFS:
+        if sk not in st.session_state:
+            st.session_state[sk] = opts[0]
+
+
+def _bt_set_combo(row) -> None:
+    """Write all parameter values from an opt_df row into session state."""
+    for col, sk, _, cast in _BT_PARAM_DEFS:
+        st.session_state[sk] = cast(row[col])
+
+
+def _bt_lookup(opt_df: pd.DataFrame) -> pd.DataFrame:
+    """Return rows of opt_df matching the current session-state selection."""
+    mask = pd.Series([True] * len(opt_df), index=opt_df.index)
+    for col, sk, _, cast in _BT_PARAM_DEFS:
+        v = st.session_state[sk]
+        if cast is float:
+            mask &= (opt_df[col].astype(float) - float(v)).abs() < 1e-9
+        elif cast is int:
+            mask &= opt_df[col].astype(int) == int(v)
+        else:
+            mask &= opt_df[col].astype(str) == str(v)
+    return opt_df[mask]
+
+
 def page_backtest() -> None:
     st.title("📊 Backtest Results")
 
@@ -244,30 +284,68 @@ def page_backtest() -> None:
     trade_df = load_trades()
     eq_df    = load_equity()
 
-    missing = (["`optimisation_results.csv`"] if opt_df   is None else [] +
-               ["`trade_log.csv`"]            if trade_df is None else [] +
-               ["`equity_curve.csv`"]         if eq_df    is None else [])
-    if missing:
-        st.error(f"Missing: {', '.join(missing)}. Run `python backtest_engine.py` first.")
+    if opt_df is None:
+        st.error("Missing `optimisation_results.csv`. Run `python backtest_engine.py` first.")
         return
 
-    # ── Combo selector ────────────────────────────────────────────────────────
-    def _label(row):
-        return (
-            f"#{int(row.name)+1}  "
-            f"N={row['SWING_N']} SZ={row['MIN_SWING_SIZE']} INC={row['MIN_SWING_INCR']} "
-            f"TR={int(row['MIN_TREND_SIZE'])} RR={row['TREND_RANGE_RATIO']} "
-            f"LB={int(row['PULLBACK_LOOKBACK'])} SB={int(row['STOP_BUFFER'])} TP={row['TP_MODE']}"
-            f"  |  OOS exp={row['OOS_expectancy_net_r']:.3f}R  IS exp={row['IS_expectancy_net_r']:.3f}R"
-        )
+    _bt_init_state()
 
-    labels  = [_label(row) for _, row in opt_df.iterrows()]
-    sel_idx = st.selectbox("Parameter combination", range(len(labels)),
-                            format_func=lambda i: labels[i])
-    sel     = opt_df.iloc[sel_idx]
+    # ── Sidebar: parameter selection ──────────────────────────────────────────
+    with st.sidebar:
+        st.subheader("Parameter selection")
+        for col, sk, opts, cast in _BT_PARAM_DEFS:
+            st.radio(
+                col, opts,
+                format_func=lambda o: f"{o:.2f}" if isinstance(o, float) else str(o),
+                key=sk,
+            )
+
+        st.divider()
+        st.subheader("Best combinations")
+
+        if st.button("Best in-sample EV", use_container_width=True):
+            col_name = "IS_net_ev" if "IS_net_ev" in opt_df.columns else "IS_expectancy_net_r"
+            _bt_set_combo(opt_df.loc[opt_df[col_name].idxmax()])
+            st.rerun()
+
+        if st.button("Best out-of-sample EV", use_container_width=True):
+            col_name = "OOS_net_ev" if "OOS_net_ev" in opt_df.columns else "OOS_expectancy_net_r"
+            _bt_set_combo(opt_df.loc[opt_df[col_name].idxmax()])
+            st.rerun()
+
+        if st.button("Most trades", use_container_width=True):
+            _t_col = pd.Series(0, index=opt_df.index, dtype=float)
+            for c in ("IS_total_trades", "OOS_total_trades"):
+                if c in opt_df.columns:
+                    _t_col = _t_col + opt_df[c].astype(float)
+            _bt_set_combo(opt_df.loc[_t_col.idxmax()])
+            st.rerun()
+
+    # ── Resolve current selection ─────────────────────────────────────────────
+    matches = _bt_lookup(opt_df)
+
+    if matches.empty:
+        st.warning(
+            "⚠️ **This combination was not tested.**  "
+            "The optimisation grid does not include every permutation. "
+            "Adjust the controls in the sidebar or use one of the **Best combinations** buttons."
+        )
+        return
+
+    sel       = matches.iloc[0]
+    sel_rank  = int(sel.name) + 1   # opt_df is reset_index(drop=True) after sort
+    total     = len(opt_df)
+    oos_exp   = float(sel.get("OOS_expectancy_net_r", float("nan")))
+    is_exp    = float(sel.get("IS_expectancy_net_r",  float("nan")))
 
     is_m  = {k[3:]: sel[k] for k in opt_df.columns if k.startswith("IS_")}
     oos_m = {k[4:]: sel[k] for k in opt_df.columns if k.startswith("OOS_")}
+
+    # ── Rank banner ───────────────────────────────────────────────────────────
+    st.info(
+        f"**Rank {sel_rank} of {total}** combinations tested (sorted by OOS expectancy)  ·  "
+        f"OOS exp: {oos_exp:.4f} R  ·  IS exp: {is_exp:.4f} R"
+    )
 
     # ── Metric rows ───────────────────────────────────────────────────────────
     st.subheader("In-Sample  (first 70% by date)")
@@ -334,27 +412,33 @@ def page_backtest() -> None:
 
     # ── Equity curve ──────────────────────────────────────────────────────────
     st.subheader("Equity Curve  (default-parameter run)")
-    split_n = int(is_m.get("total_trades", 0)) or None
-    st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
+    if eq_df is not None:
+        split_n = int(is_m.get("total_trades", 0)) or None
+        st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
+    else:
+        st.info("No `equity_curve.csv` found. Run `python backtest_engine.py` first.")
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     st.subheader("Trade Log  (default-parameter run)")
-    show_cols = [c for c in [
-        "trade_id", "direction", "entry_date", "entry_price",
-        "exit_date", "exit_price", "exit_reason",
-        "net_pips", "net_r", "duration_hours",
-    ] if c in trade_df.columns]
-    show = trade_df[show_cols].copy()
-    if "net_pips" in show.columns:
-        show["net_pips"] = show["net_pips"].round(0).astype("Int64")
-    st.dataframe(show, use_container_width=True, height=360)
+    if trade_df is not None:
+        show_cols = [c for c in [
+            "trade_id", "direction", "entry_date", "entry_price",
+            "exit_date", "exit_price", "exit_reason",
+            "net_pips", "net_r", "duration_hours",
+        ] if c in trade_df.columns]
+        show = trade_df[show_cols].copy()
+        if "net_pips" in show.columns:
+            show["net_pips"] = show["net_pips"].round(0).astype("Int64")
+        st.dataframe(show, use_container_width=True, height=360)
 
-    st.download_button(
-        "⬇  Download trade log",
-        data=trade_df.to_csv(index=False).encode(),
-        file_name="trade_log.csv",
-        mime="text/csv",
-    )
+        st.download_button(
+            "⬇  Download trade log",
+            data=trade_df.to_csv(index=False).encode(),
+            file_name="trade_log.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No `trade_log.csv` found. Run `python backtest_engine.py` first.")
 
 
 # ── Page 2: Live Regime Monitor ───────────────────────────────────────────────
