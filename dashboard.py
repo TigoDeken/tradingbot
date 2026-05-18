@@ -31,6 +31,19 @@ try:
 except Exception as e:
     _import_err = str(e)
 
+# ── MT5 connection probe ──────────────────────────────────────────────────────
+
+def _mt5_connected() -> bool:
+    """Return True only if the MetaTrader5 package is importable and the
+    terminal reports an active connection. Never raises."""
+    try:
+        import MetaTrader5 as _mt5
+        info = _mt5.terminal_info()
+        return info is not None and bool(info.connected)
+    except Exception:
+        return False
+
+
 # ── Paths & constants ─────────────────────────────────────────────────────────
 OPT_CSV    = Path("optimisation_results.csv")
 TRADE_CSV  = Path("trade_log.csv")
@@ -322,7 +335,11 @@ def page_live() -> None:
     st.title("📡 Live Regime Monitor")
 
     if not PIPELINE_OK:
-        st.error(f"Pipeline modules unavailable: {_import_err}")
+        st.warning(
+            "⚠️ **MT5 not connected — live data unavailable.**\n\n"
+            "MetaTrader 5 must be installed and running on this machine to use this page. "
+            f"_(Import error: {_import_err})_"
+        )
         return
 
     # Load best params from optimisation results
@@ -357,9 +374,8 @@ def page_live() -> None:
 
     if err or df_raw is None:
         st.warning(
-            f"⚠  MT5 not connected or data unavailable.  "
-            f"Make sure MetaTrader 5 is open and logged in.  "
-            f"Error: {err or 'unknown'}"
+            "⚠️ **MT5 not connected — live data unavailable.**\n\n"
+            "Make sure MetaTrader 5 is open and logged in to your broker account."
         )
         return
 
@@ -1023,8 +1039,9 @@ def page_live_trading() -> None:
     acct = _mt5_account_info()
     if acct is None:
         st.warning(
-            "MT5 account data unavailable. "
-            "MetaTrader 5 must be open and connected to display account information."
+            "⚠️ **MT5 not connected — live data unavailable.**\n\n"
+            "Open MetaTrader 5 and log in to your broker account to see live balance, "
+            "equity, and margin information."
         )
     else:
         st.caption(
@@ -1155,6 +1172,7 @@ def page_live_trading() -> None:
 
     # ── Section 4: Three Equity Curves ────────────────────────────────────────
     st.subheader("4 · Equity Curves  (Backtest · Paper · Live)")
+    st.caption("Backtest curve loads from CSV — no MT5 connection required.")
 
     eq_bt     = load_equity()
     paper_trd = parse_paper_trades(lines)
@@ -1347,8 +1365,10 @@ with st.sidebar:
     st.divider()
     page = st.radio("", list(PAGES.keys()), label_visibility="collapsed")
     st.divider()
+    if _mt5_connected():
+        st.success("🟢 MT5 connected")
+    else:
+        st.error("🔴 MT5 not connected")
     st.caption("Run `python backtest_engine.py` to generate data files.")
-    if not PIPELINE_OK:
-        st.warning(f"Pipeline import error:\n{_import_err}")
 
 PAGES[page]()
