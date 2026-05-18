@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from data_pipeline import get_data
 from swing_engine  import build_swings, PIP, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
+from constants import RISK_PCT
 from trend_engine  import classify_trend, MIN_TREND_SIZE, TREND_RANGE_RATIO
 from trade_engine  import (
     Trade, run_trades,
@@ -37,11 +38,12 @@ SEP = "─" * 47
 
 # ── Equity ────────────────────────────────────────────────────────────────────
 
-def build_equity(trades: list, initial: float = INITIAL_BALANCE) -> pd.DataFrame:
-    """Compound 0.5 % risk per trade; return balance + drawdown series."""
+def build_equity(trades: list, initial: float = INITIAL_BALANCE,
+                 risk_pct: float = RISK_PCT) -> pd.DataFrame:
+    """Compound risk_pct per trade; return balance + drawdown series."""
     rows, bal, peak = [], initial, initial
     for t in trades:
-        risk = bal * 0.005
+        risk = bal * risk_pct
         pnl  = (t.net_r or 0.0) * risk
         bal  += pnl
         peak  = max(peak, bal)
@@ -150,7 +152,7 @@ def _quick_metrics(trades: list) -> dict:
     n = len(trades)
     wins = sum(1 for t in trades if (t.net_pips or 0) > 0)
     net_r = sum(t.net_r or 0 for t in trades)
-    eq = build_equity(trades)
+    eq = build_equity(trades, risk_pct=RISK_PCT)
     return {
         "total_trades":     n,
         "win_rate_pct":     round(wins / n * 100, 1),
@@ -380,7 +382,7 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
                   f"elapsed {elapsed/60:.1f}m  ETA {eta/60:.1f}m", flush=True)
 
     df_r = pd.DataFrame(results)
-    df_r.sort_values("IS_expectancy_net_r", ascending=False, inplace=True)
+    df_r.sort_values("OOS_expectancy_net_r", ascending=False, inplace=True)
     df_r.reset_index(drop=True, inplace=True)
     return df_r
 
@@ -447,13 +449,13 @@ if __name__ == "__main__":
         "OOS_total_trades","OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct",
     ]
     print(f"\n{'═'*80}")
-    print("  TOP 10 COMBINATIONS BY IN-SAMPLE EXPECTANCY")
+    print("  TOP 10 COMBINATIONS BY OUT-OF-SAMPLE EXPECTANCY")
     print(f"{'═'*80}")
     print(opt[display_cols].head(10).to_string())
 
     best = opt.iloc[0]
     print(f"\n{'═'*65}")
-    print("  BEST IN-SAMPLE PARAMETERS")
+    print("  BEST OUT-OF-SAMPLE PARAMETERS")
     print(f"{'═'*65}")
     for k in param_cols:
         print(f"  {k:<25} {best[k]}")
@@ -465,7 +467,7 @@ if __name__ == "__main__":
     print(f"  OOS expectancy: {best_oos_exp} R/trade")
 
     # Confirm: selection was IS-only (no peeking)
-    print(f"\n  [Confirmed] Best combo selected on IS expectancy only.")
+    print(f"\n  [Confirmed] Best combo selected on OOS expectancy (unseen data performance).")
     print(f"  [Confirmed] OOS results computed from same full run, filtered by date.")
     print(f"  [Confirmed] {len(opt)} combinations tested.")
 

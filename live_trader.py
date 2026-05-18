@@ -25,9 +25,9 @@ from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fe
 from swing_engine   import build_swings, PIP
 from trend_engine   import classify_trend
 from trade_engine   import _compute_setup, _confirmed_at, _pullback_depths, PIP_VALUE
+from constants import MAGIC, MAX_LIMIT_BARS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAGIC        = 20240101       # unique magic number for all our MT5 orders
 CONFIG_PATH  = Path("config.json")
 STATE_PATH   = Path("state.json")
 LOG_PATH     = Path("trading_log.txt")
@@ -111,8 +111,10 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     state["last_updated"] = pd.Timestamp.now(tz="UTC").isoformat()
-    with open(STATE_PATH, "w") as f:
+    tmp = STATE_PATH.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2, default=str)
+    tmp.replace(STATE_PATH)  # atomic rename — prevents corrupt state.json on crash
 
 
 # ── MT5 connection ────────────────────────────────────────────────────────────
@@ -243,6 +245,7 @@ def paper_place_limit(state: dict, direction: str, entry: float, stop: float,
     state["pending_limit"] = {
         "direction": direction, "price": entry,
         "stop": stop, "tp1": tp1, "lot": lot,
+        "placed_time": pd.Timestamp.now(tz="UTC").isoformat(),
     }
     logger.info(
         f"[PAPER] Limit {direction.upper()} {lot} lots @ {entry:.5f}  "
@@ -335,6 +338,7 @@ def live_place_limit(config: dict, state: dict, direction: str, entry: float,
     state["pending_limit"] = {
         "direction": direction, "price": entry,
         "stop": stop, "tp1": tp1, "lot": lot, "ticket": result.order,
+        "placed_time": pd.Timestamp.now(tz="UTC").isoformat(),
     }
 
 

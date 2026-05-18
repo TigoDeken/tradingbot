@@ -9,7 +9,7 @@ from data_pipeline import get_data
 SWING_N = 2
 MIN_SWING_SIZE = 20       # pips — minimum candle range to qualify
 MIN_SWING_INCREMENT = 10  # pips — minimum move between consecutive same-type swings
-PIP = 0.0001              # EURUSD pip value
+from constants import PIP  # re-exported so other modules can still do: from swing_engine import PIP
 
 
 def _detect_raw(df: pd.DataFrame, n: int) -> tuple[list[int], list[int]]:

@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from data_pipeline import get_data
-from swing_engine import build_swings, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT, PIP
+from constants import PIP
+from swing_engine import build_swings, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
 
 # Parameters — all configurable
 MIN_TREND_SIZE   = 50    # pips — minimum total trend size to qualify
@@ -75,7 +76,7 @@ def classify_trend(
                     l[1] - l[0] >= min_incr and l[2] - l[1] >= min_incr):
                 trend_size = h[2] - l[0]   # most recent high − oldest low
                 if trend_size >= min_size and trend_size / rng >= trend_range_ratio:
-                    diffs = np.concatenate([np.diff(h), np.diff(l)]) / pip
+                    diffs = np.abs(np.concatenate([np.diff(h), np.diff(l)])) / pip
                     strengths[i] = float(diffs.mean())
                     regimes[i] = "UPTREND"
 
@@ -88,6 +89,12 @@ def classify_trend(
                     diffs = np.abs(np.concatenate([np.diff(h), np.diff(l)])) / pip
                     strengths[i] = float(diffs.mean())
                     regimes[i] = "DOWNTREND"
+
+    # Hysteresis: once a trend is confirmed, maintain it through AMBIGUOUS bars.
+    # Only flip when the *opposite* trend is explicitly confirmed.
+    for i in range(1, len(regimes)):
+        if regimes[i] == "AMBIGUOUS" and regimes[i - 1] in ("UPTREND", "DOWNTREND"):
+            regimes[i] = regimes[i - 1]
 
     df["regime"] = regimes
     df["trend_strength_score"] = np.where(regimes == "AMBIGUOUS", np.nan, strengths)

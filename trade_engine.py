@@ -11,11 +11,12 @@ from swing_engine import build_swings, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREM
 from trend_engine import classify_trend, MIN_TREND_SIZE, TREND_RANGE_RATIO
 
 # ── Parameters ────────────────────────────────────────────────────────────────
+from constants import PIP_VALUE, RISK_PCT  # noqa: F401 (PIP_VALUE re-exported)
+
 PULLBACK_LOOKBACK = 4
 STOP_BUFFER       = 5        # pips
 TP_MODE           = "full"   # "full" | "partial"
 SLIPPAGE_PIPS     = 3
-PIP_VALUE         = 10.0     # USD per pip per standard lot, EURUSD
 ACCOUNT_BALANCE   = 10_000.0
 
 
@@ -52,9 +53,9 @@ class Trade:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _in_session(ts: pd.Timestamp) -> bool:
-    """True if ts (UTC) is within the 07:00–20:00 entry window."""
-    return 7 <= ts.hour < 20
+def _in_session(ts: pd.Timestamp, session_start: int = 7, session_end: int = 20) -> bool:
+    """True if ts (UTC) falls within the configured session window."""
+    return session_start <= ts.hour < session_end
 
 
 def _confirmed_at(swings: pd.DataFrame, bar_i: int, swing_n: int) -> pd.DataFrame:
@@ -134,8 +135,9 @@ def _compute_setup(
     return round(entry, 5), round(stop, 5), round(tp1, 5)
 
 
-def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: float) -> float:
-    risk      = balance * 0.005
+def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: float,
+              risk_pct: float = RISK_PCT) -> float:
+    risk      = balance * risk_pct
     stop_pips = abs(entry - stop) / pip
     if stop_pips == 0:
         return 0.0
@@ -185,6 +187,9 @@ def run_trades(
     slippage_pips:    float = SLIPPAGE_PIPS,
     pip:              float = PIP,
     pip_value:        float = PIP_VALUE,
+    risk_pct:         float = RISK_PCT,
+    session_start:    int   = 7,
+    session_end:      int   = 20,
 ) -> list[Trade]:
     """
     Iterate bar-by-bar and simulate limit-order entries with stop/TP/trail exits.
@@ -265,7 +270,7 @@ def run_trades(
             continue
 
         regime = row.get("regime", "AMBIGUOUS")
-        if regime not in ("UPTREND", "DOWNTREND") or not _in_session(bar_date):
+        if regime not in ("UPTREND", "DOWNTREND") or not _in_session(bar_date, session_start, session_end):
             continue
 
         direction = "long" if regime == "UPTREND" else "short"
@@ -277,7 +282,7 @@ def run_trades(
             continue
 
         entry, stop, tp1 = setup
-        lot = _lot_size(account_balance, entry, stop, pip, pip_value)
+        lot = _lot_size(account_balance, entry, stop, pip, pip_value, risk_pct)
         if lot <= 0:
             continue
 

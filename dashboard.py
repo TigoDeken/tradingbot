@@ -245,7 +245,7 @@ def page_backtest() -> None:
             f"N={row['SWING_N']} SZ={row['MIN_SWING_SIZE']} INC={row['MIN_SWING_INCR']} "
             f"TR={int(row['MIN_TREND_SIZE'])} RR={row['TREND_RANGE_RATIO']} "
             f"LB={int(row['PULLBACK_LOOKBACK'])} SB={int(row['STOP_BUFFER'])} TP={row['TP_MODE']}"
-            f"  |  IS exp={row['IS_expectancy_net_r']:.3f}R"
+            f"  |  OOS exp={row['OOS_expectancy_net_r']:.3f}R  IS exp={row['IS_expectancy_net_r']:.3f}R"
         )
 
     labels  = [_label(row) for _, row in opt_df.iterrows()]
@@ -330,7 +330,7 @@ def page_live() -> None:
     if opt_df is not None:
         best   = opt_df.iloc[0]
         params = {c: best[c] for c in PARAM_COLS}
-        st.caption(f"Using best in-sample parameters (rank #1): {dict(params)}")
+        st.caption(f"Using best out-of-sample parameters (rank #1 by OOS expectancy): {dict(params)}")
     else:
         # Fall back to module defaults
         from swing_engine  import SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
@@ -740,7 +740,7 @@ def page_paper() -> None:
     else:
         s1, s2, s3, s4 = st.columns(4)
 
-        bal = state.get("session_start_balance") or state.get("balance", 0)
+        bal = state.get("session_starting_balance") or state.get("current_balance", 0)
         s1.metric("Session Start Balance", f"${bal:,.2f}")
 
         # derive peak balance from trade history
@@ -863,10 +863,11 @@ def page_paper() -> None:
             ("Max DD %",     "max_drawdown_pct",  "%"),
         ]
 
-        # Paper stats
+        # Paper stats — compute R using actual stop distance per trade
         p_wr  = wr  # computed above
-        p_exp = paper_trades["net_pips"].mean() / 10.0  # approx R using 10pip/R
-        neg_trades = paper_trades[paper_trades["balance"] < paper_trades["balance"].iloc[0]]
+        _sp   = (paper_trades["entry_price"] - paper_trades["stop_price"]).abs() / 0.0001
+        _nr   = paper_trades["net_pips"] / _sp.replace(0, float("nan"))
+        p_exp = float(_nr.mean()) if not _nr.empty else 0.0
         running_peak = paper_trades["balance"].cummax()
         paper_dd = ((running_peak - paper_trades["balance"]) / running_peak * 100).max()
 
@@ -934,16 +935,12 @@ def page_paper() -> None:
     else:
         st.info("Complete all checklist items above before going live.")
 
-    # Auto-refresh every 60 seconds
-    st.caption(f"Auto-refreshing every 60 s · Last render: {now_utc}")
+    # Auto-refresh: render content fully, then sleep 60 s and re-render
     import time as _time
-    _time.sleep(0)  # yield to allow st.rerun scheduling
-    if "paper_auto_ts" not in st.session_state:
-        st.session_state.paper_auto_ts = _time.time()
-    if _time.time() - st.session_state.paper_auto_ts >= 60:
-        st.session_state.paper_auto_ts = _time.time()
-        st.session_state.paper_refresh_key += 1
-        st.rerun()
+    st.caption(f"Auto-refreshing every 60 s · {now_utc}")
+    _time.sleep(60)
+    st.session_state.paper_refresh_key += 1
+    st.rerun()
 
 
 # ── Page 5: Live Trading ──────────────────────────────────────────────────────
@@ -1220,9 +1217,11 @@ def page_live_trading() -> None:
         wins   = (trd["net_pips"] > 0).sum()
         total  = len(trd)
         wr     = wins / total * 100 if total else 0
-        exp    = trd["net_pips"].mean() / 10.0
-        avg_w  = trd.loc[trd["net_pips"] > 0, "net_pips"].mean() / 10.0 if wins else None
-        avg_l  = trd.loc[trd["net_pips"] <= 0, "net_pips"].mean() / 10.0 if (total - wins) else None
+        _sp    = (trd["entry_price"] - trd["stop_price"]).abs() / 0.0001
+        _nr    = trd["net_pips"] / _sp.replace(0, float("nan"))
+        exp    = float(_nr.mean()) if not _nr.empty else 0.0
+        avg_w  = float(_nr[trd["net_pips"] > 0].mean()) if wins else None
+        avg_l  = float(_nr[trd["net_pips"] <= 0].mean()) if (total - wins) else None
         peak   = trd["balance"].cummax()
         max_dd = ((peak - trd["balance"]) / peak * 100).max()
         return dict(win_rate=wr, expectancy=exp, avg_win_r=avg_w,
@@ -1325,13 +1324,12 @@ def page_live_trading() -> None:
         last30.reverse()
         st.code("\n".join(last30), language=None)
 
-    # Auto-refresh every 60 s
-    st.caption(f"Auto-refreshing every 60 s · {now_utc}")
+    # Auto-refresh: render content fully, then sleep 60 s and re-render
     import time as _time2
-    if _time2.time() - st.session_state.live_auto_ts >= 60:
-        st.session_state.live_auto_ts = _time2.time()
-        st.session_state.live_refresh_key += 1
-        st.rerun()
+    st.caption(f"Auto-refreshing every 60 s · {now_utc}")
+    _time2.sleep(60)
+    st.session_state.live_refresh_key += 1
+    st.rerun()
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
