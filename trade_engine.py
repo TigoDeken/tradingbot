@@ -126,7 +126,7 @@ def _close(
         gross = sign * (exit_px - trade.entry_price) / pip
 
     net       = gross - slippage     # slippage always costs (reduces wins, magnifies losses)
-    risk_pips = abs(trade.entry_price - trade.stop_price) / pip
+    risk_pips = abs(trade.tp1_price - trade.entry_price) / pip / 2.0
 
     trade.exit_date     = exit_date
     trade.exit_price    = round(exit_px, 5)
