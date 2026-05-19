@@ -154,16 +154,22 @@ def run_trades(
     session_end:      int   = 20,
     min_stop_pips:    float = MIN_STOP_PIPS,
     max_lot:          float = MAX_LOT,
+    max_open_lots:    float = 0.0,
+    min_pyramid_bars: int   = 2,
     **_kwargs,
 ) -> list[Trade]:
     """
     Iterate bar-by-bar and simulate consecutive-breakout entries with stop/TP/trail exits.
+    max_open_lots > 0 enables pyramiding: adds fire when a new setup forms in the same
+    direction, provided total open lots stay under the cap and min_pyramid_bars have elapsed.
+    Each add locks the previous position's stop at breakeven + slippage.
     Returns a list of completed Trade objects.
     """
-    trades:           list[Trade]          = []
-    open_trade:       Optional[Trade]      = None
+    trades:           list[Trade]     = []
+    open_trades:      list[Trade]     = []
     trade_id          = 0
-    last_entry_setup: Optional[tuple]      = None  # (direction, bar_index)
+    last_entry_setup: Optional[tuple] = None  # (direction, bar_index)
+    last_open_bar:    int             = -999  # bar index when last trade opened
 
     params = dict(
         pullback_lookback=pullback_lookback,
@@ -176,68 +182,79 @@ def run_trades(
         bar_date = df.index[i]
         h, l, c  = row["High"], row["Low"], row["Close"]
 
-        # ── 1. Manage open trade ─────────────────────────────────────────────
-        if open_trade is not None:
-            long = open_trade.direction == "long"
+        # ── 1. Manage all open trades ────────────────────────────────────────
+        any_closed = False
+        for ot in open_trades[:]:
+            long = ot.direction == "long"
 
-            if open_trade._tp1_hit:
-                # Partial trail mode: trail stop to previous bar's low/high
+            if ot._tp1_hit:
+                # Partial trail: trail stop to previous bar's low/high
                 if i >= 1:
                     if long:
                         recent_low = df.iloc[i - 1]["Low"]
-                        if open_trade._trail_stop is None or recent_low > open_trade._trail_stop:
-                            open_trade._trail_stop = recent_low
+                        if ot._trail_stop is None or recent_low > ot._trail_stop:
+                            ot._trail_stop = recent_low
                     else:
                         recent_high = df.iloc[i - 1]["High"]
-                        if open_trade._trail_stop is None or recent_high < open_trade._trail_stop:
-                            open_trade._trail_stop = recent_high
-                ts = open_trade._trail_stop or open_trade.entry_price
+                        if ot._trail_stop is None or recent_high < ot._trail_stop:
+                            ot._trail_stop = recent_high
+                ts = ot._trail_stop or ot.entry_price
                 if (long and c < ts) or (not long and c > ts):
-                    _close(open_trade, bar_date, c, "trail_exit", pip, slippage_pips)
-                    trades.append(open_trade); open_trade = None; continue
+                    _close(ot, bar_date, c, "trail_exit", pip, slippage_pips)
+                    trades.append(ot); open_trades.remove(ot); any_closed = True; continue
 
             else:
-                # Trail mode: ratchet stop to previous bar's extreme before checking
+                # Trail mode: ratchet stop to previous bar's extreme
                 if tp_mode == "trail" and i >= 1:
                     prev_bar = df.iloc[i - 1]
                     if long:
                         new_stop = prev_bar["Low"] - stop_buffer * pip
-                        if new_stop > open_trade.stop_price:
-                            open_trade.stop_price = round(new_stop, 5)
+                        if new_stop > ot.stop_price:
+                            ot.stop_price = round(new_stop, 5)
                     else:
                         new_stop = prev_bar["High"] + stop_buffer * pip
-                        if new_stop < open_trade.stop_price:
-                            open_trade.stop_price = round(new_stop, 5)
+                        if new_stop < ot.stop_price:
+                            ot.stop_price = round(new_stop, 5)
 
-                # Normal mode: stop takes priority over TP within same bar
+                # Stop takes priority over TP within the same bar
                 if long:
-                    if l <= open_trade.stop_price:
-                        _close(open_trade, bar_date, open_trade.stop_price, "stop", pip, slippage_pips)
-                        trades.append(open_trade); open_trade = None; continue
-                    if h >= open_trade.tp1_price and tp_mode != "trail":
+                    if l <= ot.stop_price:
+                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips)
+                        trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+                    if h >= ot.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
-                            _close(open_trade, bar_date, open_trade.tp1_price, "tp1", pip, slippage_pips)
-                            trades.append(open_trade); open_trade = None; continue
+                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips)
+                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                         else:
-                            open_trade._tp1_hit   = True
-                            open_trade._tp1_pips  = (open_trade.tp1_price - open_trade.entry_price) / pip
-                            open_trade._trail_stop = open_trade.entry_price
+                            ot._tp1_hit   = True
+                            ot._tp1_pips  = (ot.tp1_price - ot.entry_price) / pip
+                            ot._trail_stop = ot.entry_price
                 else:
-                    if h >= open_trade.stop_price:
-                        _close(open_trade, bar_date, open_trade.stop_price, "stop", pip, slippage_pips)
-                        trades.append(open_trade); open_trade = None; continue
-                    if l <= open_trade.tp1_price and tp_mode != "trail":
+                    if h >= ot.stop_price:
+                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips)
+                        trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+                    if l <= ot.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
-                            _close(open_trade, bar_date, open_trade.tp1_price, "tp1", pip, slippage_pips)
-                            trades.append(open_trade); open_trade = None; continue
+                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips)
+                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                         else:
-                            open_trade._tp1_hit   = True
-                            open_trade._tp1_pips  = (open_trade.entry_price - open_trade.tp1_price) / pip
-                            open_trade._trail_stop = open_trade.entry_price
+                            ot._tp1_hit   = True
+                            ot._tp1_pips  = (ot.entry_price - ot.tp1_price) / pip
+                            ot._trail_stop = ot.entry_price
 
-        # ── 2. Look for entry ────────────────────────────────────────────────
-        if open_trade is not None:
+        # ── 2. Look for entry (new trade or pyramid add) ─────────────────────
+        # Skip entry on the same bar a trade closed (matches original single-trade behaviour)
+        if any_closed and not open_trades:
             continue
+
+        if open_trades:
+            # Pyramiding gate: disabled, or at lot cap, or too soon after last add
+            if max_open_lots <= 0:
+                continue
+            if sum(t.lot_size for t in open_trades) >= max_open_lots:
+                continue
+            if (i - last_open_bar) < min_pyramid_bars:
+                continue
 
         if i < 2 or not _in_session(bar_date, session_start, session_end):
             continue
@@ -245,10 +262,9 @@ def run_trades(
         prev2 = df.iloc[i - 2]
         prev1 = df.iloc[i - 1]
 
-        # Median bar range over last pullback_lookback bars = expected pullback depth
-        pb_start  = max(0, i - pullback_lookback)
-        pb_pips   = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
-                                      for j in range(pb_start, i)]))
+        pb_start = max(0, i - pullback_lookback)
+        pb_pips  = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
+                                     for j in range(pb_start, i)]))
 
         result = _bar_setup(prev2, prev1, row, pb_pips, stop_buffer, pip, min_stop_pips)
         if result is None:
@@ -256,67 +272,93 @@ def run_trades(
 
         direction, entry, stop, tp1 = result
 
-        # Guard: don't re-enter on the same signal bar
         setup_key = (direction, i - 1)
         if setup_key == last_entry_setup:
             continue
+
+        # Pyramid-specific validation
+        if open_trades:
+            if any(t.direction != direction for t in open_trades):
+                continue  # only add in the same direction
+            # Add's stop must be above original entry (long) / below (short)
+            # — proves price has moved in our favour
+            original = open_trades[0]
+            if direction == "long"  and stop <= original.entry_price:
+                continue
+            if direction == "short" and stop >= original.entry_price:
+                continue
 
         lot = _lot_size(account_balance, entry, stop, pip, pip_value, risk_pct,
                         min_stop_pips=min_stop_pips, max_lot=max_lot)
         if lot <= 0:
             continue
 
-        # Limit order fills when the signal bar pulls back to entry
+        # Check that adding this lot won't breach the cap
+        if open_trades and (sum(t.lot_size for t in open_trades) + lot > max_open_lots):
+            continue
+
         filled = (direction == "long" and l <= entry) or \
                  (direction == "short" and h >= entry)
         if not filled:
             continue
 
-        last_entry_setup = setup_key
-        trade_id += 1
-        open_trade = Trade(
-            trade_id        = trade_id,
-            direction       = direction,
-            entry_date      = bar_date,
-            entry_price     = entry,
-            stop_price      = stop,
-            tp1_price       = tp1,
-            lot_size        = lot,
-            regime          = direction.upper() + "_SETUP",
-            trend_strength  = None,
-            params          = params.copy(),
-        )
+        # ── Confirmed fill ────────────────────────────────────────────────────
+        # Lock the most-recent open trade at breakeven + slippage (costs covered)
+        if open_trades:
+            prev_trade = open_trades[-1]
+            be_offset  = round(slippage_pips * pip, 5)
+            if direction == "long":
+                prev_trade.stop_price = round(prev_trade.entry_price + be_offset, 5)
+            else:
+                prev_trade.stop_price = round(prev_trade.entry_price - be_offset, 5)
 
-        # Same-bar exit check (stop beats TP if both reachable)
+        last_entry_setup = setup_key
+        last_open_bar    = i
+        trade_id        += 1
+        new_trade = Trade(
+            trade_id       = trade_id,
+            direction      = direction,
+            entry_date     = bar_date,
+            entry_price    = entry,
+            stop_price     = stop,
+            tp1_price      = tp1,
+            lot_size       = lot,
+            regime         = direction.upper() + ("_PYRAMID" if open_trades else "_SETUP"),
+            trend_strength = None,
+            params         = params.copy(),
+        )
+        open_trades.append(new_trade)
+
+        # Same-bar exit for the newly opened trade
         if direction == "long":
             if l <= stop:
-                _close(open_trade, bar_date, stop, "stop", pip, slippage_pips)
-                trades.append(open_trade); open_trade = None
+                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips)
+                trades.append(new_trade); open_trades.remove(new_trade)
             elif h >= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
-                    _close(open_trade, bar_date, tp1, "tp1", pip, slippage_pips)
-                    trades.append(open_trade); open_trade = None
+                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips)
+                    trades.append(new_trade); open_trades.remove(new_trade)
                 else:
-                    open_trade._tp1_hit   = True
-                    open_trade._tp1_pips  = (tp1 - entry) / pip
-                    open_trade._trail_stop = entry
+                    new_trade._tp1_hit   = True
+                    new_trade._tp1_pips  = (tp1 - entry) / pip
+                    new_trade._trail_stop = entry
         else:
             if h >= stop:
-                _close(open_trade, bar_date, stop, "stop", pip, slippage_pips)
-                trades.append(open_trade); open_trade = None
+                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips)
+                trades.append(new_trade); open_trades.remove(new_trade)
             elif l <= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
-                    _close(open_trade, bar_date, tp1, "tp1", pip, slippage_pips)
-                    trades.append(open_trade); open_trade = None
+                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips)
+                    trades.append(new_trade); open_trades.remove(new_trade)
                 else:
-                    open_trade._tp1_hit   = True
-                    open_trade._tp1_pips  = (entry - tp1) / pip
-                    open_trade._trail_stop = entry
+                    new_trade._tp1_hit   = True
+                    new_trade._tp1_pips  = (entry - tp1) / pip
+                    new_trade._trail_stop = entry
 
-    # Close any trade still open at end of data
-    if open_trade is not None:
-        _close(open_trade, df.index[-1], df["Close"].iloc[-1], "end_of_data", pip, slippage_pips)
-        trades.append(open_trade)
+    # Close any trades still open at end of data
+    for ot in open_trades:
+        _close(ot, df.index[-1], df["Close"].iloc[-1], "end_of_data", pip, slippage_pips)
+        trades.append(ot)
 
     return trades
 
