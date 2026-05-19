@@ -353,6 +353,12 @@ def page_backtest() -> None:
         st.subheader("Equity Curve")
         st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
 
+    # ── Recent trades chart ───────────────────────────────────────────────────
+    chart_path = selected_run / "chart_trades.png"
+    if chart_path.exists():
+        st.subheader("Recent Trades Chart (last 7 days)")
+        st.image(str(chart_path), use_container_width=True)
+
     # ── Trade log ─────────────────────────────────────────────────────────────
     trade_path = selected_run / "trade_log.csv"
     if trade_path.exists():
