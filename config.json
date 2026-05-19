@@ -11,5 +11,5 @@
   "max_drawdown_pct": 5.0,
   "max_open_lots": 0.4,
   "min_pyramid_bars": 2,
-  "close_strength": 0.0
+  "close_strength": 0.6
 }
