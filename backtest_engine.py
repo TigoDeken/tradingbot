@@ -306,52 +306,88 @@ def plot_recent_trades(df: pd.DataFrame, trades: list, path: str = "recent_trade
         print("No data in the last month — skipping recent trades chart.")
         return
 
-    fig, ax = plt.subplots(figsize=(20, 8))
+    fig, ax = plt.subplots(figsize=(22, 9), facecolor="#0e1117")
+    ax.set_facecolor("#0e1117")
 
     # Draw OHLC candles
-    width_days = pd.Timedelta(hours=3)
     for ts, row in df_plot.iterrows():
-        color = "green" if row["Close"] >= row["Open"] else "red"
-        # Wick
-        ax.plot([ts, ts], [row["Low"], row["High"]], color=color, lw=0.8, alpha=0.6)
-        # Body
+        bull = row["Close"] >= row["Open"]
+        c_body = "#26a69a" if bull else "#ef5350"
+        c_wick = "#26a69a" if bull else "#ef5350"
+        ax.plot([ts, ts], [row["Low"], row["High"]], color=c_wick, lw=0.8, alpha=0.7, zorder=1)
         ax.add_patch(plt.Rectangle(
             (mdates.date2num(ts.to_pydatetime()) - 0.055, min(row["Open"], row["Close"])),
-            0.11, abs(row["Close"] - row["Open"]),
-            color=color, alpha=0.85, zorder=2,
+            0.11, max(abs(row["Close"] - row["Open"]), 0.00001),
+            color=c_body, alpha=0.9, zorder=2,
             transform=ax.transData,
         ))
 
     # Draw trades
+    legend_entries = {}
     for t in visible:
         long = t.direction == "long"
-        color_entry = "royalblue" if long else "crimson"
-        arrow_dy = -0.0020 if long else 0.0020
+        c_dir  = "#4fa8e8" if long else "#f06292"   # blue / pink
 
+        # Recover original planned stop from tp1 (immune to BE mutations)
+        if long:
+            orig_stop = t.entry_price - (t.tp1_price - t.entry_price) / 2.0
+        else:
+            orig_stop = t.entry_price + (t.entry_price - t.tp1_price) / 2.0
+
+        exit_dt = t.exit_date if t.exit_date is not None else df_plot.index[-1]
+        win = (t.net_pips or 0) > 0
+
+        # Entry horizontal line
+        h = ax.hlines(t.entry_price, t.entry_date, exit_dt,
+                      colors=c_dir, lw=1.5, zorder=4, label="Entry")
+        legend_entries.setdefault("Entry", h)
+
+        # Entry arrow marker
+        dy = -(t.tp1_price - orig_stop) * 0.3 if long else (t.tp1_price - orig_stop) * 0.3
         ax.annotate("", xy=(t.entry_date, t.entry_price),
-                    xytext=(t.entry_date, t.entry_price + arrow_dy),
-                    arrowprops=dict(arrowstyle="->", color=color_entry, lw=2.0))
+                    xytext=(t.entry_date, t.entry_price + dy),
+                    arrowprops=dict(arrowstyle="->", color=c_dir, lw=1.8), zorder=5)
 
+        # Stop line (original planned stop, red dashed)
+        h2 = ax.hlines(orig_stop, t.entry_date, exit_dt,
+                       colors="#ff5252", linestyles="--", lw=1.2, alpha=0.85, zorder=3, label="Stop")
+        legend_entries.setdefault("Stop", h2)
+
+        # TP line (green dashed)
+        h3 = ax.hlines(t.tp1_price, t.entry_date, exit_dt,
+                       colors="#69f0ae", linestyles="--", lw=1.2, alpha=0.85, zorder=3, label="TP")
+        legend_entries.setdefault("TP", h3)
+
+        # Exit horizontal line + marker
         if t.exit_date is not None:
-            # SL line
-            ax.hlines(t.stop_price, t.entry_date, t.exit_date,
-                      colors="orange", linestyles="--", lw=0.9, alpha=0.7)
-            # TP line
-            ax.hlines(t.tp1_price, t.entry_date, t.exit_date,
-                      colors="teal", linestyles="--", lw=0.9, alpha=0.7)
-            # Exit marker
-            win = (t.net_pips or 0) > 0
-            ax.plot(t.exit_date, t.exit_price, marker="x",
-                    color="green" if win else "red", ms=9, mew=2, zorder=5)
+            c_exit = "#69f0ae" if win else "#ff5252"
+            h4 = ax.hlines(t.exit_price, t.entry_date, t.exit_date,
+                           colors=c_exit, linestyles=":", lw=1.2, alpha=0.9, zorder=4, label="Exit")
+            legend_entries.setdefault("Exit", h4)
+            ax.plot(t.exit_date, t.exit_price,
+                    marker="D", color=c_exit, ms=6, zorder=6,
+                    markeredgecolor="#0e1117", markeredgewidth=0.5)
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    # Axes styling
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333")
+    ax.tick_params(colors="#aaa", labelsize=8)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
-    plt.xticks(rotation=45, fontsize=8)
-    ax.set_title(f"EURUSD 4H — Last {days} days  |  {len(visible)} trades")
-    ax.set_xlabel("Date"); ax.set_ylabel("Price")
-    ax.grid(True, alpha=0.2)
+    plt.xticks(rotation=40, ha="right")
+    ax.yaxis.label.set_color("#aaa")
+    ax.xaxis.label.set_color("#aaa")
+    ax.set_title(f"EURUSD 4H — Last {days} days  |  {len(visible)} trades shown",
+                 color="white", fontsize=12, pad=10)
+    ax.grid(True, alpha=0.12, color="#555")
+
+    if legend_entries:
+        ax.legend(legend_entries.values(), legend_entries.keys(),
+                  facecolor="#1a1d24", edgecolor="#444", labelcolor="white",
+                  fontsize=9, loc="upper left")
+
     plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    plt.savefig(path, dpi=150, facecolor=fig.get_facecolor())
     print(f"Recent trades chart: {path}")
     plt.close(fig)
 
@@ -467,7 +503,7 @@ if __name__ == "__main__":
 
     # 2. Run strategy
     print("\n[2] Running trades...")
-    all_trades = run_trades(df_raw)
+    all_trades = run_trades(df_raw, close_strength=0.6)
     is_t, oos_t = _split_trades(all_trades, split_dt)
     print(f"    Total: {len(all_trades)}  |  IS: {len(is_t)}  |  OOS: {len(oos_t)}")
 
@@ -495,7 +531,9 @@ if __name__ == "__main__":
                       title=f"EURUSD 4H — Equity Curve ({run_id})",
                       path=str(out_dir / "equity_curve.png"),
                       split_trade=split_trade_n)
-    plot_recent_trades(df_raw, all_trades, path=str(out_dir / "recent_trades.png"), days=30)
+    recent_path = str(out_dir / "recent_trades.png")
+    plot_recent_trades(df_raw, all_trades, path=recent_path, days=30)
+    import os; os.startfile(recent_path)
     export_trades_csv(all_trades, path=str(out_dir / "trade_log.csv"))
     export_equity_csv(eq_all,     path=str(out_dir / "equity_curve.csv"))
 

@@ -1,5 +1,5 @@
 """
-live_trader.py — Step 7
+live_trader.py
 Live and paper-mode execution engine. Runs on every 4H candle close.
 
 Usage:
@@ -22,10 +22,8 @@ import numpy as np
 import pandas as pd
 
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
-from swing_engine   import build_swings, PIP
-from trend_engine   import classify_trend
-from trade_engine   import PIP_VALUE
-from constants import MAGIC, MAX_LIMIT_BARS
+from constants     import PIP, MAGIC, MAX_LIMIT_BARS
+from trade_engine  import _bar_setup, PIP_VALUE
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH  = Path("config.json")
@@ -51,17 +49,14 @@ def setup_logger() -> logging.Logger:
         fmt="%(asctime)s UTC [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # File handler (always append)
     fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(fh)
     logger.addHandler(ch)
-    # Force UTC timestamps
     logging.Formatter.converter = time.gmtime
     return logger
 
@@ -92,11 +87,8 @@ _DEFAULT_STATE: dict = {
     "session_starting_balance": None,
     "current_balance":          None,
     "drawdown_pct":             0.0,
-    "open_trade":               None,   # filled when position is open
-    "pending_limit":            None,   # filled when limit order is waiting for fill
-    "last_regime":              "AMBIGUOUS",
-    "last_swing_points":        [],
-    "last_entry_zone":          None,
+    "open_trade":               None,
+    "pending_limit":            None,
     "last_updated":             None,
 }
 
@@ -104,7 +96,10 @@ _DEFAULT_STATE: dict = {
 def load_state() -> dict:
     if STATE_PATH.exists():
         with open(STATE_PATH) as f:
-            return {**_DEFAULT_STATE, **json.load(f)}
+            saved = json.load(f)
+        # Drop any stale keys from old state files
+        clean = {k: v for k, v in saved.items() if k in _DEFAULT_STATE}
+        return {**_DEFAULT_STATE, **clean}
     return dict(_DEFAULT_STATE)
 
 
@@ -113,7 +108,7 @@ def save_state(state: dict) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2, default=str)
-    tmp.replace(STATE_PATH)  # atomic rename — prevents corrupt state.json on crash
+    tmp.replace(STATE_PATH)
 
 
 # ── MT5 connection ────────────────────────────────────────────────────────────
@@ -127,7 +122,6 @@ def _is_connected() -> bool:
 
 
 def ensure_connected(logger: logging.Logger) -> None:
-    """Block until MT5 is connected, retrying every RECONNECT_INTERVAL seconds."""
     if _is_connected():
         return
     attempt = 0
@@ -150,7 +144,6 @@ _TF_MAP = {
 
 
 def fetch_data(config: dict, logger: logging.Logger) -> pd.DataFrame:
-    """Fetch OHLC from MT5, reconnecting if necessary."""
     ensure_connected(logger)
     tf = _TF_MAP.get(config["timeframe"], mt5.TIMEFRAME_H4)
     df = fetch_ohlc(symbol=config["symbol"], timeframe=tf, bars=5000)
@@ -163,7 +156,7 @@ def fetch_data(config: dict, logger: logging.Logger) -> pd.DataFrame:
 def _close_all_paper(state: dict, logger: logging.Logger) -> None:
     if state.get("open_trade"):
         logger.warning("[CB] Closing paper position at circuit breaker trigger.")
-        state["open_trade"]    = None
+        state["open_trade"] = None
     if state.get("pending_limit"):
         logger.warning("[CB] Cancelling pending paper limit at circuit breaker trigger.")
         state["pending_limit"] = None
@@ -171,12 +164,10 @@ def _close_all_paper(state: dict, logger: logging.Logger) -> None:
 
 def _close_all_live(config: dict, state: dict, logger: logging.Logger) -> None:
     sym = config["symbol"]
-    positions = mt5.positions_get(symbol=sym) or []
-    for p in positions:
+    for p in (mt5.positions_get(symbol=sym) or []):
         if p.magic == MAGIC:
             _market_close_live(p, logger)
-    orders = mt5.orders_get(symbol=sym) or []
-    for o in orders:
+    for o in (mt5.orders_get(symbol=sym) or []):
         if o.magic == MAGIC:
             mt5.order_cancel(o.ticket)
             logger.info(f"[CB] Cancelled pending order {o.ticket}")
@@ -202,7 +193,6 @@ def trigger_circuit_breaker(config: dict, state: dict, reason: str,
 
 def check_circuit_breaker(config: dict, state: dict,
                            logger: logging.Logger) -> bool:
-    """Returns True (and triggers CB) if drawdown limit is breached."""
     if state["circuit_breaker_active"]:
         return True
     start = state.get("session_starting_balance")
@@ -279,7 +269,7 @@ def paper_open_trade(state: dict, limit: dict, fill_price: float,
 
 def paper_close_trade(config: dict, state: dict, exit_price: float,
                        reason: str, logger: logging.Logger) -> None:
-    t = state["open_trade"]
+    t    = state["open_trade"]
     sign = 1 if t["direction"] == "long" else -1
     if t["tp1_hit"]:
         trail_pips = sign * (exit_price - t["entry"]) / PIP
@@ -315,9 +305,9 @@ def _send_order(request: dict, logger: logging.Logger, description: str) -> mt5.
 
 def live_place_limit(config: dict, state: dict, direction: str, entry: float,
                       stop: float, tp1: float, lot: float, logger: logging.Logger) -> None:
-    sym = config["symbol"]
+    sym        = config["symbol"]
     order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "long" else mt5.ORDER_TYPE_SELL_LIMIT
-    tp_price   = tp1 if config["tp_mode"] == "full" else 0.0  # partial: manage TP manually
+    tp_price   = tp1 if config["tp_mode"] == "full" else 0.0
 
     request = {
         "action":       mt5.TRADE_ACTION_PENDING,
@@ -342,8 +332,7 @@ def live_place_limit(config: dict, state: dict, direction: str, entry: float,
 
 
 def live_cancel_limits(config: dict, logger: logging.Logger) -> None:
-    orders = mt5.orders_get(symbol=config["symbol"]) or []
-    for o in orders:
+    for o in (mt5.orders_get(symbol=config["symbol"]) or []):
         if o.magic == MAGIC:
             mt5.order_cancel(o.ticket)
             logger.info(f"Cancelled pending order {o.ticket}")
@@ -390,42 +379,46 @@ def in_session(config: dict, ts: pd.Timestamp) -> bool:
     return config["session_start_utc"] <= ts.hour < config["session_end_utc"]
 
 
+# ── Trail stop helper ─────────────────────────────────────────────────────────
+
+def _new_trail_stop(config: dict, direction: str, df: pd.DataFrame,
+                    current_trail: float | None) -> float:
+    """Return updated trail stop based on previous bar extreme. Never moves against trade."""
+    stop_buf  = config.get("stop_buffer", 5)
+    prev_bar  = df.iloc[-2]
+    if direction == "long":
+        candidate = float(prev_bar["Low"]) - stop_buf * PIP
+        if current_trail is None or candidate > current_trail:
+            return candidate
+        return current_trail
+    else:
+        candidate = float(prev_bar["High"]) + stop_buf * PIP
+        if current_trail is None or candidate < current_trail:
+            return candidate
+        return current_trail
+
+
 # ── Per-candle trade management ───────────────────────────────────────────────
 
 def _manage_paper_trade(config: dict, state: dict, last_bar: pd.Series,
-                         swings: pd.DataFrame, df: pd.DataFrame, bar_i: int,
-                         logger: logging.Logger) -> None:
-    t = state["open_trade"]
-    h, l, c = float(last_bar["High"]), float(last_bar["Low"]), float(last_bar["Close"])
+                         df: pd.DataFrame, logger: logging.Logger) -> None:
+    t         = state["open_trade"]
+    h, l, c   = float(last_bar["High"]), float(last_bar["Low"]), float(last_bar["Close"])
     direction = t["direction"]
-    long = direction == "long"
+    long      = direction == "long"
 
     if t["tp1_hit"]:
-        # Trail mode — exit on close below trail_stop (long) or above (short)
-        confirmed = _confirmed_at(swings, bar_i, config["swing_n"])
-        if long:
-            lows = confirmed[confirmed["type"] == "low"]
-            if not lows.empty:
-                latest_l = float(lows.iloc[-1]["price"])
-                if t["trail_stop"] is None or latest_l > t["trail_stop"]:
-                    t["trail_stop"] = latest_l
-                    logger.info(f"[PAPER] Trail stop raised to {latest_l:.5f}")
-            ts_level = t["trail_stop"] or t["entry"]
-            if c < ts_level:
-                paper_close_trade(config, state, c, "trail_exit", logger)
-        else:
-            highs = confirmed[confirmed["type"] == "high"]
-            if not highs.empty:
-                latest_h = float(highs.iloc[-1]["price"])
-                if t["trail_stop"] is None or latest_h < t["trail_stop"]:
-                    t["trail_stop"] = latest_h
-                    logger.info(f"[PAPER] Trail stop lowered to {latest_h:.5f}")
-            ts_level = t["trail_stop"] or t["entry"]
-            if c > ts_level:
-                paper_close_trade(config, state, c, "trail_exit", logger)
+        # Trail mode — ratchet stop to previous bar extreme, exit on close beyond it
+        new_ts = _new_trail_stop(config, direction, df, t["trail_stop"])
+        if new_ts != t["trail_stop"]:
+            t["trail_stop"] = new_ts
+            logger.info(f"[PAPER] Trail stop moved to {new_ts:.5f}")
+        ts_level = t["trail_stop"] or t["entry"]
+        if (long and c < ts_level) or (not long and c > ts_level):
+            paper_close_trade(config, state, c, "trail_exit", logger)
         return
 
-    # Normal mode — stop takes priority
+    # Stop takes priority
     if (long and l <= t["stop"]) or (not long and h >= t["stop"]):
         paper_close_trade(config, state, t["stop"], "stop_hit", logger)
         return
@@ -436,8 +429,11 @@ def _manage_paper_trade(config: dict, state: dict, last_bar: pd.Series,
             paper_close_trade(config, state, tp1, "tp1_hit", logger)
         else:
             t["tp1_hit"]    = True
-            t["trail_stop"] = t["entry"]  # breakeven
-            logger.info(f"[PAPER] TP1 hit @ {tp1:.5f}. 50% closed. Stop moved to breakeven {t['entry']:.5f}")
+            t["trail_stop"] = t["entry"]
+            logger.info(
+                f"[PAPER] TP1 hit @ {tp1:.5f}. 50% closed. "
+                f"Stop moved to breakeven {t['entry']:.5f}"
+            )
             state["current_balance"] = round(
                 (state["current_balance"] or 0)
                 + 0.5 * (abs(tp1 - t["entry"]) / PIP - 3) * PIP_VALUE * t["lot"], 2
@@ -445,11 +441,10 @@ def _manage_paper_trade(config: dict, state: dict, last_bar: pd.Series,
 
 
 def _manage_live_trade(config: dict, state: dict, last_bar: pd.Series,
-                        swings: pd.DataFrame, bar_i: int, logger: logging.Logger) -> None:
-    """Reconcile live positions with state and apply trail/TP logic."""
+                        df: pd.DataFrame, logger: logging.Logger) -> None:
     positions = mt5.positions_get(symbol=config["symbol"]) or []
     our_pos   = next((p for p in positions if p.magic == MAGIC), None)
-    t = state.get("open_trade")
+    t         = state.get("open_trade")
 
     if our_pos is None:
         if t:
@@ -462,7 +457,6 @@ def _manage_live_trade(config: dict, state: dict, last_bar: pd.Series,
         return
 
     if t is None:
-        # MT5 has position we don't know about — reconstruct minimal state
         direction = "long" if our_pos.type == 0 else "short"
         state["open_trade"] = {
             "direction": direction, "entry": our_pos.price_open,
@@ -486,14 +480,10 @@ def _manage_live_trade(config: dict, state: dict, last_bar: pd.Series,
             state["current_balance"] = float(mt5.account_info().balance)
 
     if t["tp1_hit"]:
-        confirmed = _confirmed_at(swings, bar_i, config["swing_n"])
-        if long:
-            lows = confirmed[confirmed["type"] == "low"]
-            if not lows.empty:
-                latest_l = float(lows.iloc[-1]["price"])
-                if t["trail_stop"] is None or latest_l > t["trail_stop"]:
-                    live_modify_sl(config, our_pos, latest_l, logger)
-                    t["trail_stop"] = latest_l
+        new_ts = _new_trail_stop(config, t["direction"], df, t["trail_stop"])
+        if new_ts != t["trail_stop"]:
+            live_modify_sl(config, our_pos, new_ts, logger)
+            t["trail_stop"] = new_ts
 
 
 def _check_paper_pending(config: dict, state: dict, last_bar: pd.Series,
@@ -505,7 +495,6 @@ def _check_paper_pending(config: dict, state: dict, last_bar: pd.Series,
     if not filled:
         return
     paper_open_trade(state, lim, lim["price"], logger)
-    # Same-bar exit check (stop beats TP)
     t  = state["open_trade"]
     lo = lim["direction"] == "long"
     if (lo and l <= t["stop"]) or (not lo and h >= t["stop"]):
@@ -519,7 +508,6 @@ def _check_paper_pending(config: dict, state: dict, last_bar: pd.Series,
 
 
 def _check_live_pending(config: dict, state: dict, logger: logging.Logger) -> None:
-    """Check if our pending limit order was filled — update state if so."""
     positions = mt5.positions_get(symbol=config["symbol"]) or []
     our_pos   = next((p for p in positions if p.magic == MAGIC), None)
     if our_pos:
@@ -529,8 +517,7 @@ def _check_live_pending(config: dict, state: dict, logger: logging.Logger) -> No
             "direction": "long" if our_pos.type == 0 else "short",
             "entry": our_pos.price_open, "stop": our_pos.sl,
             "tp1": lim.get("tp1", our_pos.tp), "lot": our_pos.volume,
-            "tp1_hit": False, "trail_stop": None,
-            "ticket": our_pos.ticket,
+            "tp1_hit": False, "trail_stop": None, "ticket": our_pos.ticket,
         }
         state["pending_limit"] = None
         state["current_balance"] = float(mt5.account_info().balance)
@@ -540,7 +527,6 @@ def _check_live_pending(config: dict, state: dict, logger: logging.Logger) -> No
 
 def check_entry(config: dict, state: dict, df: pd.DataFrame,
                 logger: logging.Logger) -> None:
-    from trade_engine import _bar_setup
     if len(df) < 3:
         return
     bar_time = df.index[-1]
@@ -552,20 +538,22 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame,
     prev1 = df.iloc[-2]
     curr  = df.iloc[-1]
 
-    lb = config.get("pullback_lookback", 4)
-    pb_pips = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / PIP
-                                for j in range(max(0, len(df) - lb), len(df) - 1)]))
-    min_stop = config.get("min_stop_pips", 20.0)
+    lb      = config.get("pullback_lookback", 4)
+    pb_pips = float(np.median([
+        (df.iloc[j]["High"] - df.iloc[j]["Low"]) / PIP
+        for j in range(max(0, len(df) - lb), len(df) - 1)
+    ]))
+    min_stop       = config.get("min_stop_pips", 20.0)
+    close_strength = config.get("close_strength", 0.6)
 
     result = _bar_setup(prev2, prev1, curr, pb_pips,
-                        config.get("stop_buffer", 5), PIP, min_stop)
+                        config.get("stop_buffer", 5), PIP, min_stop,
+                        close_strength=close_strength)
     if result is None:
         logger.info("No entry — no consecutive breakout pattern")
-        state["last_entry_zone"] = None
         return
 
     direction, entry, stop, tp1 = result
-    state["last_entry_zone"] = entry
 
     balance = get_balance(config, state)
     lot     = compute_lot(config, balance, entry, stop)
@@ -591,67 +579,35 @@ def run_candle(config: dict, state: dict, df: pd.DataFrame,
                logger: logging.Logger) -> None:
     ensure_connected(logger)
 
-    from swing_engine import build_swings
-    from trend_engine import classify_trend
-    swings = build_swings(df, pip=PIP)
-    df     = classify_trend(df, swings)
+    last_bar = df.iloc[-1]
+    bar_time = df.index[-1]
 
-    last_bar  = df.iloc[-1]
-    bar_i     = len(df) - 1
-    bar_time  = df.index[-1]
-    regime    = str(last_bar.get("regime", "AMBIGUOUS"))
-    strength  = last_bar.get("trend_strength_score")
+    logger.info(f"Candle {bar_time}  close={last_bar['Close']:.5f}")
 
-    # Update state metadata
-    confirmed       = _confirmed_at(swings, bar_i, config["swing_n"])
-    state["last_regime"] = regime
-    state["last_swing_points"] = confirmed.tail(5)[["date", "price", "type"]].to_dict("records")
-
-    logger.info(
-        f"Candle {bar_time}  close={last_bar['Close']:.5f}  "
-        f"regime={regime}  strength={strength if strength and not (isinstance(strength, float) and np.isnan(strength)) else '—'}"
-    )
-
-    # Circuit breaker check
     if check_circuit_breaker(config, state, logger):
         return
 
-    # Init starting balance on first candle
     if state["session_starting_balance"] is None:
         bal = get_balance(config, state)
         state["session_starting_balance"] = bal
         state["current_balance"]          = bal
         logger.info(f"Session starting balance: ${bal:.2f}")
 
-    # ── Trade management ──────────────────────────────────────────────────────
+    # Trade management
     if state.get("open_trade"):
         logger.info("Managing open trade…")
         if config["paper_mode"]:
-            _manage_paper_trade(config, state, last_bar, swings, df, bar_i, logger)
+            _manage_paper_trade(config, state, last_bar, df, logger)
         else:
-            _manage_live_trade(config, state, last_bar, swings, bar_i, logger)
+            _manage_live_trade(config, state, last_bar, df, logger)
 
     elif state.get("pending_limit"):
-        # Check if limit was filled this candle
         if config["paper_mode"]:
             _check_paper_pending(config, state, last_bar, logger)
         else:
             _check_live_pending(config, state, logger)
 
-        # Cancel pending limit if regime changed or outside session
-        if state.get("pending_limit"):
-            lim = state["pending_limit"]
-            lim_direction = lim["direction"]
-            if (regime == "UPTREND" and lim_direction != "long") or \
-               (regime == "DOWNTREND" and lim_direction != "short") or \
-               (regime == "AMBIGUOUS"):
-                if config["paper_mode"]:
-                    paper_cancel_limit(state, "regime changed", logger)
-                else:
-                    live_cancel_limits(config, logger)
-                    state["pending_limit"] = None
-
-    # ── Entry check ───────────────────────────────────────────────────────────
+    # Entry check (only if flat)
     if not state.get("open_trade") and not state.get("pending_limit"):
         check_entry(config, state, df, logger)
 
@@ -664,13 +620,15 @@ def run_candle(config: dict, state: dict, df: pd.DataFrame,
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 
-def wait_for_next_candle(last_bar_time: pd.Timestamp, logger: logging.Logger) -> pd.DataFrame:
-    """Sleep until 30s after the next expected 4H candle close, then poll until confirmed."""
+def wait_for_next_candle(last_bar_time: pd.Timestamp, logger: logging.Logger) -> None:
     target     = last_bar_time + pd.Timedelta(hours=4, seconds=30)
     now        = pd.Timestamp.now(tz="UTC")
     sleep_secs = (target - now).total_seconds()
     if sleep_secs > 0:
-        logger.info(f"Sleeping {sleep_secs/3600:.2f}h until next candle close ({target.strftime('%Y-%m-%d %H:%M UTC')})")
+        logger.info(
+            f"Sleeping {sleep_secs/3600:.2f}h until next candle close "
+            f"({target.strftime('%Y-%m-%d %H:%M UTC')})"
+        )
         time.sleep(sleep_secs)
     logger.info("Waking up — polling for new candle…")
 
@@ -678,10 +636,6 @@ def wait_for_next_candle(last_bar_time: pd.Timestamp, logger: logging.Logger) ->
 # ── Live mode confirmation ────────────────────────────────────────────────────
 
 def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
-    """
-    Print and log a live-mode summary, then require the operator to type 'yes'
-    within 30 seconds. Exits safely if confirmation is not received in time.
-    """
     account_num = "N/A"
     try:
         if _is_connected():
@@ -698,7 +652,7 @@ def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
         f"  Risk per trade:  {config['risk_per_trade'] * 100:.1f}%\n"
         f"  Max drawdown:    {config['max_drawdown_pct']}%\n"
         "  Circuit breaker: ACTIVE\n"
-        f"  Confirm MT5 account number: {account_num}\n"
+        f"  MT5 account:     {account_num}\n"
         "=" * 60
     )
     print(banner)
@@ -719,8 +673,8 @@ def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
     confirmed.wait(timeout=30)
 
     if not answer or answer[0] != "yes":
-        logger.critical("Live mode confirmation not received within 30 s — shutting down safely.")
-        print("\n⚠  Confirmation not received. Shutting down safely.\n")
+        logger.critical("Live mode confirmation not received within 30s — shutting down safely.")
+        print("\nConfirmation not received. Shutting down safely.\n")
         try:
             dp_disconnect()
         except Exception:
@@ -728,7 +682,7 @@ def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
         sys.exit(1)
 
     logger.info("Live mode confirmed by operator.")
-    print("\n✓ Confirmed. Starting live trading engine…\n")
+    print("\nConfirmed. Starting live trading engine…\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -748,7 +702,6 @@ def main() -> None:
     mode_str = "PAPER" if config["paper_mode"] else "LIVE"
     logger.info(f"Mode: {mode_str}  Symbol: {config['symbol']}  TF: {config['timeframe']}")
 
-    # ── Startup circuit breaker guard ─────────────────────────────────────────
     if state.get("circuit_breaker_active"):
         logger.critical(
             f"STARTUP BLOCKED — circuit breaker is active. "
@@ -757,13 +710,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── Test mode: force circuit breaker ─────────────────────────────────────
     if test_cb:
         logger.info("TEST MODE: Forcing circuit breaker via simulated large loss…")
         if state["session_starting_balance"] is None:
             state["session_starting_balance"] = 10_000.0
             state["current_balance"]          = 10_000.0
-        # Drop balance enough to breach threshold
         breached_balance = state["session_starting_balance"] * (
             1 - (config["max_drawdown_pct"] + 1) / 100
         )
@@ -775,37 +726,29 @@ def main() -> None:
             logger.error("Circuit breaker DID NOT trigger — check logic!")
         sys.exit(0)
 
-    # ── Live mode confirmation (terminal prompt, 30s timeout) ─────────────────
     if not config["paper_mode"]:
         _live_mode_confirmation(config, logger)
 
-    # ── Connect to MT5 ────────────────────────────────────────────────────────
     if not dp_connect():
         logger.error("Initial MT5 connection failed. Retrying…")
         ensure_connected(logger)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
     last_bar_time = None
 
     while True:
         try:
-            # Fetch current data
             df = fetch_data(config, logger)
-
             current_last = df.index[-1]
 
             if last_bar_time is None or current_last > last_bar_time:
-                # New candle — run full logic
                 last_bar_time = current_last
                 run_candle(config, state, df, logger)
-
                 if once:
                     logger.info("--once flag: exiting after one candle.")
                     break
             else:
                 logger.debug(f"No new candle yet. Last: {last_bar_time}")
 
-            # Sleep until next expected candle close
             wait_for_next_candle(last_bar_time, logger)
 
         except TradingHalt as e:
@@ -826,10 +769,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Guard against accidental live mode
     cfg = load_config()
     if not cfg.get("paper_mode") and "--live-confirmed" not in sys.argv:
-        print("\n⚠  Live mode detected. Add --live-confirmed flag to acknowledge real money trading.")
-        print("   Or set paper_mode=true in config.json for safe testing.\n")
+        print("\nLive mode detected. Add --live-confirmed flag to acknowledge real money trading.")
+        print("Or set paper_mode=true in config.json for safe testing.\n")
         sys.exit(1)
     main()
