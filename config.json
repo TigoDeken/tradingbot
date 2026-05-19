@@ -9,7 +9,7 @@
   "stop_buffer": 5,
   "paper_mode": true,
   "max_drawdown_pct": 5.0,
-  "min_stop_pips": 20.0,
-  "max_open_lots": 0.0,
-  "min_pyramid_bars": 2
+  "max_open_lots": 0.4,
+  "min_pyramid_bars": 2,
+  "close_strength": 0.0
 }

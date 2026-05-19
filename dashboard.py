@@ -468,6 +468,7 @@ def page_parameter_studio() -> None:
         en1, en2 = st.columns(2)
         with en1:
             pullback_lookback = en1.number_input("Pullback lookback",       min_value=1,    max_value=20,    value=_i("pullback_lookback", 4),    step=1,    help="Number of recent pullbacks used to calculate the median entry offset.")
+            close_strength    = en1.number_input("Close strength (0=off)",  min_value=0.0,  max_value=0.9,   value=_f("close_strength", 0.0),     step=0.05, format="%.2f", help="Signal bar must close in the top/bottom X of its range. 0=off, 0.6=top 40% for longs.")
         with en2:
             stop_buffer       = en2.number_input("Stop buffer (pips)",      min_value=0,    max_value=50,    value=_i("stop_buffer", 5),          step=1,    help="Extra pips added beyond the swing low/high for the stop loss.")
 
@@ -518,6 +519,7 @@ def page_parameter_studio() -> None:
             "max_drawdown_pct":  float(max_drawdown_pct),
             "max_open_lots":     float(max_open_lots),
             "min_pyramid_bars":  int(min_pyramid_bars),
+            "close_strength":    float(close_strength),
         }
         Path("config.json").write_text(json.dumps(new_cfg, indent=2))
         st.success("✅ Saved to config.json — live_trader.py will use these on next restart.")
@@ -545,6 +547,7 @@ def page_parameter_studio() -> None:
         session_start=session_start, session_end=session_end,
         min_stop_pips=min_stop_pips, max_lot=max_lot,
         max_open_lots=float(max_open_lots), min_pyramid_bars=int(min_pyramid_bars),
+        close_strength=float(close_strength),
     )
 
     prog.progress(80, "Computing metrics...")

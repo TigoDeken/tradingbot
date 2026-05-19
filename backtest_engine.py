@@ -28,6 +28,7 @@ PARAM_GRID = {
     "PULLBACK_LOOKBACK":  [3, 4, 5],
     "STOP_BUFFER":        [3, 5, 8, 10],
     "TP_MODE":            ["full", "partial", "trail"],
+    "CLOSE_STRENGTH":     [0.0, 0.5, 0.6, 0.7],
 }
 
 SEP = "-" * 47
@@ -421,6 +422,7 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
             pullback_lookback=c["PULLBACK_LOOKBACK"],
             stop_buffer=c["STOP_BUFFER"],
             tp_mode=c["TP_MODE"],
+            close_strength=c["CLOSE_STRENGTH"],
         )
         is_t, oos_t = _split_trades(trades, split_dt)
         is_m  = _quick_metrics(is_t)

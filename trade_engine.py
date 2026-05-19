@@ -62,22 +62,29 @@ def _in_session(ts: pd.Timestamp, session_start: int = 7, session_end: int = 20)
 def _bar_setup(
     prev2: pd.Series, prev1: pd.Series, curr: pd.Series,
     pullback_pips: float, stop_buf: float, pip: float, min_stop_pips: float,
+    close_strength: float = 0.0,
 ) -> Optional[tuple[str, float, float, float]]:
     """
     Consecutive 4H bar breakout setup.
     LONG:  prev1 broke prev2 high cleanly, curr broke prev1 high cleanly.
     SHORT: prev1 broke prev2 low cleanly,  curr broke prev1 low cleanly.
     'Cleanly' = did NOT also take out the opposite side (no outside bar).
+    close_strength: if > 0, signal bar must close in the top/bottom portion of its range
+      (e.g. 0.6 = close must be in top 40% for long, bottom 40% for short).
     Returns (direction, entry, stop, tp1) or None.
-    Stop is placed beyond the previous bar's opposite extreme.
     """
     p1_took_high = prev1["High"] > prev2["High"]
     p1_took_low  = prev1["Low"]  < prev2["Low"]
     c_took_high  = curr["High"]  > prev1["High"]
     c_took_low   = curr["Low"]   < prev1["Low"]
 
+    bar_range    = curr["High"] - curr["Low"]
+    close_pos    = ((curr["Close"] - curr["Low"]) / bar_range) if bar_range > 0 else 0.5
+
     # LONG
     if p1_took_high and not p1_took_low and c_took_high and not c_took_low:
+        if close_strength > 0 and close_pos < close_strength:
+            return None
         entry = curr["High"] - pullback_pips * pip
         stop  = prev1["Low"] - stop_buf * pip
         if entry <= stop or (entry - stop) / pip < min_stop_pips:
@@ -87,6 +94,8 @@ def _bar_setup(
 
     # SHORT
     if p1_took_low and not p1_took_high and c_took_low and not c_took_high:
+        if close_strength > 0 and close_pos > (1.0 - close_strength):
+            return None
         entry = curr["Low"] + pullback_pips * pip
         stop  = prev1["High"] + stop_buf * pip
         if entry >= stop or (stop - entry) / pip < min_stop_pips:
@@ -156,6 +165,7 @@ def run_trades(
     max_lot:          float = MAX_LOT,
     max_open_lots:    float = 0.0,
     min_pyramid_bars: int   = 2,
+    close_strength:   float = 0.0,
     **_kwargs,
 ) -> list[Trade]:
     """
@@ -174,7 +184,7 @@ def run_trades(
     params = dict(
         pullback_lookback=pullback_lookback,
         stop_buffer=stop_buffer, tp_mode=tp_mode,
-        slippage_pips=slippage_pips,
+        slippage_pips=slippage_pips, close_strength=close_strength,
     )
 
     for i in range(len(df)):
@@ -266,7 +276,8 @@ def run_trades(
         pb_pips  = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
                                      for j in range(pb_start, i)]))
 
-        result = _bar_setup(prev2, prev1, row, pb_pips, stop_buffer, pip, min_stop_pips)
+        result = _bar_setup(prev2, prev1, row, pb_pips, stop_buffer, pip, min_stop_pips,
+                            close_strength)
         if result is None:
             continue
 
