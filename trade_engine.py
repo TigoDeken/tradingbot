@@ -197,12 +197,24 @@ def run_trades(
                     trades.append(open_trade); open_trade = None; continue
 
             else:
+                # Trail mode: ratchet stop to previous bar's extreme before checking
+                if tp_mode == "trail" and i >= 1:
+                    prev_bar = df.iloc[i - 1]
+                    if long:
+                        new_stop = prev_bar["Low"] - stop_buffer * pip
+                        if new_stop > open_trade.stop_price:
+                            open_trade.stop_price = round(new_stop, 5)
+                    else:
+                        new_stop = prev_bar["High"] + stop_buffer * pip
+                        if new_stop < open_trade.stop_price:
+                            open_trade.stop_price = round(new_stop, 5)
+
                 # Normal mode: stop takes priority over TP within same bar
                 if long:
                     if l <= open_trade.stop_price:
                         _close(open_trade, bar_date, open_trade.stop_price, "stop", pip, slippage_pips)
                         trades.append(open_trade); open_trade = None; continue
-                    if h >= open_trade.tp1_price:
+                    if h >= open_trade.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
                             _close(open_trade, bar_date, open_trade.tp1_price, "tp1", pip, slippage_pips)
                             trades.append(open_trade); open_trade = None; continue
@@ -214,7 +226,7 @@ def run_trades(
                     if h >= open_trade.stop_price:
                         _close(open_trade, bar_date, open_trade.stop_price, "stop", pip, slippage_pips)
                         trades.append(open_trade); open_trade = None; continue
-                    if l <= open_trade.tp1_price:
+                    if l <= open_trade.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
                             _close(open_trade, bar_date, open_trade.tp1_price, "tp1", pip, slippage_pips)
                             trades.append(open_trade); open_trade = None; continue
@@ -280,7 +292,7 @@ def run_trades(
             if l <= stop:
                 _close(open_trade, bar_date, stop, "stop", pip, slippage_pips)
                 trades.append(open_trade); open_trade = None
-            elif h >= tp1:
+            elif h >= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
                     _close(open_trade, bar_date, tp1, "tp1", pip, slippage_pips)
                     trades.append(open_trade); open_trade = None
@@ -292,7 +304,7 @@ def run_trades(
             if h >= stop:
                 _close(open_trade, bar_date, stop, "stop", pip, slippage_pips)
                 trades.append(open_trade); open_trade = None
-            elif l <= tp1:
+            elif l <= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
                     _close(open_trade, bar_date, tp1, "tp1", pip, slippage_pips)
                     trades.append(open_trade); open_trade = None

@@ -476,7 +476,7 @@ def page_parameter_studio() -> None:
         st.caption("Controls how trades are closed.")
         ex1, ex2 = st.columns(2)
         with ex1:
-            tp_mode = ex1.selectbox("TP mode", ["full", "partial"],
+            tp_mode = ex1.selectbox("TP mode", ["full", "partial", "trail"],
                                      index=0 if cfg.get("tp_mode", "full") == "full" else 1,
                                      help="full = close entire position at TP1. partial = close half at TP1, trail the rest.")
         with ex2:

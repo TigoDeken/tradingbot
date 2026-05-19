@@ -27,7 +27,7 @@ SPLIT_RATIO     = 0.70
 PARAM_GRID = {
     "PULLBACK_LOOKBACK":  [3, 4, 5],
     "STOP_BUFFER":        [3, 5, 8, 10],
-    "TP_MODE":            ["full", "partial"],
+    "TP_MODE":            ["full", "partial", "trail"],
 }
 
 SEP = "-" * 47
