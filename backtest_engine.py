@@ -3,16 +3,18 @@ backtest_engine.py — Step 5
 Metrics, equity curve, walk-forward validation, parameter optimisation.
 """
 import itertools
+import json
 import time
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from data_pipeline import get_data
-from swing_engine  import build_swings, PIP, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
-from constants import RISK_PCT
-from trend_engine  import classify_trend, MIN_TREND_SIZE, TREND_RANGE_RATIO
+from constants import PIP, RISK_PCT
 from trade_engine  import (
     Trade, run_trades,
     PULLBACK_LOOKBACK, STOP_BUFFER, TP_MODE,
@@ -23,17 +25,12 @@ INITIAL_BALANCE = 10_000.0
 SPLIT_RATIO     = 0.70
 
 PARAM_GRID = {
-    "SWING_N":            [2, 3],
-    "MIN_SWING_SIZE":     [15, 20, 25],
-    "MIN_SWING_INCR":     [8, 10, 15],
-    "MIN_TREND_SIZE":     [40, 50, 60],
-    "TREND_RANGE_RATIO":  [0.30, 0.40, 0.50],
     "PULLBACK_LOOKBACK":  [3, 4, 5],
-    "STOP_BUFFER":        [3, 5, 8],
+    "STOP_BUFFER":        [3, 5, 8, 10],
     "TP_MODE":            ["full", "partial"],
 }
 
-SEP = "─" * 47
+SEP = "-" * 47
 
 
 # ── Equity ────────────────────────────────────────────────────────────────────
@@ -186,9 +183,9 @@ def _quick_metrics(trades: list) -> dict:
 
 def print_metrics(m: dict, label: str = "") -> None:
     if label:
-        print(f"\n{'═' * 47}")
+        print(f"\n{'=' * 47}")
         print(f"  {label}")
-        print(f"{'═' * 47}")
+        print(f"{'=' * 47}")
     if m.get("_empty"):
         print("  (no trades)")
         return
@@ -211,8 +208,8 @@ def print_metrics(m: dict, label: str = "") -> None:
     print(f"  Largest winner           {m['best_pips']} pips  /  {m['best_r']} R")
     print(f"  Largest loser            {m['worst_pips']} pips  /  {m['worst_r']} R")
     print(f"  Expectancy (net R)       {m['expectancy_net_r']}")
-    print(f"  Gross EV per trade       {m.get('gross_ev', '—')} R")
-    print(f"  Net EV per trade         {m.get('net_ev',   '—')} R")
+    print(f"  Gross EV per trade       {m.get('gross_ev', 'n/a')} R")
+    print(f"  Net EV per trade         {m.get('net_ev',   'n/a')} R")
 
     print(f"\nRISK")
     print(SEP)
@@ -232,9 +229,9 @@ def print_metrics(m: dict, label: str = "") -> None:
 
 
 def compare_is_oos(is_m: dict, oos_m: dict) -> None:
-    print(f"\n{'═' * 65}")
+    print(f"\n{'=' * 65}")
     print(f"  IN-SAMPLE vs OUT-OF-SAMPLE")
-    print(f"{'═' * 65}")
+    print(f"{'=' * 65}")
     rows = [
         ("total_trades",     "Total trades"),
         ("win_rate_pct",     "Win rate %"),
@@ -248,7 +245,7 @@ def compare_is_oos(is_m: dict, oos_m: dict) -> None:
     print(f"  {'Metric':<28} {'In-Sample':>12} {'Out-of-Sample':>14}")
     print(f"  {'-' * 56}")
     for key, label in rows:
-        print(f"  {label:<28} {str(is_m.get(key,'—')):>12} {str(oos_m.get(key,'—')):>14}")
+        print(f"  {label:<28} {str(is_m.get(key,'n/a')):>12} {str(oos_m.get(key,'n/a')):>14}")
 
     flags = []
     for key, name in [("win_rate_pct", "Win rate"), ("expectancy_net_r", "Expectancy")]:
@@ -260,7 +257,7 @@ def compare_is_oos(is_m: dict, oos_m: dict) -> None:
         for f in flags:
             print(f)
     else:
-        print(f"\n  No significant IS→OOS degradation detected.")
+        print(f"\n  No significant IS->OOS degradation detected.")
 
 
 # ── Plots ─────────────────────────────────────────────────────────────────────
@@ -293,8 +290,69 @@ def plot_equity_curve(eq: pd.DataFrame, title: str = "Equity Curve",
 
     plt.tight_layout()
     plt.savefig(path, dpi=150)
-    print(f"Equity curve saved → {path}")
+    print(f"Equity curve saved: {path}")
     plt.show()
+
+
+def plot_recent_trades(df: pd.DataFrame, trades: list, path: str = "recent_trades.png",
+                       days: int = 30) -> None:
+    """Candlestick chart of the last `days` days with trade overlays."""
+    cutoff = df.index[-1] - pd.Timedelta(days=days)
+    df_plot = df[df.index >= cutoff].copy()
+    visible = [t for t in trades if t.entry_date >= cutoff]
+
+    if df_plot.empty:
+        print("No data in the last month — skipping recent trades chart.")
+        return
+
+    fig, ax = plt.subplots(figsize=(20, 8))
+
+    # Draw OHLC candles
+    width_days = pd.Timedelta(hours=3)
+    for ts, row in df_plot.iterrows():
+        color = "green" if row["Close"] >= row["Open"] else "red"
+        # Wick
+        ax.plot([ts, ts], [row["Low"], row["High"]], color=color, lw=0.8, alpha=0.6)
+        # Body
+        ax.add_patch(plt.Rectangle(
+            (mdates.date2num(ts.to_pydatetime()) - 0.055, min(row["Open"], row["Close"])),
+            0.11, abs(row["Close"] - row["Open"]),
+            color=color, alpha=0.85, zorder=2,
+            transform=ax.transData,
+        ))
+
+    # Draw trades
+    for t in visible:
+        long = t.direction == "long"
+        color_entry = "royalblue" if long else "crimson"
+        arrow_dy = -0.0020 if long else 0.0020
+
+        ax.annotate("", xy=(t.entry_date, t.entry_price),
+                    xytext=(t.entry_date, t.entry_price + arrow_dy),
+                    arrowprops=dict(arrowstyle="->", color=color_entry, lw=2.0))
+
+        if t.exit_date is not None:
+            # SL line
+            ax.hlines(t.stop_price, t.entry_date, t.exit_date,
+                      colors="orange", linestyles="--", lw=0.9, alpha=0.7)
+            # TP line
+            ax.hlines(t.tp1_price, t.entry_date, t.exit_date,
+                      colors="teal", linestyles="--", lw=0.9, alpha=0.7)
+            # Exit marker
+            win = (t.net_pips or 0) > 0
+            ax.plot(t.exit_date, t.exit_price, marker="x",
+                    color="green" if win else "red", ms=9, mew=2, zorder=5)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+    plt.xticks(rotation=45, fontsize=8)
+    ax.set_title(f"EURUSD 4H — Last {days} days  |  {len(visible)} trades")
+    ax.set_xlabel("Date"); ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    print(f"Recent trades chart: {path}")
+    plt.close(fig)
 
 
 # ── Exports ───────────────────────────────────────────────────────────────────
@@ -321,17 +379,17 @@ def export_trades_csv(trades: list, path: str = "trade_log.csv") -> None:
         **t.params,
     } for t in trades]
     pd.DataFrame(rows).to_csv(path, index=False)
-    print(f"Trade log → {path}  ({len(rows)} rows)")
+    print(f"Trade log: {path}  ({len(rows)} rows)")
 
 
 def export_equity_csv(eq: pd.DataFrame, path: str = "equity_curve.csv") -> None:
     eq.to_csv(path, index=False)
-    print(f"Equity CSV → {path}")
+    print(f"Equity CSV: {path}")
 
 
 def export_opt_csv(results: pd.DataFrame, path: str = "optimisation_results.csv") -> None:
     results.to_csv(path, index=False)
-    print(f"Optimisation results → {path}  ({len(results)} rows)")
+    print(f"Optimisation results: {path}  ({len(results)} rows)")
 
 
 # ── Walk-forward helpers ──────────────────────────────────────────────────────
@@ -353,47 +411,20 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
     combos = list(itertools.product(*PARAM_GRID.values()))
     total  = len(combos)
     print(f"\n  Total combinations to test: {total}")
-    print(f"  Caching swings for {len(PARAM_GRID['SWING_N'])*len(PARAM_GRID['MIN_SWING_SIZE'])*len(PARAM_GRID['MIN_SWING_INCR'])} unique swing configs")
-
-    swing_cache  = {}
-    regime_cache = {}
-    results      = []
-    t0           = time.time()
+    results = []
+    t0 = time.time()
 
     for idx, vals in enumerate(combos):
         c = dict(zip(keys, vals))
-
-        # Cached swing build
-        skey = (c["SWING_N"], c["MIN_SWING_SIZE"], c["MIN_SWING_INCR"])
-        if skey not in swing_cache:
-            swing_cache[skey] = build_swings(
-                df_raw, swing_n=c["SWING_N"],
-                min_swing_size=c["MIN_SWING_SIZE"],
-                min_swing_increment=c["MIN_SWING_INCR"], pip=PIP,
-            )
-        swings = swing_cache[skey]
-
-        # Cached regime classification
-        rkey = skey + (c["MIN_TREND_SIZE"], c["TREND_RANGE_RATIO"])
-        if rkey not in regime_cache:
-            regime_cache[rkey] = classify_trend(
-                df_raw, swings,
-                swing_n=c["SWING_N"], min_swing_increment=c["MIN_SWING_INCR"],
-                min_trend_size=c["MIN_TREND_SIZE"],
-                trend_range_ratio=c["TREND_RANGE_RATIO"], pip=PIP,
-            )
-        df_reg = regime_cache[rkey]
-
         trades = run_trades(
-            df_reg, swings, swing_n=c["SWING_N"],
+            df_raw,
             pullback_lookback=c["PULLBACK_LOOKBACK"],
-            stop_buffer=c["STOP_BUFFER"], tp_mode=c["TP_MODE"],
+            stop_buffer=c["STOP_BUFFER"],
+            tp_mode=c["TP_MODE"],
         )
-
         is_t, oos_t = _split_trades(trades, split_dt)
         is_m  = _quick_metrics(is_t)
         oos_m = _quick_metrics(oos_t)
-
         row = {**c,
                **{f"IS_{k}":  v for k, v in is_m.items()},
                **{f"OOS_{k}": v for k, v in oos_m.items()}}
@@ -402,7 +433,7 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
         done = idx + 1
         if done % max(1, total // 20) == 0 or done == total:
             elapsed = time.time() - t0
-            eta     = elapsed / done * (total - done)
+            eta = elapsed / done * (total - done)
             print(f"  {done/total*100:5.1f}%  ({done}/{total})  "
                   f"elapsed {elapsed/60:.1f}m  ETA {eta/60:.1f}m", flush=True)
 
@@ -415,25 +446,26 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    run_id  = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_dir = Path("results") / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print("=" * 55)
-    print("  EURUSD 4H ALGORITHMIC BACKTEST — STEP 5")
+    print("  EURUSD 4H ALGORITHMIC BACKTEST")
     print("=" * 55)
+    print(f"  Results folder: {out_dir}")
 
     # 1. Data
     print("\n[1] Loading data...")
     df_raw = get_data()
     split_dt = _split_date(df_raw)
     print(f"    Bars:       {len(df_raw)}")
-    print(f"    Range:      {df_raw.index[0].date()} → {df_raw.index[-1].date()}")
+    print(f"    Range:      {df_raw.index[0].date()} to {df_raw.index[-1].date()}")
     print(f"    Split date: {split_dt.date()}  (IS=70%  OOS=30%)")
 
-    # 2. Default pipeline
-    print("\n[2] Default parameters — building swings + regimes...")
-    swings = build_swings(df_raw)
-    df_cls = classify_trend(df_raw, swings)
-
-    print("[3] Running trades...")
-    all_trades = run_trades(df_cls, swings)
+    # 2. Run strategy
+    print("\n[2] Running trades...")
+    all_trades = run_trades(df_raw)
     is_t, oos_t = _split_trades(all_trades, split_dt)
     print(f"    Total: {len(all_trades)}  |  IS: {len(is_t)}  |  OOS: {len(oos_t)}")
 
@@ -442,91 +474,35 @@ if __name__ == "__main__":
     is_m  = compute_metrics(is_t)
     oos_m = compute_metrics(oos_t)
 
-    print_metrics(all_m, "FULL DATASET — DEFAULT PARAMETERS")
+    print_metrics(all_m, "FULL DATASET")
     print_metrics(is_m,  "IN-SAMPLE  (first 70% by date)")
     print_metrics(oos_m, "OUT-OF-SAMPLE  (last 30% by date)")
     compare_is_oos(is_m, oos_m)
 
-    # 4. Equity curve
-    print("\n[4] Building equity curve...")
+    # 4. Save outputs
+    print("\n[4] Saving results...")
     eq_all = build_equity(all_trades)
-    split_trade_n = len(is_t)  # trade index where OOS begins
+    split_trade_n = len(is_t)
+
     if not eq_all.empty:
         print(f"    Start:        ${INITIAL_BALANCE:,.2f}")
         print(f"    End:          ${eq_all['balance'].iloc[-1]:,.2f}")
         print(f"    Max drawdown: {eq_all['drawdown_pct'].min():.2f}%")
-        print(f"    Equity starts at 10,000: {eq_all['balance'].iloc[0] != INITIAL_BALANCE or True}")
 
     plot_equity_curve(eq_all,
-                      title="EURUSD 4H — Full Equity Curve (Default Parameters)",
+                      title=f"EURUSD 4H — Equity Curve ({run_id})",
+                      path=str(out_dir / "equity_curve.png"),
                       split_trade=split_trade_n)
-    export_trades_csv(all_trades)
-    export_equity_csv(eq_all)
+    plot_recent_trades(df_raw, all_trades, path=str(out_dir / "recent_trades.png"), days=30)
+    export_trades_csv(all_trades, path=str(out_dir / "trade_log.csv"))
+    export_equity_csv(eq_all,     path=str(out_dir / "equity_curve.csv"))
 
-    # 5. Optimisation
-    print("\n[5] Running parameter optimisation...")
-    opt = optimize(df_raw, split_dt)
-    export_opt_csv(opt)
+    # Save summary metrics as JSON
+    summary = {"run_id": run_id, "all": all_m, "is": is_m, "oos": oos_m}
+    with open(out_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"Summary JSON: {out_dir / 'summary.json'}")
 
-    param_cols   = list(PARAM_GRID.keys())
-    display_cols = param_cols + [
-        "IS_total_trades",  "IS_win_rate_pct",  "IS_expectancy_net_r",
-        "IS_gross_ev",      "IS_net_ev",         "IS_max_drawdown_pct",
-        "OOS_total_trades", "OOS_win_rate_pct", "OOS_expectancy_net_r",
-        "OOS_gross_ev",     "OOS_net_ev",        "OOS_max_drawdown_pct",
-    ]
-    print(f"\n{'═'*90}")
-    print("  TOP 10 COMBINATIONS BY OUT-OF-SAMPLE EXPECTANCY")
-    print(f"{'═'*90}")
-    print(opt[display_cols].head(10).to_string())
-
-    best = opt.iloc[0]
-    print(f"\n{'═'*65}")
-    print("  BEST OUT-OF-SAMPLE PARAMETERS")
-    print(f"{'═'*65}")
-    for k in param_cols:
-        print(f"  {k:<25} {best[k]}")
-
-    # 6. OOS result for best combo (no re-run — already computed during opt)
-    best_oos_exp    = best["OOS_expectancy_net_r"]
-    best_is_exp     = best["IS_expectancy_net_r"]
-    best_oos_net_ev = best.get("OOS_net_ev", "—")
-    best_is_net_ev  = best.get("IS_net_ev",  "—")
-    print(f"\n  IS  expectancy: {best_is_exp} R/trade    IS  net EV: {best_is_net_ev} R/trade")
-    print(f"  OOS expectancy: {best_oos_exp} R/trade    OOS net EV: {best_oos_net_ev} R/trade")
-
-    # Confirm: selection was IS-only (no peeking)
-    print(f"\n  [Confirmed] Best combo selected on OOS expectancy (unseen data performance).")
-    print(f"  [Confirmed] OOS results computed from same full run, filtered by date.")
-    print(f"  [Confirmed] {len(opt)} combinations tested.")
-
-    print(f"\n{'═'*65}")
-    if best_oos_exp > 0:
-        print(f"  FINAL: POSITIVE OOS EXPECTANCY — {best_oos_exp} R/trade  ✓")
-        print(f"  The system shows a measurable edge on unseen data.")
-    else:
-        print(f"  FINAL: NEGATIVE OOS EXPECTANCY — {best_oos_exp} R/trade  ✗")
-        print(f"  No confirmed edge on out-of-sample data. Parameters likely overfit.")
-    print(f"{'═'*65}")
-
-    # 7. Worked EV example using all_m
-    print(f"\n{'═'*65}")
-    print("  EV CALCULATION — WORKED EXAMPLE (full dataset)")
-    print(f"{'═'*65}")
-    _n  = all_m["total_trades"]
-    _w  = all_m["winning_trades"]
-    _l  = all_m["losing_trades"]
-    _wr = _w / _n
-    _lr = _l / _n
-    _ag = all_m["avg_win_r"]
-    _al = all_m["avg_loss_r"]
-    print(f"  Win rate (WR)           = {_w} / {_n} = {_wr:.4f}")
-    print(f"  Loss rate (LR)          = {_l} / {_n} = {_lr:.4f}")
-    print(f"  Avg net win  (R)        = {_ag}")
-    print(f"  Avg net loss (R)        = {_al}")
-    print(f"  Net EV = WR×avg_win − LR×|avg_loss|")
-    print(f"         = {_wr:.4f}×{_ag} − {_lr:.4f}×{abs(_al):.4f}")
-    print(f"         = {round(_wr*_ag, 4)} − {round(_lr*abs(_al), 4)}")
-    print(f"         = {all_m.get('net_ev', '—')} R/trade")
-    print(f"  (Same as expectancy = total_net_R / n = {all_m['expectancy_net_r']} R/trade)")
-    print(f"{'═'*65}")
+    print(f"\n{'='*65}")
+    print(f"  DONE  —  results saved to: {out_dir}")
+    print(f"{'='*65}")

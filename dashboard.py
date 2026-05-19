@@ -24,8 +24,7 @@ try:
     from data_pipeline  import get_data
     from swing_engine   import build_swings, PIP
     from trend_engine   import classify_trend
-    from trade_engine   import (_compute_setup, _confirmed_at,
-                                 _pullback_depths, run_trades)
+    from trade_engine   import run_trades, _bar_setup
     from backtest_engine import build_equity, compute_metrics, _split_date
     PIPELINE_OK = True
 except Exception as e:
@@ -38,6 +37,7 @@ def _mt5_connected() -> bool:
     terminal reports an active connection. Never raises."""
     try:
         import MetaTrader5 as _mt5
+        _mt5.initialize()
         info = _mt5.terminal_info()
         return info is not None and bool(info.connected)
     except Exception:
@@ -52,8 +52,6 @@ STATE_JSON = Path("state.json")
 LOG_FILE   = Path("trading_log.txt")
 
 PARAM_COLS = [
-    "SWING_N", "MIN_SWING_SIZE", "MIN_SWING_INCR",
-    "MIN_TREND_SIZE", "TREND_RANGE_RATIO",
     "PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE",
 ]
 
@@ -240,11 +238,6 @@ def _metric_row(m: dict, prefix: str = "") -> None:
 # Parameter grid exactly as defined in backtest_engine.py
 _BT_PARAM_DEFS = [
     # (csv_col,            state_key,         options,             cast)
-    ("SWING_N",            "bt_swing_n",      [2, 3],              int),
-    ("MIN_SWING_SIZE",     "bt_min_sz",       [15, 20, 25],        int),
-    ("MIN_SWING_INCR",     "bt_min_incr",     [8, 10, 15],         int),
-    ("MIN_TREND_SIZE",     "bt_trend_sz",     [40, 50, 60],        int),
-    ("TREND_RANGE_RATIO",  "bt_trend_rr",     [0.30, 0.40, 0.50], float),
     ("PULLBACK_LOOKBACK",  "bt_pb_lb",        [3, 4, 5],           int),
     ("STOP_BUFFER",        "bt_sb",           [3, 5, 8],           int),
     ("TP_MODE",            "bt_tp",           ["full", "partial"], str),
@@ -441,6 +434,180 @@ def page_backtest() -> None:
         st.info("No `trade_log.csv` found. Run `python backtest_engine.py` first.")
 
 
+# ── Parameter Studio ─────────────────────────────────────────────────────────
+
+def page_parameter_studio() -> None:
+    st.title("⚙️ Parameter Studio")
+
+    if not PIPELINE_OK:
+        st.error(f"Pipeline import failed: {_import_err}")
+        return
+
+    cfg = _load_config_fresh() or {}
+
+    def _i(key, default): return int(cfg.get(key, default))
+    def _f(key, default): return float(cfg.get(key, default))
+
+    # ── Main area: four sections ──────────────────────────────────────────────
+    st.markdown("Fill in your parameters below, then click **▶ Run Backtest**.")
+
+    # ── 1. Market Conditions ──────────────────────────────────────────────────
+    with st.expander("📊 Market Conditions", expanded=True):
+        st.caption("Controls the session window and data range.")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            bars          = mc1.number_input("Bars to fetch",             min_value=100, max_value=50000, value=9999, step=100, help="Number of 4H candles to pull from MT5.")
+            session_start = mc1.number_input("Session start (UTC hour)",  min_value=0,   max_value=23,    value=_i("session_start_utc", 0), step=1, help="Only take trades at or after this UTC hour.")
+        with mc2:
+            split_pct   = mc2.number_input("In-sample split %",          min_value=10,  max_value=90,    value=70, step=5, help="Percentage of data used for in-sample testing.")
+            session_end = mc2.number_input("Session end (UTC hour)",      min_value=1,   max_value=24,    value=_i("session_end_utc", 20), step=1, help="Stop taking new trades after this UTC hour.")
+
+    # ── 2. Entry ──────────────────────────────────────────────────────────────
+    with st.expander("🎯 Entry", expanded=True):
+        st.caption("Controls when and how a limit order is placed.")
+        en1, en2 = st.columns(2)
+        with en1:
+            pullback_lookback = en1.number_input("Pullback lookback",       min_value=1,    max_value=20,    value=_i("pullback_lookback", 4),    step=1,    help="Number of recent pullbacks used to calculate the median entry offset.")
+        with en2:
+            stop_buffer       = en2.number_input("Stop buffer (pips)",      min_value=0,    max_value=50,    value=_i("stop_buffer", 5),          step=1,    help="Extra pips added beyond the swing low/high for the stop loss.")
+
+    # ── 3. Exit ───────────────────────────────────────────────────────────────
+    with st.expander("🚪 Exit", expanded=True):
+        st.caption("Controls how trades are closed.")
+        ex1, ex2 = st.columns(2)
+        with ex1:
+            tp_mode = ex1.selectbox("TP mode", ["full", "partial"],
+                                     index=0 if cfg.get("tp_mode", "full") == "full" else 1,
+                                     help="full = close entire position at TP1. partial = close half at TP1, trail the rest.")
+        with ex2:
+            st.markdown("")  # spacer
+
+    # ── 4. Risk Management ────────────────────────────────────────────────────
+    with st.expander("🛡️ Risk Management", expanded=True):
+        st.caption("Controls position sizing and capital protection.")
+        rm1, rm2 = st.columns(2)
+        with rm1:
+            risk_pct_pct    = rm1.number_input("Risk per trade %",          min_value=0.01, max_value=10.0,  value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f", help="Percentage of account balance risked per trade.")
+            min_stop_pips   = rm1.number_input("Min stop distance (pips)",  min_value=1,    max_value=100,   value=5,                              step=1,    help="Setups with a stop smaller than this are skipped (prevents oversizing).")
+            max_drawdown_pct= rm1.number_input("Max drawdown % (circuit breaker)", min_value=1.0, max_value=50.0, value=_f("max_drawdown_pct", 5.0), step=0.5, help="Live trader halts if session drawdown hits this level.")
+        with rm2:
+            initial_balance = rm2.number_input("Initial balance ($)",       min_value=100,  max_value=10000000, value=10000,                       step=500,  help="Starting capital for the backtest equity simulation.")
+            max_lot         = rm2.number_input("Max lot size",              min_value=0.01, max_value=100.0, value=10.0,                           step=0.5,  format="%.2f", help="Hard cap on position size regardless of the risk formula result.")
+        risk_pct = risk_pct_pct / 100
+        split_ratio = split_pct / 100
+
+    st.divider()
+    col_run, col_save, _ = st.columns([1, 1, 3])
+    run_btn  = col_run.button("▶  Run Backtest",      type="primary", use_container_width=True)
+    save_btn = col_save.button("💾  Save as config.json",             use_container_width=True)
+
+    # ── Save config ───────────────────────────────────────────────────────────
+    if save_btn:
+        new_cfg = {
+            "symbol":            "EURUSD",
+            "timeframe":         "H4",
+            "session_start_utc": int(session_start),
+            "session_end_utc":   int(session_end),
+            "risk_per_trade":    round(risk_pct, 4),
+            "tp_mode":           tp_mode,
+            "pullback_lookback": int(pullback_lookback),
+            "stop_buffer":       int(stop_buffer),
+            "paper_mode":        cfg.get("paper_mode", True),
+            "max_drawdown_pct":  float(max_drawdown_pct),
+        }
+        Path("config.json").write_text(json.dumps(new_cfg, indent=2))
+        st.success("✅ Saved to config.json — live_trader.py will use these on next restart.")
+
+    if not run_btn:
+        if cfg:
+            st.subheader("Current config.json")
+            st.json(cfg)
+        return
+
+    # ── Run pipeline ──────────────────────────────────────────────────────────
+    prog = st.progress(0, "Fetching data from MT5...")
+    try:
+        df_raw = get_data(bars=bars)
+    except Exception as e:
+        st.error(f"MT5 fetch failed: {e}")
+        return
+
+    prog.progress(40, "Simulating trades...")
+    all_trades = run_trades(
+        df_raw,
+        account_balance=initial_balance,
+        pullback_lookback=pullback_lookback, stop_buffer=stop_buffer,
+        tp_mode=tp_mode, risk_pct=risk_pct,
+        session_start=session_start, session_end=session_end,
+        min_stop_pips=min_stop_pips, max_lot=max_lot,
+    )
+
+    prog.progress(80, "Computing metrics...")
+    split_dt = df_raw.index[0] + (df_raw.index[-1] - df_raw.index[0]) * split_ratio
+    is_t     = [t for t in all_trades if t.entry_date <  split_dt]
+    oos_t    = [t for t in all_trades if t.entry_date >= split_dt]
+
+    all_m = compute_metrics(all_trades, initial=initial_balance)
+    is_m  = compute_metrics(is_t,       initial=initial_balance)
+    oos_m = compute_metrics(oos_t,      initial=initial_balance)
+    prog.progress(100, "Done.")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    oos_ev = oos_m.get("net_ev", 0) or 0
+    if oos_ev >= 0:
+        st.success(f"✅  {len(all_trades)} trades  |  OOS net EV: +{oos_ev:.4f} R/trade")
+    else:
+        st.error(f"❌  {len(all_trades)} trades  |  OOS net EV: {oos_ev:.4f} R/trade")
+
+    # Metrics columns
+    def _mcol(col, label, m):
+        with col:
+            st.markdown(f"**{label}**")
+            st.metric("Trades",     m.get("total_trades", "—"))
+            st.metric("Win Rate",   f"{m.get('win_rate_pct', 0):.1f}%")
+            st.metric("Expectancy", f"{m.get('expectancy_net_r', 0):.4f} R")
+            st.metric("Net EV",     f"{m.get('net_ev', 0):.4f} R")
+            st.metric("Max DD",     f"{m.get('max_drawdown_pct', 0):.1f}%")
+            st.metric("Avg Win",    f"{m.get('avg_win_r', 0):.2f} R")
+            st.metric("Avg Loss",   f"{m.get('avg_loss_r', 0):.2f} R")
+            st.metric("T/month",    f"{m.get('trades_per_month', 0):.1f}")
+
+    c1, c2, c3 = st.columns(3)
+    _mcol(c1, "Full Dataset",                all_m)
+    _mcol(c2, f"In-Sample ({split_pct}%)",   is_m)
+    _mcol(c3, f"Out-of-Sample ({100-split_pct}%)", oos_m)
+
+    # Equity curve
+    eq = build_equity(all_trades, initial=initial_balance)
+    if not eq.empty:
+        st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
+
+    # Trade table
+    st.subheader("Trade Log")
+    if all_trades:
+        tbl = pd.DataFrame([{
+            "id":       t.trade_id,
+            "dir":      t.direction,
+            "entry":    str(t.entry_date)[:16],
+            "exit":     str(t.exit_date)[:16],
+            "reason":   t.exit_reason,
+            "net_pips": t.net_pips,
+            "net_r":    t.net_r,
+            "lot":      t.lot_size,
+            "dur_h":    t.duration_hours,
+            "regime":   t.regime,
+        } for t in all_trades])
+        st.dataframe(tbl, use_container_width=True, height=350)
+        st.download_button(
+            "⬇  Download trade log",
+            data=tbl.to_csv(index=False).encode(),
+            file_name="trade_log_studio.csv",
+            mime="text/csv",
+        )
+    else:
+        st.warning("No trades generated with these parameters.")
+
+
 # ── Page 2: Live Regime Monitor ───────────────────────────────────────────────
 
 def page_live() -> None:
@@ -461,16 +628,8 @@ def page_live() -> None:
         params = {c: best[c] for c in PARAM_COLS}
         st.caption(f"Using best out-of-sample parameters (rank #1 by OOS expectancy): {dict(params)}")
     else:
-        # Fall back to module defaults
-        from swing_engine  import SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
-        from trend_engine  import MIN_TREND_SIZE, TREND_RANGE_RATIO
         from trade_engine  import PULLBACK_LOOKBACK, STOP_BUFFER, TP_MODE
-        params = dict(
-            SWING_N=SWING_N, MIN_SWING_SIZE=MIN_SWING_SIZE,
-            MIN_SWING_INCR=MIN_SWING_INCREMENT, MIN_TREND_SIZE=MIN_TREND_SIZE,
-            TREND_RANGE_RATIO=TREND_RANGE_RATIO, PULLBACK_LOOKBACK=PULLBACK_LOOKBACK,
-            STOP_BUFFER=STOP_BUFFER, TP_MODE=TP_MODE,
-        )
+        params = dict(PULLBACK_LOOKBACK=PULLBACK_LOOKBACK, STOP_BUFFER=STOP_BUFFER, TP_MODE=TP_MODE)
         st.info("No optimisation results found — using default parameters.")
 
     # Refresh button (bumps cache key)
@@ -494,98 +653,63 @@ def page_live() -> None:
     st.caption(f"Last update: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')} "
                f"| {len(df_raw)} bars")
 
-    # Run pipeline with best params
-    swings = build_swings(
-        df_raw,
-        swing_n=int(params["SWING_N"]),
-        min_swing_size=float(params["MIN_SWING_SIZE"]),
-        min_swing_increment=float(params["MIN_SWING_INCR"]),
-        pip=PIP,
-    )
-    df_cls = classify_trend(
-        df_raw, swings,
-        swing_n=int(params["SWING_N"]),
-        min_swing_increment=float(params["MIN_SWING_INCR"]),
-        min_trend_size=float(params["MIN_TREND_SIZE"]),
-        trend_range_ratio=float(params["TREND_RANGE_RATIO"]),
-        pip=PIP,
-    )
-
-    last      = df_cls.iloc[-1]
-    regime    = str(last["regime"])
+    last      = df_raw.iloc[-1]
     close_px  = float(last["Close"])
-    strength  = last.get("trend_strength_score")
-    last_time = df_cls.index[-1]
+    last_time = df_raw.index[-1]
 
-    # ── Status banner ─────────────────────────────────────────────────────────
-    banner = {"UPTREND": "🟢 UPTREND", "DOWNTREND": "🔴 DOWNTREND", "AMBIGUOUS": "⚫ AMBIGUOUS"}
-    st.markdown(f"## {banner.get(regime, regime)}")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Close Price",    f"{close_px:.5f}")
-    c2.metric("Last Candle",    str(last_time)[:16])
-    str_val = (f"{float(strength):.1f} pips"
-               if strength is not None and not (isinstance(strength, float) and np.isnan(strength))
-               else "—")
-    c3.metric("Trend Strength", str_val)
+    c1, c2 = st.columns(2)
+    c1.metric("Close Price", f"{close_px:.5f}")
+    c2.metric("Last Candle", str(last_time)[:16])
     st.divider()
 
-    # ── Swings & pullbacks ────────────────────────────────────────────────────
-    bar_i     = len(df_raw) - 1
-    confirmed = _confirmed_at(swings, bar_i, int(params["SWING_N"]))
-    direction = "long" if regime == "UPTREND" else "short"
+    # ── Last 3 bars ───────────────────────────────────────────────────────────
+    if len(df_raw) >= 3:
+        prev2 = df_raw.iloc[-3]
+        prev1 = df_raw.iloc[-2]
+        curr  = df_raw.iloc[-1]
 
-    col_sw, col_pb = st.columns(2)
+        lb   = int(params.get("PULLBACK_LOOKBACK", 4))
+        sb   = float(params.get("STOP_BUFFER", 5))
+        pb_pips = float(np.median(
+            [(df_raw.iloc[j]["High"] - df_raw.iloc[j]["Low"]) / PIP
+             for j in range(max(0, len(df_raw) - lb), len(df_raw))]
+        ))
 
-    with col_sw:
-        st.subheader("Last 10 Confirmed Swing Points")
-        if confirmed.empty:
-            st.info("No confirmed swings yet.")
-        else:
-            disp = confirmed.tail(10)[["date", "price", "type"]].copy()
-            disp["price"] = disp["price"].round(5)
-            st.dataframe(disp.reset_index(drop=True), use_container_width=True)
+        from trade_engine import MIN_STOP_PIPS
+        result = _bar_setup(prev2, prev1, curr, pb_pips, sb, PIP, MIN_STOP_PIPS)
 
-    with col_pb:
-        st.subheader("Pullback Depths")
-        depths = _pullback_depths(confirmed, direction, PIP) if not confirmed.empty else []
-        last5  = depths[-5:]
-        if last5:
-            pb_df = pd.DataFrame(
-                {"pullback_pips": [int(round(d)) for d in last5]},
-                index=range(1, len(last5) + 1),
-            )
-            st.dataframe(pb_df, use_container_width=True)
-            med = float(np.median(last5))
-            st.metric("Median Pullback (entry offset)", f"{int(round(med))} pips")
-        else:
-            st.info("Fewer than 2 pullbacks — fallback to 20-bar range median.")
+        col_bars, col_sig = st.columns(2)
+        with col_bars:
+            st.subheader("Last 3 Bars")
+            bar_data = pd.DataFrame([
+                {"bar": "prev2", "Open": prev2["Open"], "High": prev2["High"],
+                 "Low": prev2["Low"], "Close": prev2["Close"]},
+                {"bar": "prev1", "Open": prev1["Open"], "High": prev1["High"],
+                 "Low": prev1["Low"], "Close": prev1["Close"]},
+                {"bar": "curr",  "Open": curr["Open"],  "High": curr["High"],
+                 "Low": curr["Low"],  "Close": curr["Close"]},
+            ])
+            st.dataframe(bar_data.round(5), use_container_width=True)
 
-    st.divider()
-
-    # ── Projected signal ──────────────────────────────────────────────────────
-    st.subheader("Projected Signal  (if triggered now)")
-    if regime not in ("UPTREND", "DOWNTREND"):
-        st.info("Market is AMBIGUOUS — no signal.")
+        with col_sig:
+            st.subheader("Projected Signal")
+            if result is None:
+                st.info("No consecutive bar setup detected on the last 3 bars.")
+            else:
+                direction, entry, stop, tp1 = result
+                rr = abs(tp1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0
+                st.success(f"**{direction.upper()} SETUP**")
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Entry", f"{entry:.5f}")
+                p2.metric("Stop",  f"{stop:.5f}",
+                          delta=f"{int(round(abs(entry - stop) / PIP))} pip risk")
+                p3.metric("TP",    f"{tp1:.5f}",
+                          delta=f"{int(round(abs(tp1 - entry) / PIP))} pip target")
+                p4.metric("R:R",   f"1 : {rr:.2f}")
     else:
-        df_window = df_raw.iloc[max(0, bar_i - 19): bar_i + 1]
-        setup = _compute_setup(
-            confirmed, direction, df_window,
-            int(params["PULLBACK_LOOKBACK"]),
-            float(params["STOP_BUFFER"]), PIP,
-        )
-        if setup:
-            entry, stop, tp1 = setup
-            rr = abs(tp1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Entry",  f"{entry:.5f}")
-            p2.metric("Stop",   f"{stop:.5f}",
-                      delta=f"{int(round(abs(entry - stop) / PIP))} pip risk")
-            p3.metric("TP1",    f"{tp1:.5f}",
-                      delta=f"{int(round(abs(tp1 - entry) / PIP))} pip target")
-            p4.metric("R:R",    f"1 : {rr:.2f}")
-        else:
-            st.info("Structure incomplete for a valid setup at current bar.")
+        st.info("Not enough bars to evaluate setup.")
+
+    st.divider()
 
 
 # ── Page 3: Parameter Explorer ────────────────────────────────────────────────
@@ -603,21 +727,11 @@ def page_explorer() -> None:
     # ── Sidebar filters ───────────────────────────────────────────────────────
     with st.sidebar:
         st.subheader("Filters")
-        swing_n_f = st.multiselect("SWING_N",            [2, 3],            default=[2, 3])
-        size_r    = st.slider("MIN_SWING_SIZE",  15, 25, (15, 25), step=5)
-        incr_r    = st.slider("MIN_SWING_INCR",   8, 15,  (8, 15))
-        trend_r   = st.slider("MIN_TREND_SIZE",  40, 60, (40, 60), step=10)
-        ratio_r   = st.slider("TREND_RANGE_RATIO", 0.30, 0.50, (0.30, 0.50), step=0.05)
-        lb_r      = st.slider("PULLBACK_LOOKBACK",  3,  5, (3, 5))
-        sb_r      = st.slider("STOP_BUFFER",        3,  8, (3, 8))
-        tp_f      = st.multiselect("TP_MODE", ["full", "partial"], default=["full", "partial"])
+        lb_r = st.slider("PULLBACK_LOOKBACK", 3, 5, (3, 5))
+        sb_r = st.slider("STOP_BUFFER",       3, 8, (3, 8))
+        tp_f = st.multiselect("TP_MODE", ["full", "partial"], default=["full", "partial"])
 
     mask = (
-        opt_df["SWING_N"].isin(swing_n_f) &
-        opt_df["MIN_SWING_SIZE"].between(*size_r) &
-        opt_df["MIN_SWING_INCR"].between(*incr_r) &
-        opt_df["MIN_TREND_SIZE"].between(*trend_r) &
-        opt_df["TREND_RANGE_RATIO"].between(*ratio_r) &
         opt_df["PULLBACK_LOOKBACK"].between(*lb_r) &
         opt_df["STOP_BUFFER"].between(*sb_r) &
         opt_df["TP_MODE"].isin(tp_f)
@@ -635,19 +749,15 @@ def page_explorer() -> None:
         "OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct","OOS_total_trades",
     ] if c in filt.columns]
 
-    # Cast SWING_N to string so plotly treats it as categorical
-    plot_df = filt.copy()
-    plot_df["SWING_N"] = plot_df["SWING_N"].astype(str)
-
     fig = px.scatter(
-        plot_df,
+        filt,
         x="IS_win_rate_pct", y="IS_expectancy_net_r",
         size="IS_total_trades", size_max=20,
-        color="SWING_N",
-        color_discrete_map={"2": "#4da6ff", "3": "#ff884d"},
+        color="TP_MODE",
+        color_discrete_map={"full": "#4da6ff", "partial": "#ff884d"},
         hover_data=hover_cols,
         template="plotly_dark",
-        title="IS Win Rate % vs IS Expectancy R  (bubble size = trade count, colour = SWING_N)",
+        title="IS Win Rate % vs IS Expectancy R  (bubble size = trade count, colour = TP_MODE)",
         labels={
             "IS_win_rate_pct":     "Win Rate % (IS)",
             "IS_expectancy_net_r": "Expectancy R (IS)",
@@ -1664,6 +1774,7 @@ def page_live_trading() -> None:
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 PAGES = {
+    "⚙️ Parameter Studio":      page_parameter_studio,
     "📊 Backtest Results":      page_backtest,
     "📡 Live Regime Monitor":   page_live,
     "🔍 Parameter Explorer":    page_explorer,

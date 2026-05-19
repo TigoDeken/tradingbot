@@ -24,7 +24,7 @@ import pandas as pd
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
 from swing_engine   import build_swings, PIP
 from trend_engine   import classify_trend
-from trade_engine   import _compute_setup, _confirmed_at, _pullback_depths, PIP_VALUE
+from trade_engine   import PIP_VALUE
 from constants import MAGIC, MAX_LIMIT_BARS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -75,8 +75,7 @@ def load_config() -> dict:
         cfg = json.load(f)
     required = [
         "symbol", "timeframe", "session_start_utc", "session_end_utc",
-        "risk_per_trade", "tp_mode", "swing_n", "min_swing_size",
-        "min_swing_increment", "min_trend_size", "trend_range_ratio",
+        "risk_per_trade", "tp_mode",
         "pullback_lookback", "stop_buffer", "paper_mode", "max_drawdown_pct",
     ]
     missing = [k for k in required if k not in cfg]
@@ -540,39 +539,38 @@ def _check_live_pending(config: dict, state: dict, logger: logging.Logger) -> No
 # ── Entry logic ───────────────────────────────────────────────────────────────
 
 def check_entry(config: dict, state: dict, df: pd.DataFrame,
-                swings: pd.DataFrame, logger: logging.Logger) -> None:
-    last_bar  = df.iloc[-1]
-    bar_i     = len(df) - 1
-    bar_time  = df.index[-1]
-    regime    = str(last_bar.get("regime", "AMBIGUOUS"))
-
-    if regime not in ("UPTREND", "DOWNTREND"):
-        logger.info(f"No entry — regime: {regime}")
+                logger: logging.Logger) -> None:
+    from trade_engine import _bar_setup
+    if len(df) < 3:
         return
+    bar_time = df.index[-1]
     if not in_session(config, bar_time):
         logger.info(f"No entry — outside session hours ({bar_time.hour:02d}:00 UTC)")
         return
 
-    direction = "long" if regime == "UPTREND" else "short"
-    confirmed = _confirmed_at(swings, bar_i, config["swing_n"])
-    df_window = df.iloc[max(0, bar_i - 19): bar_i + 1]
+    prev2 = df.iloc[-3]
+    prev1 = df.iloc[-2]
+    curr  = df.iloc[-1]
 
-    setup = _compute_setup(
-        confirmed, direction, df_window,
-        config["pullback_lookback"], config["stop_buffer"], PIP,
-    )
-    if setup is None:
-        logger.info("No entry — setup returned None (insufficient structure)")
+    lb = config.get("pullback_lookback", 4)
+    pb_pips = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / PIP
+                                for j in range(max(0, len(df) - lb), len(df) - 1)]))
+    min_stop = config.get("min_stop_pips", 20.0)
+
+    result = _bar_setup(prev2, prev1, curr, pb_pips,
+                        config.get("stop_buffer", 5), PIP, min_stop)
+    if result is None:
+        logger.info("No entry — no consecutive breakout pattern")
         state["last_entry_zone"] = None
         return
 
-    entry, stop, tp1 = setup
+    direction, entry, stop, tp1 = result
     state["last_entry_zone"] = entry
 
     balance = get_balance(config, state)
     lot     = compute_lot(config, balance, entry, stop)
     if lot <= 0:
-        logger.info(f"No entry — lot size zero (balance=${balance:.2f}, stop={abs(entry-stop)/PIP:.1f}pip)")
+        logger.info(f"No entry — lot size zero (stop={abs(entry-stop)/PIP:.1f}pip)")
         return
 
     logger.info(
@@ -593,22 +591,10 @@ def run_candle(config: dict, state: dict, df: pd.DataFrame,
                logger: logging.Logger) -> None:
     ensure_connected(logger)
 
-    # Build pipeline
-    swings = build_swings(
-        df,
-        swing_n=config["swing_n"],
-        min_swing_size=config["min_swing_size"],
-        min_swing_increment=config["min_swing_increment"],
-        pip=PIP,
-    )
-    df = classify_trend(
-        df, swings,
-        swing_n=config["swing_n"],
-        min_swing_increment=config["min_swing_increment"],
-        min_trend_size=config["min_trend_size"],
-        trend_range_ratio=config["trend_range_ratio"],
-        pip=PIP,
-    )
+    from swing_engine import build_swings
+    from trend_engine import classify_trend
+    swings = build_swings(df, pip=PIP)
+    df     = classify_trend(df, swings)
 
     last_bar  = df.iloc[-1]
     bar_i     = len(df) - 1
@@ -667,7 +653,7 @@ def run_candle(config: dict, state: dict, df: pd.DataFrame,
 
     # ── Entry check ───────────────────────────────────────────────────────────
     if not state.get("open_trade") and not state.get("pending_limit"):
-        check_entry(config, state, df, swings, logger)
+        check_entry(config, state, df, logger)
 
     save_state(state)
     logger.info(

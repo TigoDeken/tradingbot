@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from data_pipeline import get_data
-from swing_engine import build_swings, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT, PIP
-from trend_engine import classify_trend, MIN_TREND_SIZE, TREND_RANGE_RATIO
+from constants import PIP
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 from constants import PIP_VALUE, RISK_PCT  # noqa: F401 (PIP_VALUE re-exported)
@@ -18,6 +17,8 @@ STOP_BUFFER       = 5        # pips
 TP_MODE           = "full"   # "full" | "partial"
 SLIPPAGE_PIPS     = 3
 ACCOUNT_BALANCE   = 10_000.0
+MIN_STOP_PIPS     = 20.0     # floor to prevent degenerate lot sizing
+MAX_LOT           = 10.0     # hard cap on position size
 
 
 # ── Trade record ─────────────────────────────────────────────────────────────
@@ -58,90 +59,53 @@ def _in_session(ts: pd.Timestamp, session_start: int = 7, session_end: int = 20)
     return session_start <= ts.hour < session_end
 
 
-def _confirmed_at(swings: pd.DataFrame, bar_i: int, swing_n: int) -> pd.DataFrame:
-    """All swings confirmed by bar_i (need swing_n bars after the swing candle)."""
-    return swings[swings["bar"] <= bar_i - swing_n]
-
-
-def _pullback_depths(trend_sw: pd.DataFrame, direction: str, pip: float) -> list[float]:
-    """Extract pip distances of each high→low (long) or low→high (short) pair."""
-    depths: list[float] = []
-    if direction == "long":
-        last_h = None
-        for _, r in trend_sw.iterrows():
-            if r["type"] == "high":
-                last_h = r["price"]
-            elif r["type"] == "low" and last_h is not None:
-                depths.append((last_h - r["price"]) / pip)
-                last_h = None
-    else:
-        last_l = None
-        for _, r in trend_sw.iterrows():
-            if r["type"] == "low":
-                last_l = r["price"]
-            elif r["type"] == "high" and last_l is not None:
-                depths.append((r["price"] - last_l) / pip)
-                last_l = None
-    return depths
-
-
-def _compute_setup(
-    confirmed:  pd.DataFrame,
-    direction:  str,
-    df_window:  pd.DataFrame,   # last 20 bars for fallback range
-    lookback:   int,
-    stop_buf:   float,          # pips
-    pip:        float,
-) -> Optional[tuple[float, float, float]]:
+def _bar_setup(
+    prev2: pd.Series, prev1: pd.Series, curr: pd.Series,
+    pullback_pips: float, stop_buf: float, pip: float, min_stop_pips: float,
+) -> Optional[tuple[str, float, float, float]]:
     """
-    Return (entry, stop, tp1) using median pullback depth, or None if setup
-    is invalid (not enough swings, stop crosses entry, etc.).
+    Consecutive 4H bar breakout setup.
+    LONG:  prev1 broke prev2 high cleanly, curr broke prev1 high cleanly.
+    SHORT: prev1 broke prev2 low cleanly,  curr broke prev1 low cleanly.
+    'Cleanly' = did NOT also take out the opposite side (no outside bar).
+    Returns (direction, entry, stop, tp1) or None.
+    Stop is placed beyond the previous bar's opposite extreme.
     """
-    highs = confirmed[confirmed["type"] == "high"]
-    lows  = confirmed[confirmed["type"] == "low"]
-    if len(highs) < 3 or len(lows) < 3:
-        return None
+    p1_took_high = prev1["High"] > prev2["High"]
+    p1_took_low  = prev1["Low"]  < prev2["Low"]
+    c_took_high  = curr["High"]  > prev1["High"]
+    c_took_low   = curr["Low"]   < prev1["Low"]
 
-    # Trend-defining swings: last 3 highs + last 3 lows
-    h3 = highs.tail(3)
-    l3 = lows.tail(3)
-    oldest_date = min(h3.iloc[0]["date"], l3.iloc[0]["date"])
-    trend_sw    = confirmed[confirmed["date"] >= oldest_date]
-
-    depths = _pullback_depths(trend_sw, direction, pip)
-    if len(depths) >= 2:
-        pb_pips = float(np.median(depths[-lookback:]))
-    else:
-        # Fallback: median candle range of last 20 bars
-        pb_pips = float(np.median((df_window["High"] - df_window["Low"]) / pip))
-
-    if direction == "long":
-        swing_h = highs.iloc[-1]["price"]
-        swing_l = lows.iloc[-1]["price"]
-        entry   = swing_h - pb_pips * pip
-        stop    = swing_l - stop_buf * pip
-        if entry <= stop:
+    # LONG
+    if p1_took_high and not p1_took_low and c_took_high and not c_took_low:
+        entry = curr["High"] - pullback_pips * pip
+        stop  = prev1["Low"] - stop_buf * pip
+        if entry <= stop or (entry - stop) / pip < min_stop_pips:
             return None
         tp1 = entry + 2.0 * (entry - stop)
-    else:
-        swing_l = lows.iloc[-1]["price"]
-        swing_h = highs.iloc[-1]["price"]
-        entry   = swing_l + pb_pips * pip
-        stop    = swing_h + stop_buf * pip
-        if entry >= stop:
+        return "long", round(entry, 5), round(stop, 5), round(tp1, 5)
+
+    # SHORT
+    if p1_took_low and not p1_took_high and c_took_low and not c_took_high:
+        entry = curr["Low"] + pullback_pips * pip
+        stop  = prev1["High"] + stop_buf * pip
+        if entry >= stop or (stop - entry) / pip < min_stop_pips:
             return None
         tp1 = entry - 2.0 * (stop - entry)
+        return "short", round(entry, 5), round(stop, 5), round(tp1, 5)
 
-    return round(entry, 5), round(stop, 5), round(tp1, 5)
+    return None
 
 
 def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: float,
-              risk_pct: float = RISK_PCT) -> float:
+              risk_pct: float = RISK_PCT, min_stop_pips: float = MIN_STOP_PIPS,
+              max_lot: float = MAX_LOT) -> float:
     risk      = balance * risk_pct
     stop_pips = abs(entry - stop) / pip
-    if stop_pips == 0:
+    if stop_pips < min_stop_pips:
         return 0.0
-    return math.floor(risk / (stop_pips * pip_value) * 100) / 100
+    lot = math.floor(risk / (stop_pips * pip_value) * 100) / 100
+    return min(lot, max_lot)
 
 
 def _close(
@@ -178,9 +142,6 @@ def _close(
 
 def run_trades(
     df:               pd.DataFrame,
-    swings:           pd.DataFrame,
-    account_balance:  float = ACCOUNT_BALANCE,
-    swing_n:          int   = SWING_N,
     pullback_lookback:int   = PULLBACK_LOOKBACK,
     stop_buffer:      float = STOP_BUFFER,
     tp_mode:          str   = TP_MODE,
@@ -188,19 +149,24 @@ def run_trades(
     pip:              float = PIP,
     pip_value:        float = PIP_VALUE,
     risk_pct:         float = RISK_PCT,
-    session_start:    int   = 7,
+    account_balance:  float = ACCOUNT_BALANCE,
+    session_start:    int   = 0,
     session_end:      int   = 20,
+    min_stop_pips:    float = MIN_STOP_PIPS,
+    max_lot:          float = MAX_LOT,
+    **_kwargs,
 ) -> list[Trade]:
     """
-    Iterate bar-by-bar and simulate limit-order entries with stop/TP/trail exits.
+    Iterate bar-by-bar and simulate consecutive-breakout entries with stop/TP/trail exits.
     Returns a list of completed Trade objects.
     """
-    trades:     list[Trade]       = []
-    open_trade: Optional[Trade]   = None
-    trade_id    = 0
+    trades:           list[Trade]          = []
+    open_trade:       Optional[Trade]      = None
+    trade_id          = 0
+    last_entry_setup: Optional[tuple]      = None  # (direction, bar_index)
 
     params = dict(
-        swing_n=swing_n, pullback_lookback=pullback_lookback,
+        pullback_lookback=pullback_lookback,
         stop_buffer=stop_buffer, tp_mode=tp_mode,
         slippage_pips=slippage_pips,
     )
@@ -215,28 +181,20 @@ def run_trades(
             long = open_trade.direction == "long"
 
             if open_trade._tp1_hit:
-                # Partial trail mode: update trailing stop, exit on close
-                conf = _confirmed_at(swings, i, swing_n)
-                if long:
-                    new_lows = conf[conf["type"] == "low"]
-                    if not new_lows.empty:
-                        latest = new_lows.iloc[-1]["price"]
-                        if open_trade._trail_stop is None or latest > open_trade._trail_stop:
-                            open_trade._trail_stop = latest
-                    ts = open_trade._trail_stop or open_trade.entry_price
-                    if c < ts:
-                        _close(open_trade, bar_date, c, "trail_exit", pip, slippage_pips)
-                        trades.append(open_trade); open_trade = None; continue
-                else:
-                    new_highs = conf[conf["type"] == "high"]
-                    if not new_highs.empty:
-                        latest = new_highs.iloc[-1]["price"]
-                        if open_trade._trail_stop is None or latest < open_trade._trail_stop:
-                            open_trade._trail_stop = latest
-                    ts = open_trade._trail_stop or open_trade.entry_price
-                    if c > ts:
-                        _close(open_trade, bar_date, c, "trail_exit", pip, slippage_pips)
-                        trades.append(open_trade); open_trade = None; continue
+                # Partial trail mode: trail stop to previous bar's low/high
+                if i >= 1:
+                    if long:
+                        recent_low = df.iloc[i - 1]["Low"]
+                        if open_trade._trail_stop is None or recent_low > open_trade._trail_stop:
+                            open_trade._trail_stop = recent_low
+                    else:
+                        recent_high = df.iloc[i - 1]["High"]
+                        if open_trade._trail_stop is None or recent_high < open_trade._trail_stop:
+                            open_trade._trail_stop = recent_high
+                ts = open_trade._trail_stop or open_trade.entry_price
+                if (long and c < ts) or (not long and c > ts):
+                    _close(open_trade, bar_date, c, "trail_exit", pip, slippage_pips)
+                    trades.append(open_trade); open_trade = None; continue
 
             else:
                 # Normal mode: stop takes priority over TP within same bar
@@ -269,29 +227,40 @@ def run_trades(
         if open_trade is not None:
             continue
 
-        regime = row.get("regime", "AMBIGUOUS")
-        if regime not in ("UPTREND", "DOWNTREND") or not _in_session(bar_date, session_start, session_end):
+        if i < 2 or not _in_session(bar_date, session_start, session_end):
             continue
 
-        direction = "long" if regime == "UPTREND" else "short"
-        conf      = _confirmed_at(swings, i, swing_n)
-        df_window = df.iloc[max(0, i - 19):i + 1]
+        prev2 = df.iloc[i - 2]
+        prev1 = df.iloc[i - 1]
 
-        setup = _compute_setup(conf, direction, df_window, pullback_lookback, stop_buffer, pip)
-        if setup is None:
+        # Median bar range over last pullback_lookback bars = expected pullback depth
+        pb_start  = max(0, i - pullback_lookback)
+        pb_pips   = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
+                                      for j in range(pb_start, i)]))
+
+        result = _bar_setup(prev2, prev1, row, pb_pips, stop_buffer, pip, min_stop_pips)
+        if result is None:
             continue
 
-        entry, stop, tp1 = setup
-        lot = _lot_size(account_balance, entry, stop, pip, pip_value, risk_pct)
+        direction, entry, stop, tp1 = result
+
+        # Guard: don't re-enter on the same signal bar
+        setup_key = (direction, i - 1)
+        if setup_key == last_entry_setup:
+            continue
+
+        lot = _lot_size(account_balance, entry, stop, pip, pip_value, risk_pct,
+                        min_stop_pips=min_stop_pips, max_lot=max_lot)
         if lot <= 0:
             continue
 
-        # Limit order fills when bar reaches entry price
+        # Limit order fills when the signal bar pulls back to entry
         filled = (direction == "long" and l <= entry) or \
                  (direction == "short" and h >= entry)
         if not filled:
             continue
 
+        last_entry_setup = setup_key
         trade_id += 1
         open_trade = Trade(
             trade_id        = trade_id,
@@ -301,8 +270,8 @@ def run_trades(
             stop_price      = stop,
             tp1_price       = tp1,
             lot_size        = lot,
-            regime          = regime,
-            trend_strength  = row.get("trend_strength_score"),
+            regime          = direction.upper() + "_SETUP",
+            trend_strength  = None,
             params          = params.copy(),
         )
 
@@ -444,19 +413,10 @@ if __name__ == "__main__":
     print("Fetching data...")
     df = get_data()
 
-    print("Detecting swings...")
-    swings = build_swings(df, swing_n=SWING_N, min_swing_size=MIN_SWING_SIZE,
-                          min_swing_increment=MIN_SWING_INCREMENT, pip=PIP)
-
-    print("Classifying regimes...")
-    df = classify_trend(df, swings, swing_n=SWING_N, min_swing_increment=MIN_SWING_INCREMENT,
-                        min_trend_size=MIN_TREND_SIZE, trend_range_ratio=TREND_RANGE_RATIO, pip=PIP)
-
     print("Running trade simulation...")
     trades = run_trades(
-        df, swings,
+        df,
         account_balance   = ACCOUNT_BALANCE,
-        swing_n           = SWING_N,
         pullback_lookback = PULLBACK_LOOKBACK,
         stop_buffer       = STOP_BUFFER,
         tp_mode           = TP_MODE,

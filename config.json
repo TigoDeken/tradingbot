@@ -1,17 +1,13 @@
 {
   "symbol": "EURUSD",
   "timeframe": "H4",
-  "session_start_utc": 7,
+  "session_start_utc": 0,
   "session_end_utc": 20,
   "risk_per_trade": 0.005,
   "tp_mode": "full",
-  "swing_n": 2,
-  "min_swing_size": 20,
-  "min_swing_increment": 10,
-  "min_trend_size": 50,
-  "trend_range_ratio": 0.40,
   "pullback_lookback": 4,
   "stop_buffer": 5,
   "paper_mode": true,
-  "max_drawdown_pct": 5.0
+  "max_drawdown_pct": 5.0,
+  "min_stop_pips": 20.0
 }

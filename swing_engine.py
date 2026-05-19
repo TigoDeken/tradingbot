@@ -6,9 +6,9 @@ import matplotlib.dates as mdates
 from data_pipeline import get_data
 
 # Parameters — all configurable, nothing hardcoded
-SWING_N = 2
+SWING_N = 1
 MIN_SWING_SIZE = 20       # pips — minimum candle range to qualify
-MIN_SWING_INCREMENT = 10  # pips — minimum move between consecutive same-type swings
+MIN_SWING_INCREMENT = 5   # pips — minimum move between consecutive same-type swings
 from constants import PIP  # re-exported so other modules can still do: from swing_engine import PIP
 
 

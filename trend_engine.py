@@ -8,8 +8,7 @@ from constants import PIP
 from swing_engine import build_swings, SWING_N, MIN_SWING_SIZE, MIN_SWING_INCREMENT
 
 # Parameters — all configurable
-MIN_TREND_SIZE   = 50    # pips — minimum total trend size to qualify
-TREND_RANGE_RATIO = 0.40  # trend size must be this fraction of last-20-bar range
+MIN_TREND_SIZE   = 25    # pips — minimum total trend size to qualify
 
 
 def classify_trend(
@@ -18,8 +17,8 @@ def classify_trend(
     swing_n: int = SWING_N,
     min_swing_increment: float = MIN_SWING_INCREMENT,
     min_trend_size: float = MIN_TREND_SIZE,
-    trend_range_ratio: float = TREND_RANGE_RATIO,
     pip: float = PIP,
+    **_kwargs,
 ) -> pd.DataFrame:
     """
     Adds three columns to df and returns it:
@@ -31,9 +30,6 @@ def classify_trend(
     never look ahead.
     """
     df = df.copy()
-
-    # Precompute rolling 20-bar high-low range (vectorised)
-    roll_range = (df["High"].rolling(20).max() - df["Low"].rolling(20).min()).values
 
     # Convert swings to numpy arrays for fast access
     sw = swings.sort_values("bar").reset_index(drop=True)
@@ -66,16 +62,12 @@ def classify_trend(
         if len(h) < 3 or len(l) < 3:
             continue
 
-        rng = roll_range[i]
-        if rng <= 0:
-            continue
-
         if last_type == "high":
             # --- Uptrend ---
             if (h[1] - h[0] >= min_incr and h[2] - h[1] >= min_incr and
                     l[1] - l[0] >= min_incr and l[2] - l[1] >= min_incr):
                 trend_size = h[2] - l[0]   # most recent high − oldest low
-                if trend_size >= min_size and trend_size / rng >= trend_range_ratio:
+                if trend_size >= min_size:
                     diffs = np.abs(np.concatenate([np.diff(h), np.diff(l)])) / pip
                     strengths[i] = float(diffs.mean())
                     regimes[i] = "UPTREND"
@@ -85,7 +77,7 @@ def classify_trend(
             if (h[0] - h[1] >= min_incr and h[1] - h[2] >= min_incr and
                     l[0] - l[1] >= min_incr and l[1] - l[2] >= min_incr):
                 trend_size = h[0] - l[2]   # oldest high − most recent low
-                if trend_size >= min_size and trend_size / rng >= trend_range_ratio:
+                if trend_size >= min_size:
                     diffs = np.abs(np.concatenate([np.diff(h), np.diff(l)])) / pip
                     strengths[i] = float(diffs.mean())
                     regimes[i] = "DOWNTREND"
@@ -156,7 +148,7 @@ def plot_regimes(df: pd.DataFrame) -> None:
     ax.legend(handles=patches, loc="upper left")
     ax.set_title(
         f"EURUSD 4H — Trend Classification  |  "
-        f"MIN_TREND_SIZE={MIN_TREND_SIZE}pip  TREND_RANGE_RATIO={TREND_RANGE_RATIO}"
+        f"MIN_TREND_SIZE={MIN_TREND_SIZE}pip"
     )
     ax.set_xlabel("Date")
     ax.set_ylabel("Price")
@@ -179,7 +171,7 @@ if __name__ == "__main__":
 
     print("Classifying trend regimes...")
     df = classify_trend(df, swings, swing_n=SWING_N, min_swing_increment=MIN_SWING_INCREMENT,
-                        min_trend_size=MIN_TREND_SIZE, trend_range_ratio=TREND_RANGE_RATIO, pip=PIP)
+                        min_trend_size=MIN_TREND_SIZE, pip=PIP)
 
     validate_trend(df)
     plot_regimes(df)

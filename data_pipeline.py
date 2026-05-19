@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 SYMBOL = "EURUSD"
 TIMEFRAME = mt5.TIMEFRAME_H4
-NUM_BARS = 5000
+NUM_BARS = 9999
 
 
 def connect() -> bool:
