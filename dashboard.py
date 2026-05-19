@@ -18,13 +18,13 @@ import plotly.express as px
 st.set_page_config(page_title="EURUSD Algo Trader", page_icon="📈", layout="wide")
 
 # ── Optional pipeline imports ─────────────────────────────────────────────────
+from constants import PIP
+
 PIPELINE_OK = False
 _import_err  = ""
 try:
-    from data_pipeline  import get_data
-    from swing_engine   import build_swings, PIP
-    from trend_engine   import classify_trend
-    from trade_engine   import run_trades, _bar_setup
+    from data_pipeline   import get_data
+    from trade_engine    import run_trades, _bar_setup
     from backtest_engine import build_equity, compute_metrics, _split_date
     PIPELINE_OK = True
 except Exception as e:
@@ -51,9 +51,9 @@ EQUITY_CSV = Path("equity_curve.csv")
 STATE_JSON = Path("state.json")
 LOG_FILE   = Path("trading_log.txt")
 
-PARAM_COLS = [
-    "PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE",
-]
+PARAM_COLS = ["PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE", "CLOSE_STRENGTH"]
+
+RESULTS_DIR = Path("results")
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -237,10 +237,11 @@ def _metric_row(m: dict, prefix: str = "") -> None:
 
 # Parameter grid exactly as defined in backtest_engine.py
 _BT_PARAM_DEFS = [
-    # (csv_col,            state_key,         options,             cast)
-    ("PULLBACK_LOOKBACK",  "bt_pb_lb",        [3, 4, 5],           int),
-    ("STOP_BUFFER",        "bt_sb",           [3, 5, 8],           int),
-    ("TP_MODE",            "bt_tp",           ["full", "partial"], str),
+    # (csv_col,            state_key,  options,                        cast)
+    ("PULLBACK_LOOKBACK",  "bt_pb_lb", [3, 4, 5],                     int),
+    ("STOP_BUFFER",        "bt_sb",    [3, 5, 8, 10],                  int),
+    ("TP_MODE",            "bt_tp",    ["full", "partial", "trail"],   str),
+    ("CLOSE_STRENGTH",     "bt_cs",    [0.0, 0.5, 0.6, 0.7],          float),
 ]
 
 
@@ -270,20 +271,128 @@ def _bt_lookup(opt_df: pd.DataFrame) -> pd.DataFrame:
     return opt_df[mask]
 
 
+def _list_runs() -> list[Path]:
+    if not RESULTS_DIR.exists():
+        return []
+    return sorted(
+        [d for d in RESULTS_DIR.iterdir() if d.is_dir() and (d / "summary.json").exists()],
+        reverse=True,
+    )
+
+
 def page_backtest() -> None:
     st.title("📊 Backtest Results")
 
-    opt_df   = load_opt()
-    trade_df = load_trades()
-    eq_df    = load_equity()
-
-    if opt_df is None:
-        st.error("Missing `optimisation_results.csv`. Run `python backtest_engine.py` first.")
+    # ── Run selector ──────────────────────────────────────────────────────────
+    runs = _list_runs()
+    if not runs:
+        st.error("No backtest runs found in `results/`. Run `python backtest_engine.py` first.")
         return
+
+    selected_run = st.selectbox(
+        "Select backtest run",
+        options=runs,
+        format_func=lambda p: p.name,
+    )
+
+    with open(selected_run / "summary.json") as f:
+        run_summary = json.load(f)
+
+    is_m_run  = run_summary.get("is",  {})
+    oos_m_run = run_summary.get("oos", {})
+
+    # ── Summary metrics from selected run ─────────────────────────────────────
+    compare = [
+        ("total_trades",     "Total Trades",   ""),
+        ("win_rate_pct",     "Win Rate",        "%"),
+        ("expectancy_net_r", "Expectancy",      " R"),
+        ("net_ev",           "Net EV",          " R"),
+        ("net_r",            "Total Net R",     " R"),
+        ("max_drawdown_pct", "Max Drawdown",    "%"),
+        ("trades_per_month", "Trades / Month",  ""),
+    ]
+
+    col_is, col_oos = st.columns(2)
+    with col_is:
+        st.markdown("**In-Sample (first 70%)**")
+        for key, label, unit in compare:
+            v = is_m_run.get(key)
+            st.metric(label, f"{v}{unit}" if v is not None else "—")
+        ev = is_m_run.get("net_ev")
+        if ev is not None:
+            if float(ev) >= 0:
+                st.success(f"Net EV: **+{ev:.4f} R/trade**")
+            else:
+                st.error(f"Net EV: **{ev:.4f} R/trade**")
+    with col_oos:
+        st.markdown("**Out-of-Sample (last 30%)**")
+        for key, label, unit in compare:
+            iv = is_m_run.get(key)
+            ov = oos_m_run.get(key)
+            delta = None
+            if iv is not None and ov is not None:
+                try:
+                    delta = round(float(ov) - float(iv), 3)
+                except Exception:
+                    pass
+            st.metric(label, f"{ov}{unit}" if ov is not None else "—", delta=delta)
+        ev = oos_m_run.get("net_ev")
+        if ev is not None:
+            if float(ev) >= 0:
+                st.success(f"Net EV: **+{ev:.4f} R/trade**")
+            else:
+                st.error(f"Net EV: **{ev:.4f} R/trade**")
+
+    st.divider()
+
+    # ── Equity curve ──────────────────────────────────────────────────────────
+    eq_path = selected_run / "equity_curve.csv"
+    if eq_path.exists():
+        eq_df = pd.read_csv(eq_path)
+        split_n = int(is_m_run.get("total_trades", 0)) or None
+        st.subheader("Equity Curve")
+        st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
+
+    # ── Trade log ─────────────────────────────────────────────────────────────
+    trade_path = selected_run / "trade_log.csv"
+    if trade_path.exists():
+        trade_df = pd.read_csv(trade_path)
+        for c in ("entry_date", "exit_date"):
+            if c in trade_df.columns:
+                trade_df[c] = pd.to_datetime(trade_df[c])
+        show_cols = [c for c in [
+            "trade_id", "direction", "entry_date", "entry_price",
+            "exit_date", "exit_price", "exit_reason",
+            "net_pips", "net_r", "duration_hours",
+        ] if c in trade_df.columns]
+        show = trade_df[show_cols].copy()
+        if "net_pips" in show.columns:
+            show["net_pips"] = show["net_pips"].round(0).astype("Int64")
+        st.subheader("Trade Log")
+        st.dataframe(show, use_container_width=True, height=360)
+        st.download_button(
+            "⬇  Download trade log",
+            data=trade_df.to_csv(index=False).encode(),
+            file_name=f"trade_log_{selected_run.name}.csv",
+            mime="text/csv",
+        )
+
+    # ── Parameter optimisation explorer (optional) ────────────────────────────
+    opt_df = load_opt()
+    if opt_df is None:
+        st.info("No `optimisation_results.csv` — run `python backtest_engine.py --optimize` to see the parameter explorer.")
+        return
+
+    # Check this CSV has current-strategy columns
+    if "CLOSE_STRENGTH" not in opt_df.columns:
+        st.info("Optimisation results are from an older strategy run and are not shown.")
+        return
+
+    st.divider()
+    st.subheader("Parameter Optimisation Explorer")
 
     _bt_init_state()
 
-    # ── Sidebar: parameter selection ──────────────────────────────────────────
     with st.sidebar:
         st.subheader("Parameter selection")
         for col, sk, opts, cast in _BT_PARAM_DEFS:
@@ -314,124 +423,40 @@ def page_backtest() -> None:
             _bt_set_combo(opt_df.loc[_t_col.idxmax()])
             st.rerun()
 
-    # ── Resolve current selection ─────────────────────────────────────────────
     matches = _bt_lookup(opt_df)
 
     if matches.empty:
         st.warning(
-            "⚠️ **This combination was not tested.**  "
-            "The optimisation grid does not include every permutation. "
-            "Adjust the controls in the sidebar or use one of the **Best combinations** buttons."
+            "This combination was not tested. Adjust the controls in the sidebar "
+            "or use one of the **Best combinations** buttons."
         )
         return
 
-    sel       = matches.iloc[0]
-    sel_rank  = int(sel.name) + 1   # opt_df is reset_index(drop=True) after sort
-    total     = len(opt_df)
-    oos_exp   = float(sel.get("OOS_expectancy_net_r", float("nan")))
-    is_exp    = float(sel.get("IS_expectancy_net_r",  float("nan")))
+    sel      = matches.iloc[0]
+    sel_rank = int(sel.name) + 1
+    total    = len(opt_df)
+    oos_exp  = float(sel.get("OOS_expectancy_net_r", float("nan")))
+    is_exp   = float(sel.get("IS_expectancy_net_r",  float("nan")))
+
+    st.info(
+        f"**Rank {sel_rank} of {total}** combinations  ·  "
+        f"OOS exp: {oos_exp:.4f} R  ·  IS exp: {is_exp:.4f} R"
+    )
 
     is_m  = {k[3:]: sel[k] for k in opt_df.columns if k.startswith("IS_")}
     oos_m = {k[4:]: sel[k] for k in opt_df.columns if k.startswith("OOS_")}
 
-    # ── Rank banner ───────────────────────────────────────────────────────────
-    st.info(
-        f"**Rank {sel_rank} of {total}** combinations tested (sorted by OOS expectancy)  ·  "
-        f"OOS exp: {oos_exp:.4f} R  ·  IS exp: {is_exp:.4f} R"
-    )
-
-    # ── Metric rows ───────────────────────────────────────────────────────────
-    st.subheader("In-Sample  (first 70% by date)")
+    st.subheader("In-Sample")
     _metric_row(is_m)
     _ev_col1, _ev_col2, *_ = st.columns(6)
     _ev_col1.metric("Gross EV", f"{is_m['gross_ev']:.4f} R" if "gross_ev" in is_m else "—")
     _ev_col2.metric("Net EV",   f"{is_m['net_ev']:.4f} R"   if "net_ev"   in is_m else "—")
 
-    st.subheader("Out-of-Sample  (last 30% by date)")
+    st.subheader("Out-of-Sample")
     _metric_row(oos_m)
     _ev_col3, _ev_col4, *_ = st.columns(6)
     _ev_col3.metric("Gross EV", f"{oos_m['gross_ev']:.4f} R" if "gross_ev" in oos_m else "—")
     _ev_col4.metric("Net EV",   f"{oos_m['net_ev']:.4f} R"   if "net_ev"   in oos_m else "—")
-
-    # ── IS vs OOS side by side with delta ─────────────────────────────────────
-    st.subheader("Comparison")
-    compare = [
-        ("total_trades",     "Total Trades",      ""),
-        ("win_rate_pct",     "Win Rate",          "%"),
-        ("expectancy_net_r", "Expectancy",        " R"),
-        ("gross_ev",         "Gross EV",          " R"),
-        ("net_ev",           "Net EV",            " R"),
-        ("net_r",            "Total Net R",       " R"),
-        ("max_drawdown_pct", "Max Drawdown",      "%"),
-        ("trades_per_month", "Trades / Month",    ""),
-    ]
-    col_is, col_oos = st.columns(2)
-    with col_is:
-        st.markdown("**In-Sample**")
-        for key, label, unit in compare:
-            v = is_m.get(key)
-            st.metric(label, f"{v}{unit}" if v is not None else "—")
-    with col_oos:
-        st.markdown("**Out-of-Sample**")
-        for key, label, unit in compare:
-            iv  = is_m.get(key)
-            ov  = oos_m.get(key)
-            delta = None
-            if iv is not None and ov is not None:
-                try:
-                    delta = round(float(ov) - float(iv), 3)
-                except Exception:
-                    pass
-            st.metric(label, f"{ov}{unit}" if ov is not None else "—", delta=delta)
-
-    # Net EV color callout
-    ev_is_n  = is_m.get("net_ev")
-    ev_oos_n = oos_m.get("net_ev")
-    if ev_is_n is not None or ev_oos_n is not None:
-        st.markdown("**Net EV summary**")
-        _nev1, _nev2 = st.columns(2)
-        with _nev1:
-            if ev_is_n is not None:
-                if float(ev_is_n) >= 0:
-                    st.success(f"IS Net EV: **+{ev_is_n:.4f} R/trade** ✅")
-                else:
-                    st.error(f"IS Net EV: **{ev_is_n:.4f} R/trade** ❌")
-        with _nev2:
-            if ev_oos_n is not None:
-                if float(ev_oos_n) >= 0:
-                    st.success(f"OOS Net EV: **+{ev_oos_n:.4f} R/trade** ✅")
-                else:
-                    st.error(f"OOS Net EV: **{ev_oos_n:.4f} R/trade** ❌")
-
-    # ── Equity curve ──────────────────────────────────────────────────────────
-    st.subheader("Equity Curve  (default-parameter run)")
-    if eq_df is not None:
-        split_n = int(is_m.get("total_trades", 0)) or None
-        st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
-    else:
-        st.info("No `equity_curve.csv` found. Run `python backtest_engine.py` first.")
-
-    # ── Trade log ─────────────────────────────────────────────────────────────
-    st.subheader("Trade Log  (default-parameter run)")
-    if trade_df is not None:
-        show_cols = [c for c in [
-            "trade_id", "direction", "entry_date", "entry_price",
-            "exit_date", "exit_price", "exit_reason",
-            "net_pips", "net_r", "duration_hours",
-        ] if c in trade_df.columns]
-        show = trade_df[show_cols].copy()
-        if "net_pips" in show.columns:
-            show["net_pips"] = show["net_pips"].round(0).astype("Int64")
-        st.dataframe(show, use_container_width=True, height=360)
-
-        st.download_button(
-            "⬇  Download trade log",
-            data=trade_df.to_csv(index=False).encode(),
-            file_name="trade_log.csv",
-            mime="text/csv",
-        )
-    else:
-        st.info("No `trade_log.csv` found. Run `python backtest_engine.py` first.")
 
 
 # ── Parameter Studio ─────────────────────────────────────────────────────────
