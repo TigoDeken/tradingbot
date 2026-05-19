@@ -531,8 +531,8 @@ if __name__ == "__main__":
                       title=f"EURUSD 4H — Equity Curve ({run_id})",
                       path=str(out_dir / "equity_curve.png"),
                       split_trade=split_trade_n)
-    recent_path = str(out_dir / "recent_trades.png")
-    plot_recent_trades(df_raw, all_trades, path=recent_path, days=30)
+    recent_path = str(out_dir / "chart_trades.png")
+    plot_recent_trades(df_raw, all_trades, path=recent_path, days=7)
     import os; os.startfile(recent_path)
     export_trades_csv(all_trades, path=str(out_dir / "trade_log.csv"))
     export_equity_csv(eq_all,     path=str(out_dir / "equity_curve.csv"))
