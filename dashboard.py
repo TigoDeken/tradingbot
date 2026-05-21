@@ -402,187 +402,155 @@ def page_backtest() -> None:
 
 # ── Parameter Studio ─────────────────────────────────────────────────────────
 
-def page_parameter_studio() -> None:
-    st.title("⚙️ Parameter Studio")
-
-    if not PIPELINE_OK:
-        st.error(f"Pipeline import failed: {_import_err}")
-        return
+def page_bot_settings() -> None:
+    st.title("⚙️ Bot Settings")
+    st.caption("Saved to config.json — restart bot to apply.")
 
     cfg = _load_config_fresh() or {}
 
     def _i(key, default): return int(cfg.get(key, default))
     def _f(key, default): return float(cfg.get(key, default))
 
-    # ── Main area: four sections ──────────────────────────────────────────────
-    st.markdown("Fill in your parameters below, then click **▶ Run Backtest**.")
+    def _val_changed(key, new_v):
+        old_v = cfg.get(key)
+        if old_v is None:
+            return True
+        if isinstance(new_v, str):
+            return str(old_v) != new_v
+        try:
+            return abs(float(old_v) - float(new_v)) > 1e-9
+        except Exception:
+            return old_v != new_v
 
-    # ── 1. Market Conditions ──────────────────────────────────────────────────
-    with st.expander("📊 Market Conditions", expanded=True):
-        st.caption("Controls the session window and data range.")
-        mc1, mc2 = st.columns(2)
-        with mc1:
-            bars          = mc1.number_input("Bars to fetch",             min_value=100, max_value=50000, value=9999, step=100, help="Number of 4H candles to pull from MT5.")
-            session_start = mc1.number_input("Session start (UTC hour)",  min_value=0,   max_value=23,    value=_i("session_start_utc", 0), step=1, help="Only take trades at or after this UTC hour.")
-        with mc2:
-            split_pct   = mc2.number_input("In-sample split %",          min_value=10,  max_value=90,    value=70, step=5, help="Percentage of data used for in-sample testing.")
-            session_end = mc2.number_input("Session end (UTC hour)",      min_value=1,   max_value=24,    value=_i("session_end_utc", 20), step=1, help="Stop taking new trades after this UTC hour.")
+    # ── 1. Trading Session ────────────────────────────────────────────────────
+    with st.expander("🕐 Trading Session", expanded=True):
+        s1, s2 = st.columns(2)
+        with s1:
+            session_start = st.number_input(
+                "Session start (UTC hour)", min_value=0, max_value=23,
+                value=_i("session_start_utc", 7), step=1,
+                help="Only take new trades at or after this UTC hour."
+            )
+            st.caption(f"currently: {_i('session_start_utc', 7)}")
+        with s2:
+            session_end = st.number_input(
+                "Session end (UTC hour)", min_value=1, max_value=24,
+                value=_i("session_end_utc", 20), step=1,
+                help="Stop taking new trades after this UTC hour."
+            )
+            st.caption(f"currently: {_i('session_end_utc', 20)}")
 
-    # ── 2. Entry ──────────────────────────────────────────────────────────────
-    with st.expander("🎯 Entry", expanded=True):
-        st.caption("Controls when and how a limit order is placed.")
-        en1, en2 = st.columns(2)
-        with en1:
-            pullback_lookback = en1.number_input("Pullback lookback",       min_value=1,    max_value=20,    value=_i("pullback_lookback", 4),    step=1,    help="Number of recent pullbacks used to calculate the median entry offset.")
-            close_strength    = en1.number_input("Close strength (0=off)",  min_value=0.0,  max_value=0.9,   value=_f("close_strength", 0.0),     step=0.05, format="%.2f", help="Signal bar must close in the top/bottom X of its range. 0=off, 0.6=top 40% for longs.")
-        with en2:
-            stop_buffer       = en2.number_input("Stop buffer (pips)",      min_value=0,    max_value=50,    value=_i("stop_buffer", 5),          step=1,    help="Extra pips added beyond the swing low/high for the stop loss.")
+    # ── 2. Entry & Stop ───────────────────────────────────────────────────────
+    with st.expander("🎯 Entry & Stop", expanded=True):
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            pullback_lookback = st.number_input(
+                "Entry offset lookback (bars)", min_value=1, max_value=20,
+                value=_i("pullback_lookback", 4), step=1,
+                help="Bars used to calculate the median pullback distance for the limit entry."
+            )
+            st.caption(f"currently: {_i('pullback_lookback', 4)}")
+        with e2:
+            stop_buffer = st.number_input(
+                "Stop beyond swing (pips)", min_value=0, max_value=50,
+                value=_i("stop_buffer", 5), step=1,
+                help="Extra pips added beyond the swing low/high for the stop loss."
+            )
+            st.caption(f"currently: {_i('stop_buffer', 5)}")
+        with e3:
+            close_strength = st.number_input(
+                "Signal bar close quality (0 = off)", min_value=0.0, max_value=0.9,
+                value=_f("close_strength", 0.6), step=0.05, format="%.2f",
+                help="Signal bar must close in the top/bottom fraction of its range. 0 = disabled."
+            )
+            st.caption(f"currently: {_f('close_strength', 0.6):.2f}")
 
-    # ── 3. Exit ───────────────────────────────────────────────────────────────
-    with st.expander("🚪 Exit", expanded=True):
-        st.caption("Controls how trades are closed.")
-        ex1, ex2 = st.columns(2)
-        with ex1:
-            tp_mode = ex1.selectbox("TP mode", ["full", "partial", "trail"],
-                                     index=0 if cfg.get("tp_mode", "full") == "full" else 1,
-                                     help="full = close entire position at TP1. partial = close half at TP1, trail the rest.")
-        with ex2:
-            st.markdown("")  # spacer
+        tp_opts = ["full", "partial", "trail"]
+        tp_val  = cfg.get("tp_mode", "full")
+        tp_idx  = tp_opts.index(tp_val) if tp_val in tp_opts else 0
+        tp_mode = st.selectbox(
+            "Take profit mode", tp_opts, index=tp_idx,
+            help="full = close entire position at TP1.  partial = half at TP1, trail the rest."
+        )
+        st.caption(f"currently: {cfg.get('tp_mode', 'full')}")
 
-    # ── 4. Risk Management ────────────────────────────────────────────────────
-    with st.expander("🛡️ Risk Management", expanded=True):
-        st.caption("Controls position sizing and capital protection.")
-        rm1, rm2 = st.columns(2)
-        with rm1:
-            risk_pct_pct    = rm1.number_input("Risk per trade %",          min_value=0.01, max_value=10.0,  value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f", help="Percentage of account balance risked per trade.")
-            min_stop_pips   = rm1.number_input("Min stop distance (pips)",  min_value=1,    max_value=100,   value=5,                              step=1,    help="Setups with a stop smaller than this are skipped (prevents oversizing).")
-            max_drawdown_pct= rm1.number_input("Max drawdown % (circuit breaker)", min_value=1.0, max_value=50.0, value=_f("max_drawdown_pct", 5.0), step=0.5, help="Live trader halts if session drawdown hits this level.")
-            max_open_lots        = rm1.number_input("Max open lots (pyramid cap)",    min_value=0.0,  max_value=100.0, value=_f("max_open_lots", 0.0),           step=0.01, format="%.2f", help="0 = pyramiding disabled. Set to e.g. 0.4 to allow adds up to that total lot exposure.")
-            pyramid_min_profit_r = rm1.number_input("Min profit before add (R)",     min_value=0.0,  max_value=5.0,   value=_f("pyramid_min_profit_r", 0.5),    step=0.1,  format="%.1f", help="Original trade must be this many R in profit before a pyramid add is allowed. 0 = disabled.")
-        with rm2:
-            initial_balance = rm2.number_input("Initial balance ($)",       min_value=100,  max_value=10000000, value=10000,                       step=500,  help="Starting capital for the backtest equity simulation.")
-            max_lot         = rm2.number_input("Max lot size",              min_value=0.01, max_value=100.0, value=10.0,                           step=0.5,  format="%.2f", help="Hard cap on position size regardless of the risk formula result.")
-            min_pyramid_bars= rm2.number_input("Min bars between adds",     min_value=1,    max_value=20,    value=_i("min_pyramid_bars", 4),       step=1,    help="Minimum 4H bars that must pass before a pyramid add is allowed.")
+    # ── 3. Risk ───────────────────────────────────────────────────────────────
+    with st.expander("🛡️ Risk", expanded=True):
+        r1, r2 = st.columns(2)
+        with r1:
+            risk_pct_pct = st.number_input(
+                "Risk per trade (%)", min_value=0.01, max_value=10.0,
+                value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f",
+                help="Percentage of account balance risked per trade."
+            )
+            st.caption(f"currently: {_f('risk_per_trade', 0.005) * 100:.2f}%")
+        with r2:
+            max_drawdown_pct = st.number_input(
+                "Max drawdown — circuit breaker (%)", min_value=1.0, max_value=50.0,
+                value=_f("max_drawdown_pct", 5.0), step=0.5,
+                help="Bot halts all trading for the session if session drawdown hits this level."
+            )
+            st.caption(f"currently: {_f('max_drawdown_pct', 5.0):.1f}%")
         risk_pct = risk_pct_pct / 100
-        split_ratio = split_pct / 100
+
+    # ── 4. Pyramiding ─────────────────────────────────────────────────────────
+    with st.expander("📈 Pyramiding", expanded=True):
+        max_open_lots = st.number_input(
+            "Max open lots (0 = pyramiding off)", min_value=0.0, max_value=100.0,
+            value=_f("max_open_lots", 0.0), step=0.01, format="%.2f",
+            help="Total lot cap across all adds. 0 disables pyramiding entirely."
+        )
+        st.caption(f"currently: {_f('max_open_lots', 0.0):.2f}")
+
+        pyramid_on = max_open_lots > 0.0
+        if pyramid_on:
+            p1, p2 = st.columns(2)
+            with p1:
+                min_pyramid_bars = st.number_input(
+                    "Min bars between adds", min_value=1, max_value=20,
+                    value=_i("min_pyramid_bars", 4), step=1,
+                    help="Minimum 4H bars that must pass before adding to a position."
+                )
+                st.caption(f"currently: {_i('min_pyramid_bars', 4)}")
+            with p2:
+                pyramid_min_profit_r = st.number_input(
+                    "Min profit before adding (R)", min_value=0.0, max_value=5.0,
+                    value=_f("pyramid_min_profit_r", 0.5), step=0.1, format="%.1f",
+                    help="Original trade must be this many R in profit before an add is allowed."
+                )
+                st.caption(f"currently: {_f('pyramid_min_profit_r', 0.5):.1f}")
+        else:
+            st.caption("Set max open lots > 0 to enable pyramiding settings.")
+            min_pyramid_bars     = _i("min_pyramid_bars", 4)
+            pyramid_min_profit_r = _f("pyramid_min_profit_r", 0.5)
+
+    # ── Unsaved changes detection + save ─────────────────────────────────────
+    new_vals = {
+        "session_start_utc":    int(session_start),
+        "session_end_utc":      int(session_end),
+        "risk_per_trade":       round(risk_pct, 4),
+        "tp_mode":              tp_mode,
+        "pullback_lookback":    int(pullback_lookback),
+        "stop_buffer":          int(stop_buffer),
+        "close_strength":       round(float(close_strength), 2),
+        "max_drawdown_pct":     float(max_drawdown_pct),
+        "max_open_lots":        float(max_open_lots),
+        "min_pyramid_bars":     int(min_pyramid_bars),
+        "pyramid_min_profit_r": float(pyramid_min_profit_r),
+    }
+
+    changed_keys = [k for k, v in new_vals.items() if _val_changed(k, v)]
+    has_changes  = bool(changed_keys)
 
     st.divider()
-    col_run, col_save, _ = st.columns([1, 1, 3])
-    run_btn  = col_run.button("▶  Run Backtest",      type="primary", use_container_width=True)
-    save_btn = col_save.button("💾  Save as config.json",             use_container_width=True)
+    if has_changes:
+        st.warning(f"Unsaved changes: {', '.join(changed_keys)}")
 
-    # ── Save config ───────────────────────────────────────────────────────────
-    if save_btn:
-        new_cfg = {
-            "symbols":           active_symbols,
-            "timeframe":         "H4",
-            "session_start_utc": int(session_start),
-            "session_end_utc":   int(session_end),
-            "risk_per_trade":    round(risk_pct, 4),
-            "tp_mode":           tp_mode,
-            "pullback_lookback": int(pullback_lookback),
-            "stop_buffer":       int(stop_buffer),
-            "paper_mode":        cfg.get("paper_mode", True),
-            "max_drawdown_pct":  float(max_drawdown_pct),
-            "max_open_lots":        float(max_open_lots),
-            "min_pyramid_bars":     int(min_pyramid_bars),
-            "pyramid_min_profit_r": float(pyramid_min_profit_r),
-            "close_strength":       float(close_strength),
-        }
-        Path("config.json").write_text(json.dumps(new_cfg, indent=2))
-        st.success("✅ Saved to config.json — live_trader.py will use these on next restart.")
-
-    if not run_btn:
-        if cfg:
-            st.subheader("Current config.json")
-            st.json(cfg)
-        return
-
-    # ── Run pipeline ──────────────────────────────────────────────────────────
-    prog = st.progress(0, "Fetching data from MT5...")
-    try:
-        df_raw = get_data(bars=bars)
-    except Exception as e:
-        st.error(f"MT5 fetch failed: {e}")
-        return
-
-    prog.progress(40, "Simulating trades...")
-    all_trades = run_trades(
-        df_raw,
-        account_balance=initial_balance,
-        pullback_lookback=pullback_lookback, stop_buffer=stop_buffer,
-        tp_mode=tp_mode, risk_pct=risk_pct,
-        session_start=session_start, session_end=session_end,
-        min_stop_pips=min_stop_pips, max_lot=max_lot,
-        max_open_lots=float(max_open_lots), min_pyramid_bars=int(min_pyramid_bars),
-        pyramid_min_profit_r=float(pyramid_min_profit_r),
-        close_strength=float(close_strength),
-    )
-
-    prog.progress(80, "Computing metrics...")
-    split_dt = df_raw.index[0] + (df_raw.index[-1] - df_raw.index[0]) * split_ratio
-    is_t     = [t for t in all_trades if t.entry_date <  split_dt]
-    oos_t    = [t for t in all_trades if t.entry_date >= split_dt]
-
-    all_m = compute_metrics(all_trades, initial=initial_balance)
-    is_m  = compute_metrics(is_t,       initial=initial_balance)
-    oos_m = compute_metrics(oos_t,      initial=initial_balance)
-    prog.progress(100, "Done.")
-
-    # ── Results ───────────────────────────────────────────────────────────────
-    oos_ev = oos_m.get("net_ev", 0) or 0
-    if oos_ev >= 0:
-        st.success(f"✅  {len(all_trades)} trades  |  OOS net EV: +{oos_ev:.4f} R/trade")
-    else:
-        st.error(f"❌  {len(all_trades)} trades  |  OOS net EV: {oos_ev:.4f} R/trade")
-
-    # Metrics columns
-    def _mcol(col, label, m):
-        with col:
-            st.markdown(f"**{label}**")
-            st.metric("Trades",     m.get("total_trades", "—"))
-            st.metric("Win Rate",   f"{m.get('win_rate_pct', 0):.1f}%")
-            st.metric("Expectancy", f"{m.get('expectancy_net_r', 0):.4f} R")
-            st.metric("Net EV",     f"{m.get('net_ev', 0):.4f} R")
-            st.metric("Max DD",     f"{m.get('max_drawdown_pct', 0):.1f}%")
-            st.metric("Avg Win",    f"{m.get('avg_win_r', 0):.2f} R")
-            st.metric("Avg Loss",   f"{m.get('avg_loss_r', 0):.2f} R")
-            st.metric("T/month",    f"{m.get('trades_per_month', 0):.1f}")
-
-    c1, c2, c3 = st.columns(3)
-    _mcol(c1, "Full Dataset",                all_m)
-    _mcol(c2, f"In-Sample ({split_pct}%)",   is_m)
-    _mcol(c3, f"Out-of-Sample ({100-split_pct}%)", oos_m)
-
-    # Equity curve
-    eq = build_equity(all_trades, initial=initial_balance)
-    if not eq.empty:
-        st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
-
-    # Trade table
-    st.subheader("Trade Log")
-    if all_trades:
-        tbl = pd.DataFrame([{
-            "id":       t.trade_id,
-            "dir":      t.direction,
-            "entry":    str(t.entry_date)[:16],
-            "exit":     str(t.exit_date)[:16],
-            "reason":   t.exit_reason,
-            "net_pips": t.net_pips,
-            "net_r":    t.net_r,
-            "lot":      t.lot_size,
-            "dur_h":    t.duration_hours,
-            "regime":   t.regime,
-        } for t in all_trades])
-        st.dataframe(tbl, use_container_width=True, height=350)
-        st.download_button(
-            "⬇  Download trade log",
-            data=tbl.to_csv(index=False).encode(),
-            file_name="trade_log_studio.csv",
-            mime="text/csv",
-        )
-    else:
-        st.warning("No trades generated with these parameters.")
+    if st.button("💾 Save — restart bot to apply", type="primary", disabled=not has_changes):
+        new_cfg = {**cfg, **new_vals, "symbols": active_symbols}
+        CONFIG_PATH.write_text(json.dumps(new_cfg, indent=2))
+        st.success("Saved. Restart live_trader.py to apply.")
+        st.rerun()
 
 
 # ── Page 2: Live Regime Monitor ───────────────────────────────────────────────
@@ -1411,7 +1379,7 @@ def page_overview() -> None:
 
 PAGES = {
     "Market Overview":          page_overview,
-    "⚙️ Parameter Studio":      page_parameter_studio,
+    "⚙️ Bot Settings":          page_bot_settings,
     "📊 Backtest Results":      page_backtest,
     "📡 Live Regime Monitor":   page_live,
     "🔴 Live Trading":          page_live_trading,
