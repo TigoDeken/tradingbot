@@ -1597,7 +1597,7 @@ PAGES = {
 with st.sidebar:
     st.title("Algo Trader")
     st.divider()
-    page = st.radio("", list(PAGES.keys()), label_visibility="collapsed")
+    page = st.radio("Navigation", list(PAGES.keys()), label_visibility="collapsed")
     st.divider()
 
     # ── Active Pairs ──────────────────────────────────────────────────────────
@@ -1617,7 +1617,7 @@ with st.sidebar:
 
     # ── View Symbol ───────────────────────────────────────────────────────────
     st.markdown("**View Symbol**")
-    selected = st.radio("", active_symbols, label_visibility="collapsed", key="sym_radio")
+    selected = st.radio("Symbol", active_symbols, label_visibility="collapsed", key="sym_radio")
 
     st.divider()
     if _mt5_connected():
