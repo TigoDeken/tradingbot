@@ -355,9 +355,24 @@ def page_backtest() -> None:
             split_ratio = split_pct / 100
             params      = _cfg_run_params()
 
+            def _get_pip_info(sym: str) -> tuple:
+                try:
+                    import MetaTrader5 as _mt5
+                    _mt5.initialize()
+                    info = _mt5.symbol_info(sym)
+                    if info:
+                        pip       = round(info.point * 10, 6)
+                        pip_value = round(info.trade_tick_value * (pip / info.trade_tick_size), 4)
+                        return pip, pip_value
+                except Exception:
+                    pass
+                return (0.01, 9.0) if "JPY" in sym else (0.0001, 10.0)
+
             def _run_sym(sym):
+                pip, pip_value = _get_pip_info(sym)
                 df       = get_data(symbol=sym, bars=bars)
-                trades   = run_trades(df, account_balance=initial_balance, **params)
+                trades   = run_trades(df, account_balance=initial_balance,
+                                      pip=pip, pip_value=pip_value, **params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]
