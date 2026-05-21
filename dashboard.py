@@ -412,6 +412,32 @@ def page_backtest() -> None:
                     use_container_width=True,
                 )
 
+                # ── Portfolio combined ────────────────────────────────────────
+                all_combined = sorted(
+                    [t for r in results.values() if r for t in r[4]],
+                    key=lambda t: t.entry_date,
+                )
+                if all_combined:
+                    first_dt         = all_combined[0].entry_date
+                    last_dt          = all_combined[-1].entry_date
+                    split_dt_comb    = first_dt + (last_dt - first_dt) * split_ratio
+                    comb_is_t        = [t for t in all_combined if t.entry_date <  split_dt_comb]
+                    comb_oos_t       = [t for t in all_combined if t.entry_date >= split_dt_comb]
+                    comb_is_m        = compute_metrics(comb_is_t,  initial=initial_balance)
+                    comb_oos_m       = compute_metrics(comb_oos_t, initial=initial_balance)
+                    comb_eq          = build_equity(all_combined,  initial=initial_balance)
+                    comb_oos_ev      = comb_oos_m.get("net_ev", 0) or 0
+
+                    st.divider()
+                    st.subheader("Portfolio — All Symbols Combined")
+                    lbl = (f"Portfolio — {len(all_combined)} total trades | "
+                           f"OOS EV: {'+' if comb_oos_ev >= 0 else ''}{comb_oos_ev:.4f} R/trade")
+                    (st.success if comb_oos_ev >= 0 else st.error)(lbl)
+                    if not comb_eq.empty:
+                        st.plotly_chart(equity_fig(comb_eq, split_n=len(comb_is_t)), use_container_width=True)
+                    _metric_pair(*st.columns(2), comb_is_m, comb_oos_m, split_pct)
+                    st.divider()
+
                 # Per-symbol tabs
                 tabs = st.tabs(ALL_SYMBOLS)
                 for tab, sym in zip(tabs, ALL_SYMBOLS):
