@@ -600,6 +600,23 @@ def page_bot_settings() -> None:
 
     cfg = _load_config_fresh() or {}
 
+    # ── Trading mode toggle ───────────────────────────────────────────────────
+    paper_mode_current = bool(cfg.get("paper_mode", True))
+    working_for_real   = not paper_mode_current
+
+    if working_for_real:
+        st.error("**WORKING FOR REAL** — bot is placing live MT5 orders on your demo account.")
+    else:
+        st.info("**Simulation mode** — bot runs paper trades, no real MT5 orders.")
+
+    toggle_label = "Switch to Simulation" if working_for_real else "Switch to Working for Real"
+    if st.button(toggle_label, type="secondary"):
+        cfg["paper_mode"] = working_for_real   # flip
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        st.rerun()
+
+    st.divider()
+
     def _i(key, default): return int(cfg.get(key, default))
     def _f(key, default): return float(cfg.get(key, default))
 
