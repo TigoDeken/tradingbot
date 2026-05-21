@@ -298,10 +298,98 @@ def _list_runs() -> list[Path]:
 def page_backtest() -> None:
     st.title("📊 Backtest Results")
 
-    # ── Run selector ──────────────────────────────────────────────────────────
+    # ── Run new backtest ──────────────────────────────────────────────────────
+    if PIPELINE_OK:
+        cfg = _load_config_fresh() or {}
+        with st.expander("▶ Run Backtest", expanded=False):
+            rb1, rb2, rb3 = st.columns(3)
+            bars            = rb1.number_input("Bars to fetch",       min_value=100, max_value=50000, value=9999,  step=100)
+            split_pct       = rb2.number_input("In-sample split %",   min_value=10,  max_value=90,    value=70,    step=5)
+            initial_balance = rb3.number_input("Initial balance ($)",  min_value=100, max_value=10_000_000, value=10000, step=500)
+            run_btn = st.button("▶ Run with current Bot Settings", type="primary")
+
+        if run_btn:
+            prog = st.progress(0, "Fetching data from MT5...")
+            try:
+                df_raw = get_data(bars=bars)
+            except Exception as e:
+                st.error(f"MT5 fetch failed: {e}")
+                return
+
+            prog.progress(40, "Simulating trades...")
+            all_trades = run_trades(
+                df_raw,
+                account_balance=initial_balance,
+                pullback_lookback=int(cfg.get("pullback_lookback", 4)),
+                stop_buffer=int(cfg.get("stop_buffer", 5)),
+                tp_mode=cfg.get("tp_mode", "full"),
+                risk_pct=float(cfg.get("risk_per_trade", 0.005)),
+                session_start=int(cfg.get("session_start_utc", 7)),
+                session_end=int(cfg.get("session_end_utc", 20)),
+                min_stop_pips=5, max_lot=10.0,
+                max_open_lots=float(cfg.get("max_open_lots", 0.0)),
+                min_pyramid_bars=int(cfg.get("min_pyramid_bars", 4)),
+                pyramid_min_profit_r=float(cfg.get("pyramid_min_profit_r", 0.5)),
+                close_strength=float(cfg.get("close_strength", 0.6)),
+            )
+
+            prog.progress(80, "Computing metrics...")
+            split_ratio = split_pct / 100
+            split_dt    = df_raw.index[0] + (df_raw.index[-1] - df_raw.index[0]) * split_ratio
+            is_t        = [t for t in all_trades if t.entry_date <  split_dt]
+            oos_t       = [t for t in all_trades if t.entry_date >= split_dt]
+            all_m = compute_metrics(all_trades, initial=initial_balance)
+            is_m  = compute_metrics(is_t,       initial=initial_balance)
+            oos_m = compute_metrics(oos_t,      initial=initial_balance)
+            prog.progress(100, "Done.")
+
+            oos_ev = oos_m.get("net_ev", 0) or 0
+            if oos_ev >= 0:
+                st.success(f"{len(all_trades)} trades  |  OOS net EV: +{oos_ev:.4f} R/trade")
+            else:
+                st.error(f"{len(all_trades)} trades  |  OOS net EV: {oos_ev:.4f} R/trade")
+
+            def _mcol(col, label, m):
+                with col:
+                    st.markdown(f"**{label}**")
+                    st.metric("Trades",     m.get("total_trades", "—"))
+                    st.metric("Win Rate",   f"{m.get('win_rate_pct', 0):.1f}%")
+                    st.metric("Expectancy", f"{m.get('expectancy_net_r', 0):.4f} R")
+                    st.metric("Net EV",     f"{m.get('net_ev', 0):.4f} R")
+                    st.metric("Max DD",     f"{m.get('max_drawdown_pct', 0):.1f}%")
+                    st.metric("T/month",    f"{m.get('trades_per_month', 0):.1f}")
+
+            c1, c2, c3 = st.columns(3)
+            _mcol(c1, "Full Dataset", all_m)
+            _mcol(c2, f"In-Sample ({split_pct}%)", is_m)
+            _mcol(c3, f"Out-of-Sample ({100 - split_pct}%)", oos_m)
+
+            eq = build_equity(all_trades, initial=initial_balance)
+            if not eq.empty:
+                st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
+
+            if all_trades:
+                tbl = pd.DataFrame([{
+                    "id": t.trade_id, "dir": t.direction,
+                    "entry": str(t.entry_date)[:16], "exit": str(t.exit_date)[:16],
+                    "reason": t.exit_reason, "net_pips": t.net_pips,
+                    "net_r": t.net_r, "lot": t.lot_size,
+                } for t in all_trades])
+                st.subheader("Trade Log")
+                st.dataframe(tbl, use_container_width=True, height=350)
+                st.download_button(
+                    "⬇ Download trade log",
+                    data=tbl.to_csv(index=False).encode(),
+                    file_name="trade_log_run.csv", mime="text/csv",
+                )
+            return
+
+        st.divider()
+
+    # ── Saved runs selector ───────────────────────────────────────────────────
     runs = _list_runs()
     if not runs:
-        st.error("No backtest runs found in `results/`. Run `python backtest_engine.py` first.")
+        st.info("No saved runs found in `results/`. Use Run Backtest above or run `python backtest_engine.py`.")
         return
 
     selected_run = st.selectbox(
