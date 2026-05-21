@@ -23,7 +23,7 @@ import pandas as pd
 
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
 from constants     import PIP, MAGIC, MAX_LIMIT_BARS
-from trade_engine  import _bar_setup, PIP_VALUE
+from trade_engine  import _bar_setup, PIP_VALUE, MIN_STOP_PIPS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH  = Path("config.json")
@@ -224,7 +224,10 @@ def compute_lot(config: dict, balance: float, entry: float, stop: float) -> floa
     stop_pips = abs(entry - stop) / PIP
     if stop_pips <= 0:
         return 0.0
-    return math.floor(risk / (stop_pips * PIP_VALUE) * 100) / 100
+    lot = math.floor(risk / (stop_pips * PIP_VALUE) * 100) / 100
+    if 0 < lot < 0.01:
+        lot = 0.01
+    return lot
 
 
 # ── Paper-mode order helpers ──────────────────────────────────────────────────
@@ -407,6 +410,15 @@ def _manage_paper_trade(config: dict, state: dict, last_bar: pd.Series,
     direction = t["direction"]
     long      = direction == "long"
 
+    stop_dist = (l - t["stop"]) / PIP if long else (t["stop"] - h) / PIP
+    tp_dist   = (t["tp1"] - h)  / PIP if long else (l - t["tp1"]) / PIP
+    logger.info(
+        f"[PAPER] Managing {direction.upper()}  entry={t['entry']:.5f}  "
+        f"stop={t['stop']:.5f}  tp={t['tp1']:.5f}"
+        f"\n  Bar H={h:.5f}  L={l:.5f}  C={c:.5f}"
+        f"\n  Distance to stop: {stop_dist:.1f}pip  Distance to TP: {tp_dist:.1f}pip"
+    )
+
     if t["tp1_hit"]:
         # Trail mode — ratchet stop to previous bar extreme, exit on close beyond it
         new_ts = _new_trail_stop(config, direction, df, t["trail_stop"])
@@ -490,6 +502,12 @@ def _check_paper_pending(config: dict, state: dict, last_bar: pd.Series,
                           logger: logging.Logger) -> None:
     lim  = state["pending_limit"]
     h, l = float(last_bar["High"]), float(last_bar["Low"])
+    dist = (l - lim["price"]) / PIP if lim["direction"] == "long" else (lim["price"] - h) / PIP
+    logger.info(
+        f"[PAPER] Pending {lim['direction'].upper()} limit @ {lim['price']:.5f}  "
+        f"Bar H={h:.5f}  L={l:.5f}  "
+        f"{'filled' if dist <= 0 else f'not filled ({dist:.1f}pip away)'}"
+    )
     filled = (lim["direction"] == "long"  and l <= lim["price"]) or \
              (lim["direction"] == "short" and h >= lim["price"])
     if not filled:
@@ -529,41 +547,95 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame,
                 logger: logging.Logger) -> None:
     if len(df) < 3:
         return
+
     bar_time = df.index[-1]
     if not in_session(config, bar_time):
-        logger.info(f"No entry — outside session hours ({bar_time.hour:02d}:00 UTC)")
+        logger.info(f"No entry — outside session ({bar_time.hour:02d}:00 UTC, window {config['session_start_utc']}-{config['session_end_utc']})")
         return
 
     prev2 = df.iloc[-3]
     prev1 = df.iloc[-2]
     curr  = df.iloc[-1]
 
+    # Log the three bars being evaluated
+    logger.info(
+        f"Evaluating bars:"
+        f"\n  prev2  O={prev2['Open']:.5f}  H={prev2['High']:.5f}  L={prev2['Low']:.5f}  C={prev2['Close']:.5f}"
+        f"\n  prev1  O={prev1['Open']:.5f}  H={prev1['High']:.5f}  L={prev1['Low']:.5f}  C={prev1['Close']:.5f}"
+        f"\n  curr   O={curr['Open']:.5f}  H={curr['High']:.5f}  L={curr['Low']:.5f}  C={curr['Close']:.5f}"
+    )
+
+    # Bar structure checks
+    p1_took_high = prev1["High"] > prev2["High"]
+    p1_took_low  = prev1["Low"]  < prev2["Low"]
+    c_took_high  = curr["High"]  > prev1["High"]
+    c_took_low   = curr["Low"]   < prev1["Low"]
+    bar_range    = curr["High"] - curr["Low"]
+    close_pos    = ((curr["Close"] - curr["Low"]) / bar_range) if bar_range > 0 else 0.5
+
+    logger.info(
+        f"Bar conditions:"
+        f"\n  prev1 broke high={p1_took_high}  prev1 broke low={p1_took_low}"
+        f"\n  curr  broke high={c_took_high}   curr  broke low={c_took_low}"
+        f"\n  close_pos={close_pos:.2f}  (need >={config.get('close_strength', 0.6):.2f} long / <={(1-config.get('close_strength',0.6)):.2f} short)"
+    )
+
+    # Diagnose which direction (if any) qualifies
+    close_strength = config.get("close_strength", 0.6)
+    long_struct  = p1_took_high and not p1_took_low and c_took_high and not c_took_low
+    short_struct = p1_took_low  and not p1_took_high and c_took_low and not c_took_high
+
+    if long_struct:
+        if close_pos < close_strength:
+            logger.info(f"No entry — LONG structure valid but close too weak ({close_pos:.2f} < {close_strength:.2f})")
+        else:
+            logger.debug("LONG structure passed close_strength check")
+    elif short_struct:
+        if close_pos > (1.0 - close_strength):
+            logger.info(f"No entry — SHORT structure valid but close too weak ({close_pos:.2f} > {1-close_strength:.2f})")
+        else:
+            logger.debug("SHORT structure passed close_strength check")
+    else:
+        reasons = []
+        if not (p1_took_high and not p1_took_low):
+            reasons.append("prev1 not clean up-break")
+        if not (p1_took_low and not p1_took_high):
+            reasons.append("prev1 not clean down-break")
+        logger.info(f"No entry — no clean consecutive breakout ({', '.join(reasons)})")
+
     lb      = config.get("pullback_lookback", 4)
     pb_pips = float(np.median([
         (df.iloc[j]["High"] - df.iloc[j]["Low"]) / PIP
         for j in range(max(0, len(df) - lb), len(df) - 1)
     ]))
-    min_stop       = config.get("min_stop_pips", 20.0)
-    close_strength = config.get("close_strength", 0.6)
+    min_stop       = config.get("min_stop_pips", MIN_STOP_PIPS)
+    logger.debug(f"Pullback target: {pb_pips:.1f} pip (median of last {lb} bars)  min_stop: {min_stop:.0f} pip")
 
     result = _bar_setup(prev2, prev1, curr, pb_pips,
                         config.get("stop_buffer", 5), PIP, min_stop,
                         close_strength=close_strength)
     if result is None:
-        logger.info("No entry — no consecutive breakout pattern")
         return
 
     direction, entry, stop, tp1 = result
+    stop_pips = abs(entry - stop) / PIP
+    risk_r    = abs(tp1 - entry) / abs(entry - stop)
+
+    logger.info(
+        f"SIGNAL: {direction.upper()}  "
+        f"entry={entry:.5f}  stop={stop:.5f}  tp={tp1:.5f}  "
+        f"stop_dist={stop_pips:.1f}pip  R:R=1:{risk_r:.1f}"
+    )
 
     balance = get_balance(config, state)
     lot     = compute_lot(config, balance, entry, stop)
     if lot <= 0:
-        logger.info(f"No entry — lot size zero (stop={abs(entry-stop)/PIP:.1f}pip)")
+        logger.info(f"No entry — lot size zero (stop={stop_pips:.1f}pip  balance=${balance:.2f})")
         return
 
     logger.info(
-        f"Entry signal: {direction.upper()}  entry={entry:.5f}  stop={stop:.5f}  "
-        f"tp1={tp1:.5f}  lot={lot}  risk={abs(entry-stop)/PIP:.1f}pip"
+        f"Placing order: {direction.upper()} {lot} lots  "
+        f"risk=${balance * config['risk_per_trade']:.2f} ({config['risk_per_trade']*100:.1f}%)"
     )
     if config["paper_mode"]:
         paper_cancel_limit(state, "new signal", logger)

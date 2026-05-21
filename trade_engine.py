@@ -17,7 +17,7 @@ STOP_BUFFER       = 5        # pips
 TP_MODE           = "full"   # "full" | "partial"
 SLIPPAGE_PIPS     = 3
 ACCOUNT_BALANCE   = 10_000.0
-MIN_STOP_PIPS     = 20.0     # floor to prevent degenerate lot sizing
+MIN_STOP_PIPS     = 10.0     # floor to prevent degenerate lot sizing
 MAX_LOT           = 10.0     # hard cap on position size
 
 
@@ -114,6 +114,8 @@ def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: 
     if stop_pips < min_stop_pips:
         return 0.0
     lot = math.floor(risk / (stop_pips * pip_value) * 100) / 100
+    if 0 < lot < 0.01:
+        lot = 0.01
     return min(lot, max_lot)
 
 
@@ -179,7 +181,6 @@ def run_trades(
     trades:           list[Trade]     = []
     open_trades:      list[Trade]     = []
     trade_id          = 0
-    last_entry_setup: Optional[tuple] = None  # (direction, bar_index)
     last_open_bar:    int             = -999  # bar index when last trade opened
 
     params = dict(
@@ -285,10 +286,6 @@ def run_trades(
 
         direction, entry, stop, tp1 = result
 
-        setup_key = (direction, i - 1)
-        if setup_key == last_entry_setup:
-            continue
-
         # Pyramid-specific validation
         if open_trades:
             if any(t.direction != direction for t in open_trades):
@@ -338,8 +335,7 @@ def run_trades(
                 new_stop   = min(prev_trade.entry_price - be_offset, structure)
                 prev_trade.stop_price = round(new_stop, 5)
 
-        last_entry_setup = setup_key
-        last_open_bar    = i
+        last_open_bar = i
         trade_id        += 1
         new_trade = Trade(
             trade_id       = trade_id,
