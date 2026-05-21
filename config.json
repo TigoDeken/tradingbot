@@ -7,7 +7,7 @@
     "USDCAD"
   ],
   "timeframe": "H4",
-  "session_start_utc": 7,
+  "session_start_utc": 3,
   "session_end_utc": 20,
   "risk_per_trade": 0.005,
   "tp_mode": "full",
