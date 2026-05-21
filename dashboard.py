@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 
-st.set_page_config(page_title="EURUSD Algo Trader", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Algo Trader", page_icon="📈", layout="wide")
 
 # ── Optional pipeline imports ─────────────────────────────────────────────────
 from constants import PIP
@@ -45,15 +45,18 @@ def _mt5_connected() -> bool:
 
 
 # ── Paths & constants ─────────────────────────────────────────────────────────
-OPT_CSV    = Path("optimisation_results.csv")
-TRADE_CSV  = Path("trade_log.csv")
-EQUITY_CSV = Path("equity_curve.csv")
-STATE_JSON = Path("state.json")
-LOG_FILE   = Path("trading_log.txt")
+OPT_CSV     = Path("optimisation_results.csv")
+TRADE_CSV   = Path("trade_log.csv")
+EQUITY_CSV  = Path("equity_curve.csv")
+STATE_JSON  = Path("state.json")
+LOG_FILE    = Path("trading_log.txt")
+CONFIG_PATH = Path("config.json")
 
-PARAM_COLS = ["PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE", "CLOSE_STRENGTH"]
+ALL_SYMBOLS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD"]
 
 RESULTS_DIR = Path("results")
+
+PARAM_COLS = ["PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE", "CLOSE_STRENGTH"]
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -89,6 +92,18 @@ def load_state(refresh_key: int = 0) -> dict | None:
         return None
     try:
         with STATE_JSON.open() as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_state(symbol: str) -> dict | None:
+    """Load per-symbol state_{symbol}.json."""
+    path = Path(f"state_{symbol}.json")
+    if not path.exists():
+        return None
+    try:
+        with path.open() as f:
             return json.load(f)
     except Exception:
         return None
@@ -170,10 +185,10 @@ def parse_paper_trades(lines: list[str]) -> pd.DataFrame:
 
 
 @st.cache_data
-def fetch_live(refresh_key: int):
+def fetch_live(refresh_key: int, symbol: str = "EURUSD"):
     """MT5 fetch — refresh_key busts the cache on demand."""
     try:
-        return get_data(), None
+        return get_data(symbol=symbol), None
     except Exception as e:
         return None, str(e)
 
@@ -459,7 +474,7 @@ def page_parameter_studio() -> None:
     # ── Save config ───────────────────────────────────────────────────────────
     if save_btn:
         new_cfg = {
-            "symbol":            "EURUSD",
+            "symbols":           active_symbols,
             "timeframe":         "H4",
             "session_start_utc": int(session_start),
             "session_end_utc":   int(session_end),
@@ -602,8 +617,9 @@ def page_live() -> None:
         if st.button("🔄 Refresh"):
             st.session_state.refresh_key += 1
 
+    st.caption(f"Symbol: **{selected}**")
     with st.spinner("Fetching data from MT5…"):
-        df_raw, err = fetch_live(st.session_state.refresh_key)
+        df_raw, err = fetch_live(st.session_state.refresh_key, selected)
 
     if err or df_raw is None:
         st.warning(
@@ -674,85 +690,7 @@ def page_live() -> None:
     st.divider()
 
 
-# ── Page 3: Parameter Explorer ────────────────────────────────────────────────
-
-def page_explorer() -> None:
-    st.title("🔍 Parameter Explorer")
-
-    opt_df = load_opt()
-    if opt_df is None:
-        st.error("No optimisation results. Run `python backtest_engine.py` first.")
-        return
-
-    best_oos_idx = int(opt_df["OOS_expectancy_net_r"].idxmax())
-
-    # ── Sidebar filters ───────────────────────────────────────────────────────
-    with st.sidebar:
-        st.subheader("Filters")
-        lb_r = st.slider("PULLBACK_LOOKBACK", 3, 5, (3, 5))
-        sb_r = st.slider("STOP_BUFFER",       3, 8, (3, 8))
-        tp_f = st.multiselect("TP_MODE", ["full", "partial"], default=["full", "partial"])
-
-    mask = (
-        opt_df["PULLBACK_LOOKBACK"].between(*lb_r) &
-        opt_df["STOP_BUFFER"].between(*sb_r) &
-        opt_df["TP_MODE"].isin(tp_f)
-    )
-    filt = opt_df[mask].copy()
-    st.write(f"Showing **{len(filt)}** of {len(opt_df)} combinations")
-
-    if filt.empty:
-        st.warning("No combinations match the current filters.")
-        return
-
-    # ── Scatter plot ──────────────────────────────────────────────────────────
-    hover_cols = [c for c in PARAM_COLS + [
-        "IS_win_rate_pct", "IS_expectancy_net_r", "IS_max_drawdown_pct", "IS_total_trades",
-        "OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct","OOS_total_trades",
-    ] if c in filt.columns]
-
-    fig = px.scatter(
-        filt,
-        x="IS_win_rate_pct", y="IS_expectancy_net_r",
-        size="IS_total_trades", size_max=20,
-        color="TP_MODE",
-        color_discrete_map={"full": "#4da6ff", "partial": "#ff884d"},
-        hover_data=hover_cols,
-        template="plotly_dark",
-        title="IS Win Rate % vs IS Expectancy R  (bubble size = trade count, colour = TP_MODE)",
-        labels={
-            "IS_win_rate_pct":     "Win Rate % (IS)",
-            "IS_expectancy_net_r": "Expectancy R (IS)",
-        },
-    )
-
-    # Highlight best OOS combo
-    if best_oos_idx in filt.index:
-        bo = filt.loc[best_oos_idx]
-        fig.add_trace(go.Scatter(
-            x=[bo["IS_win_rate_pct"]], y=[bo["IS_expectancy_net_r"]],
-            mode="markers+text", text=["★ Best OOS"],
-            textposition="top center",
-            marker=dict(color="yellow", size=18, symbol="star",
-                        line=dict(color="white", width=1)),
-            name="Best OOS combo",
-        ))
-
-    fig.add_hline(y=0, line=dict(color="white", dash="dot", width=0.8))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Filtered table ────────────────────────────────────────────────────────
-    tbl_cols = [c for c in PARAM_COLS + [
-        "IS_total_trades", "IS_win_rate_pct", "IS_expectancy_net_r", "IS_max_drawdown_pct",
-        "OOS_total_trades","OOS_win_rate_pct","OOS_expectancy_net_r","OOS_max_drawdown_pct",
-    ] if c in filt.columns]
-    st.dataframe(
-        filt[tbl_cols].sort_values("IS_expectancy_net_r", ascending=False).reset_index(drop=True),
-        use_container_width=True, height=400,
-    )
-
-
-# ── Live-trade helpers (used by pages 4 & 5) ─────────────────────────────────
+# ── Live-trade helpers ────────────────────────────────────────────────────────
 
 def _load_config_fresh() -> dict | None:
     p = Path("config.json")
@@ -858,8 +796,7 @@ def _sidebar_kpis() -> dict:
     Priority: paper trades > backtest OOS CSV.
     (Live trades lack net_pips in current log format.)
     """
-    rk    = st.session_state.get("paper_refresh_key",
-            st.session_state.get("live_refresh_key", 0))
+    rk    = st.session_state.get("live_refresh_key", 0)
     lines = load_log_lines(rk)
     paper = parse_paper_trades(lines)
 
@@ -947,326 +884,6 @@ def _emergency_stop_execute() -> tuple[bool, list[str]]:
     return True, msgs
 
 
-# ── Page 4: Paper Trading Monitor ────────────────────────────────────────────
-
-def page_paper() -> None:
-    st.title("📄 Paper Trading Monitor")
-
-    # ── Refresh controls ──────────────────────────────────────────────────────
-    if "paper_refresh_key" not in st.session_state:
-        st.session_state.paper_refresh_key = 0
-
-    hdr_l, hdr_r = st.columns([5, 1])
-    with hdr_r:
-        if st.button("🔄 Refresh Now"):
-            st.session_state.paper_refresh_key += 1
-
-    rk    = st.session_state.paper_refresh_key
-    state = load_state(rk)
-    lines = load_log_lines(rk)
-
-    # ── Status banner ─────────────────────────────────────────────────────────
-    st.warning(
-        "⚠  **PAPER MODE** — All orders are simulated. "
-        "No real positions are opened in MetaTrader 5."
-    )
-
-    now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
-    b1, b2, b3 = st.columns(3)
-    if state:
-        pm = state.get("paper_mode", True)
-        b1.metric("Mode",       "📄 PAPER" if pm else "🔴 LIVE")
-        b2.metric("Last Update", now_utc)
-        cb = state.get("circuit_breaker_active", False)
-        b3.metric("Circuit Breaker", "🔴 TRIGGERED" if cb else "🟢 OK")
-    else:
-        b1.info("No `state.json` found — start `live_trader.py` first.")
-        b2.metric("Last Update", now_utc)
-        b3.metric("Circuit Breaker", "—")
-
-    st.divider()
-
-    # ── Section 1: Current State ───────────────────────────────────────────────
-    st.subheader("1 · Current State  (`state.json`)")
-    if not state:
-        st.info("state.json not found. Live trader has not been started yet.")
-    else:
-        s1, s2, s3, s4 = st.columns(4)
-
-        bal = state.get("session_starting_balance") or state.get("current_balance", 0)
-        s1.metric("Session Start Balance", f"${bal:,.2f}")
-
-        # derive peak balance from trade history
-        hist = state.get("trade_history", [])
-        peak = bal
-        if hist:
-            balances = [t.get("balance", bal) for t in hist if "balance" in t]
-            if balances:
-                peak = max(balances)
-        s2.metric("Peak Balance", f"${peak:,.2f}")
-
-        dd_pct = state.get("session_drawdown_pct", 0.0)
-        s3.metric("Session Drawdown", f"{dd_pct:.2f}%",
-                  delta_color="inverse" if dd_pct > 0 else "normal")
-
-        open_trade = state.get("open_trade")
-        pending_ord = state.get("pending_order")
-        if open_trade:
-            s4.metric("Position", f"OPEN {open_trade.get('direction','').upper()}")
-        elif pending_ord:
-            s4.metric("Position", f"PENDING {pending_ord.get('direction','').upper()}")
-        else:
-            s4.metric("Position", "FLAT")
-
-        # Open trade detail
-        if open_trade:
-            st.markdown("**Open Position**")
-            oc1, oc2, oc3, oc4 = st.columns(4)
-            oc1.metric("Direction",  open_trade.get("direction", "—").upper())
-            oc2.metric("Entry",      f"{open_trade.get('entry_price', 0):.5f}")
-            oc3.metric("Stop",       f"{open_trade.get('stop_price', 0):.5f}")
-            oc4.metric("TP",         f"{open_trade.get('tp_price', 0):.5f}")
-
-        if pending_ord:
-            st.markdown("**Pending Limit Order**")
-            pc1, pc2, pc3, pc4 = st.columns(4)
-            pc1.metric("Direction",    pending_ord.get("direction", "—").upper())
-            pc2.metric("Limit Price",  f"{pending_ord.get('limit_price', 0):.5f}")
-            pc3.metric("Stop",         f"{pending_ord.get('stop_price', 0):.5f}")
-            pc4.metric("TP",           f"{pending_ord.get('tp_price', 0):.5f}")
-
-    st.divider()
-
-    # ── Section 2: Paper Trade Log ─────────────────────────────────────────────
-    st.subheader("2 · Paper Trade Log  (parsed from `trading_log.txt`)")
-    paper_trades = parse_paper_trades(lines)
-
-    if paper_trades.empty:
-        st.info("No completed paper trades found in the log yet.")
-    else:
-        show_cols = [c for c in [
-            "trade_#", "direction", "open_ts", "close_ts",
-            "entry_price", "exit_price", "exit_reason",
-            "gross_pips", "net_pips", "pnl_usd", "balance",
-        ] if c in paper_trades.columns]
-        disp = paper_trades[show_cols].copy()
-        if "gross_pips" in disp.columns:
-            disp["gross_pips"] = disp["gross_pips"].round(1)
-        if "net_pips" in disp.columns:
-            disp["net_pips"] = disp["net_pips"].round(1)
-        st.dataframe(disp, use_container_width=True, height=320)
-
-        wins  = (paper_trades["net_pips"] > 0).sum()
-        total = len(paper_trades)
-        wr    = wins / total * 100 if total else 0
-        tot_pnl = paper_trades["pnl_usd"].sum()
-        sm1, sm2, sm3, sm4 = st.columns(4)
-        sm1.metric("Paper Trades",  total)
-        sm2.metric("Win Rate",      f"{wr:.1f}%")
-        sm3.metric("Total P&L",     f"${tot_pnl:+,.2f}")
-        sm4.metric("Avg Net Pips",  f"{paper_trades['net_pips'].mean():.1f}")
-
-    st.divider()
-
-    # ── Section 3: Paper Equity Curve ─────────────────────────────────────────
-    st.subheader("3 · Paper Equity Curve")
-    if paper_trades.empty:
-        st.info("No trades to plot yet.")
-    else:
-        eq_fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.70, 0.30], vertical_spacing=0.05,
-            subplot_titles=["Paper Balance (USD)", "Trade P&L (USD)"],
-        )
-        t_idx = paper_trades["trade_#"].values
-        bal_v = paper_trades["balance"].values
-        pnl_v = paper_trades["pnl_usd"].values
-        colors = ["#26c26e" if p >= 0 else "#ef5350" for p in pnl_v]
-
-        eq_fig.add_trace(
-            go.Scatter(x=t_idx, y=bal_v, name="Balance",
-                       line=dict(color="#4da6ff", width=2)),
-            row=1, col=1,
-        )
-        eq_fig.add_trace(
-            go.Bar(x=t_idx, y=pnl_v, name="P&L", marker_color=colors),
-            row=2, col=1,
-        )
-        eq_fig.update_layout(height=460, template="plotly_dark", showlegend=True,
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        eq_fig.update_xaxes(title_text="Trade #", row=2)
-        eq_fig.update_yaxes(title_text="USD", row=1)
-        eq_fig.update_yaxes(title_text="USD", row=2)
-        st.plotly_chart(eq_fig, use_container_width=True)
-
-    st.divider()
-
-    # ── Section 4: Rolling EV ─────────────────────────────────────────────────
-    st.subheader("4 · Rolling Expected Value (EV)")
-    opt_df = load_opt()
-    bt_ev = None
-    if opt_df is not None and not opt_df.empty:
-        bt_ev = opt_df.iloc[0].get("OOS_net_ev")
-
-    if paper_trades.empty:
-        st.info("No completed paper trades to compute rolling EV yet.")
-    else:
-        rev_df = _rolling_ev_df(paper_trades)
-        if not rev_df.empty:
-            # Summary metrics
-            rev1, rev2, rev3 = st.columns(3)
-            rev1.metric("EV all trades",  f"{rev_df['ev_all'].iloc[-1]:.4f} R")
-            rev2.metric("EV last 20",     f"{rev_df['ev_last20'].iloc[-1]:.4f} R")
-            rev3.metric("EV last 10",     f"{rev_df['ev_last10'].iloc[-1]:.4f} R")
-
-            # Rolling EV chart
-            ev_fig = go.Figure()
-            x = rev_df["trade_#"].values
-            ev_fig.add_trace(go.Scatter(
-                x=x, y=rev_df["ev_all"].values,
-                name="EV all trades", line=dict(color="#4da6ff", width=2),
-            ))
-            ev_fig.add_trace(go.Scatter(
-                x=x, y=rev_df["ev_last20"].values,
-                name="EV last 20", line=dict(color="#26c26e", width=1.8, dash="dash"),
-            ))
-            ev_fig.add_trace(go.Scatter(
-                x=x, y=rev_df["ev_last10"].values,
-                name="EV last 10", line=dict(color="#ffd700", width=1.5, dash="dot"),
-            ))
-            ev_fig.add_hline(y=0, line=dict(color="white", dash="dot", width=0.7))
-
-            if bt_ev is not None:
-                ev_fig.add_hline(
-                    y=float(bt_ev),
-                    line=dict(color="orange", dash="longdash", width=1.2),
-                    annotation_text=f"Backtest OOS EV ({bt_ev:.4f} R)",
-                    annotation_position="bottom right",
-                )
-                # Red shading if any rolling EV drops >20% below backtest EV
-                threshold = float(bt_ev) * 0.80
-                if bt_ev > 0 and rev_df[["ev_all","ev_last20","ev_last10"]].min().min() < threshold:
-                    st.error(
-                        f"⚠️  Rolling EV has dropped more than 20% below backtest EV "
-                        f"({bt_ev:.4f} R). Review recent trades."
-                    )
-
-            ev_fig.update_layout(
-                height=380, template="plotly_dark",
-                xaxis_title="Trade #", yaxis_title="EV (R/trade)",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                title="Rolling Expected Value vs Backtest Reference",
-            )
-            st.plotly_chart(ev_fig, use_container_width=True)
-
-    st.divider()
-
-    # ── Section 5: Paper vs Backtest Comparison ────────────────────────────────
-    st.subheader("5 · Paper vs Backtest Comparison")
-    if opt_df is None:
-        st.info("No optimisation_results.csv found — run the backtest first.")
-    elif paper_trades.empty:
-        st.info("No completed paper trades to compare yet.")
-    else:
-        best_row = opt_df.iloc[0]
-        metrics = [
-            ("Win Rate %",   "win_rate_pct",     "%"),
-            ("Expectancy R", "expectancy_net_r",  " R"),
-            ("Net EV",       "net_ev",            " R"),
-            ("Max DD %",     "max_drawdown_pct",  "%"),
-        ]
-
-        # Paper stats — compute R using actual stop distance per trade
-        p_wr  = wr  # computed above
-        _sp   = (paper_trades["entry_price"] - paper_trades["stop_price"]).abs() / 0.0001
-        _nr   = paper_trades["net_pips"] / _sp.replace(0, float("nan"))
-        p_exp = float(_nr.mean()) if not _nr.empty else 0.0
-        _wins_mask = paper_trades["net_pips"] > 0
-        _wr_f = p_wr / 100
-        _lr_f = 1 - _wr_f
-        _avg_nw = float(_nr[_wins_mask].mean())   if _wins_mask.any()  else 0.0
-        _avg_nl = float(_nr[~_wins_mask].mean())  if (~_wins_mask).any() else 0.0
-        p_net_ev = round(_wr_f * _avg_nw - _lr_f * abs(_avg_nl), 4)
-        running_peak = paper_trades["balance"].cummax()
-        paper_dd = ((running_peak - paper_trades["balance"]) / running_peak * 100).max()
-
-        paper_stats  = {
-            "win_rate_pct":     p_wr,
-            "expectancy_net_r": p_exp,
-            "net_ev":           p_net_ev,
-            "max_drawdown_pct": paper_dd,
-        }
-        bt_oos_stats = {
-            "win_rate_pct":     best_row.get("OOS_win_rate_pct",     None),
-            "expectancy_net_r": best_row.get("OOS_expectancy_net_r", None),
-            "net_ev":           best_row.get("OOS_net_ev",           None),
-            "max_drawdown_pct": best_row.get("OOS_max_drawdown_pct", None),
-        }
-
-        cmp_l, cmp_r = st.columns(2)
-        with cmp_l:
-            st.markdown("**Backtest OOS  (best combo)**")
-            for label, key, unit in metrics:
-                v = bt_oos_stats.get(key)
-                st.metric(label, f"{v:.4f}{unit}" if v is not None else "—")
-        with cmp_r:
-            st.markdown("**Paper Trading (live)**")
-            for label, key, unit in metrics:
-                pv = paper_stats.get(key)
-                bv = bt_oos_stats.get(key)
-                delta = None
-                if pv is not None and bv is not None:
-                    try:
-                        delta = round(float(pv) - float(bv), 4)
-                    except Exception:
-                        pass
-                st.metric(label, f"{pv:.4f}{unit}" if pv is not None else "—", delta=delta)
-
-    st.divider()
-
-    # ── Section 6: Last 30 Log Lines ──────────────────────────────────────────
-    st.subheader("6 · Last 30 Log Lines  (`trading_log.txt`)")
-    if not lines:
-        st.info("trading_log.txt not found or empty.")
-    else:
-        last30 = "\n".join(lines[-30:])
-        st.code(last30, language=None)
-
-    st.divider()
-
-    # ── Go Live Checklist ─────────────────────────────────────────────────────
-    st.subheader("Go-Live Checklist")
-    st.markdown(
-        "Review every item before switching `paper_mode` to `false` in `config.json`."
-    )
-    checks = [
-        "Paper mode has run for at least 2 weeks with ≥ 10 completed trades",
-        "Paper win rate is within ±10% of OOS backtest win rate",
-        "Paper expectancy is positive (> 0 R)",
-        "Paper max drawdown is below `max_drawdown_pct` threshold in config.json",
-        "MT5 account has been verified as connected (check Page 2)",
-        "Risk per trade (`risk_per_trade = 0.005`) confirmed correct for live account size",
-        "Circuit breaker threshold (`max_drawdown_pct`) reviewed and accepted",
-    ]
-    all_checked = all(
-        st.checkbox(item, key=f"chk_{i}")
-        for i, item in enumerate(checks)
-    )
-    if all_checked:
-        st.success(
-            "✅ All items checked. You may set `paper_mode: false` in config.json "
-            "and restart with `--live-confirmed` flag."
-        )
-    else:
-        st.info("Complete all checklist items above before going live.")
-
-    # Auto-refresh: render content fully, then sleep 60 s and re-render
-    import time as _time
-    st.caption(f"Auto-refreshing every 60 s · {now_utc}")
-    _time.sleep(60)
-    st.session_state.paper_refresh_key += 1
-    st.rerun()
-
 
 # ── Page 5: Live Trading ──────────────────────────────────────────────────────
 
@@ -1291,8 +908,9 @@ def page_live_trading() -> None:
 
     cfg   = _load_config_fresh()
     rk    = st.session_state.live_refresh_key
-    state = load_state(rk)
+    state = _load_state(selected)
     lines = load_log_lines(rk)
+    sym_lines = [l for l in lines if f"[{selected}]" in l]
     now_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
 
     is_live = cfg is not None and not cfg.get("paper_mode", True)
@@ -1388,7 +1006,7 @@ def page_live_trading() -> None:
     # ── Section 2: Current State ───────────────────────────────────────────────
     st.subheader("2 · Current State")
     if not state:
-        st.info("state.json not found. Start live_trader.py first.")
+        st.info(f"state_{selected}.json not found. Start live_trader.py first.")
     else:
         regime   = state.get("last_regime", "—")
         cb_on    = state.get("circuit_breaker_active", False)
@@ -1422,7 +1040,7 @@ def page_live_trading() -> None:
             cur_r    = "—"
             try:
                 import MetaTrader5 as _mt5
-                tick = _mt5.symbol_info_tick(cfg["symbol"] if cfg else "EURUSD")
+                tick = _mt5.symbol_info_tick(selected)
                 if tick:
                     cur_px    = float(tick.bid if direction == "LONG" else tick.ask)
                     pip       = 0.0001
@@ -1457,8 +1075,8 @@ def page_live_trading() -> None:
     st.divider()
 
     # ── Section 3: Live Trade Log ──────────────────────────────────────────────
-    st.subheader("3 · Live Trade Log")
-    live_trades = parse_live_trades(lines)
+    st.subheader(f"3 · {selected} Live Trade Log")
+    live_trades = parse_live_trades(sym_lines)
 
     if is_live and live_trades.empty:
         st.info("No live trades recorded yet in trading_log.txt.")
@@ -1486,9 +1104,9 @@ def page_live_trading() -> None:
     if _live_opt_df is not None and not _live_opt_df.empty:
         _live_bt_ev = _live_opt_df.iloc[0].get("OOS_net_ev")
 
-    _paper_for_ev = parse_paper_trades(lines)
+    _paper_for_ev = parse_paper_trades(sym_lines)
 
-    if live_trd.empty and _paper_for_ev.empty:
+    if live_trades.empty and _paper_for_ev.empty:
         st.info(
             "No paper or live trades with sufficient data to compute rolling EV. "
             "Live trade R is derived from paper trading logs (net_pips required)."
@@ -1550,7 +1168,7 @@ def page_live_trading() -> None:
     st.caption("Backtest curve loads from CSV — no MT5 connection required.")
 
     eq_bt     = load_equity()
-    paper_trd = parse_paper_trades(lines)
+    paper_trd = parse_paper_trades(sym_lines)
     live_trd  = live_trades  # already parsed above
 
     fig4 = go.Figure()
@@ -1708,9 +1326,9 @@ def page_live_trading() -> None:
     st.divider()
 
     # ── Section 7: Recent Log Entries ─────────────────────────────────────────
-    st.subheader("7 · Recent Log Entries")
-    if not lines:
-        st.info("trading_log.txt not found or empty.")
+    st.subheader(f"7 · Recent Log Entries  ({selected})")
+    if not sym_lines:
+        st.info(f"No log entries for {selected} yet.")
     else:
         def _tag(line: str) -> str:
             if "[PAPER]" in line:
@@ -1721,7 +1339,7 @@ def page_live_trading() -> None:
                     return f"[LIVE]  {line}"
             return line
 
-        last30 = [_tag(l) for l in lines[-30:]]
+        last30 = [_tag(l) for l in sym_lines[-30:]]
         last30.reverse()
         st.code("\n".join(last30), language=None)
 
@@ -1733,21 +1351,97 @@ def page_live_trading() -> None:
     st.rerun()
 
 
+# ── Page 0: Market Overview ───────────────────────────────────────────────────
+
+def page_overview() -> None:
+    hdr_l, hdr_r = st.columns([8, 1])
+    with hdr_l:
+        st.title("Market Overview")
+    with hdr_r:
+        if st.button("Refresh"):
+            st.rerun()
+
+    st.caption(f"Last render: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')}")
+    st.divider()
+
+    cols = st.columns(len(active_symbols))
+    for col, sym in zip(cols, active_symbols):
+        state = _load_state(sym)
+        with col:
+            st.markdown(f"**{sym}**")
+            if state is None:
+                st.markdown("NO DATA")
+                st.caption("Start bot")
+            else:
+                cb_on   = state.get("circuit_breaker_active", False)
+                open_t  = state.get("open_trade")
+                pending = state.get("pending_limit")
+                cur_bal = state.get("current_balance")
+                ses_bal = state.get("session_starting_balance")
+                dd_pct  = state.get("drawdown_pct", 0.0)
+
+                if cb_on:
+                    status = "CIRCUIT BREAK"
+                    color  = "🔴"
+                elif open_t:
+                    dir_str = open_t.get("direction", "").upper()
+                    status  = f"IN TRADE ({dir_str})"
+                    color   = "🟢"
+                elif pending:
+                    dir_str = pending.get("direction", "").upper()
+                    status  = f"PENDING ({dir_str})"
+                    color   = "🟡"
+                else:
+                    status = "FLAT"
+                    color  = "⚪"
+
+                st.markdown(f"{color} {status}")
+
+                if cur_bal is not None and ses_bal is not None and ses_bal > 0:
+                    delta = cur_bal - ses_bal
+                    sign  = "+" if delta >= 0 else ""
+                    st.metric("Session P&L", f"{sign}${delta:,.2f}")
+                else:
+                    st.metric("Session P&L", "—")
+
+                st.caption(f"DD: {dd_pct:.2f}%  |  CB: {'TRIGGERED' if cb_on else 'OK'}")
+
+
 # ── Navigation ────────────────────────────────────────────────────────────────
 
 PAGES = {
+    "Market Overview":          page_overview,
     "⚙️ Parameter Studio":      page_parameter_studio,
     "📊 Backtest Results":      page_backtest,
     "📡 Live Regime Monitor":   page_live,
-    "🔍 Parameter Explorer":    page_explorer,
-    "📄 Paper Trading Monitor": page_paper,
     "🔴 Live Trading":          page_live_trading,
 }
 
 with st.sidebar:
-    st.title("EURUSD Algo Trader")
+    st.title("Algo Trader")
     st.divider()
     page = st.radio("", list(PAGES.keys()), label_visibility="collapsed")
+    st.divider()
+
+    # ── Active Pairs ──────────────────────────────────────────────────────────
+    _cfg_sb      = _load_config_fresh() or {}
+    _active_in_cfg = _cfg_sb.get("symbols", ALL_SYMBOLS)
+
+    st.markdown("**Active Pairs**")
+    active_symbols = [s for s in ALL_SYMBOLS
+                      if st.checkbox(s, value=(s in _active_in_cfg), key=f"cb_{s}")]
+    if not active_symbols:
+        active_symbols = list(_active_in_cfg[:1])
+
+    if set(active_symbols) != set(_active_in_cfg):
+        _cfg_sb["symbols"] = active_symbols
+        CONFIG_PATH.write_text(json.dumps(_cfg_sb, indent=2))
+        st.warning("Restart bot to apply")
+
+    # ── View Symbol ───────────────────────────────────────────────────────────
+    st.markdown("**View Symbol**")
+    selected = st.radio("", active_symbols, label_visibility="collapsed", key="sym_radio")
+
     st.divider()
     if _mt5_connected():
         st.success("🟢 MT5 connected")
