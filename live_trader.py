@@ -257,7 +257,7 @@ def compute_lot(config: dict, balance: float, entry: float, stop: float,
                 pip: float, pip_value: float) -> float:
     risk      = balance * config["risk_per_trade"]
     stop_pips = abs(entry - stop) / pip
-    if stop_pips <= 0:
+    if stop_pips <= 0 or pip_value <= 0:
         return 0.0
     lot = math.floor(risk / (stop_pips * pip_value) * 100) / 100
     if 0 < lot < 0.01:
@@ -873,6 +873,11 @@ def main() -> None:
 
             for sym in list(sym_info.keys()):
                 pip, pip_value = sym_info[sym]
+                if pip_value <= 0:
+                    pip, pip_value = get_symbol_info(sym)
+                    if pip and pip_value > 0:
+                        sym_info[sym] = (pip, pip_value)
+                        logger.info(f"[{sym}] pip_value refreshed: {pip_value:.4f}")
                 sym_cfg = {**config, "symbol": sym}
                 state   = load_state(sym)
 
