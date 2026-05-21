@@ -1520,6 +1520,30 @@ def page_live_trading() -> None:
         last30.reverse()
         st.code("\n".join(last30), language=None)
 
+    # ── Section 8: Scale-Up Checklist ────────────────────────────────────────────
+    st.subheader("8 · Scale-Up Checklist  (0.5% → 1% risk)")
+    with st.expander("Show checklist", expanded=False):
+        st.markdown("""
+Use this checklist before increasing `risk_per_trade` from **0.5% to 1.0%** in Bot Settings.
+
+**Minimum requirements:**
+- [ ] 50+ live trades completed across all symbols
+- [ ] Live expectancy ≥ 0.44R  *(within 20% of OOS backtest 0.552R)*
+- [ ] Live win rate ≥ 44%  *(within 20% of OOS 55.5%)*
+- [ ] At least one drawdown period observed and recovered from
+- [ ] Max live drawdown has not exceeded 10%  *(at 0.5% risk)*
+- [ ] Bot has run uninterrupted for at least 3 months
+
+**If all boxes are ticked:** change `risk_per_trade` to `0.01` in Bot Settings.
+
+**Do not scale up if:**
+- Live expectancy is below 0.35R after 50+ trades
+- You are in an active drawdown
+- You have modified the strategy mid-run
+""")
+
+    st.divider()
+
     # Auto-refresh: render content fully, then sleep 60 s and re-render
     import time as _time2
     st.caption(f"Auto-refreshing every 60 s · {now_utc}")
