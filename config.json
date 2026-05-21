@@ -1,5 +1,11 @@
 {
-  "symbol": "EURUSD",
+  "symbols": [
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "AUDUSD",
+    "USDCAD"
+  ],
   "timeframe": "H4",
   "session_start_utc": 7,
   "session_end_utc": 20,
