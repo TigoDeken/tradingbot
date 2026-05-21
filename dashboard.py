@@ -298,140 +298,223 @@ def _list_runs() -> list[Path]:
 def page_backtest() -> None:
     st.title("📊 Backtest Results")
 
+    _METRICS = [
+        ("total_trades",     "Trades",      ""),
+        ("win_rate_pct",     "Win Rate",    "%"),
+        ("expectancy_net_r", "Expectancy",  " R"),
+        ("net_ev",           "Net EV",      " R"),
+        ("max_drawdown_pct", "Max DD",      "%"),
+        ("trades_per_month", "T/Month",     ""),
+    ]
+
+    def _metric_pair(col_is, col_oos, is_m, oos_m, split_pct):
+        with col_is:
+            st.markdown(f"**In-Sample ({split_pct}%)**")
+            for key, lbl, unit in _METRICS:
+                v = is_m.get(key, 0)
+                st.metric(lbl, f"{v:.1f}{unit}" if isinstance(v, float) else f"{v}{unit}")
+        with col_oos:
+            st.markdown(f"**Out-of-Sample ({100 - split_pct}%)**")
+            for key, lbl, unit in _METRICS:
+                iv, ov = is_m.get(key, 0), oos_m.get(key, 0)
+                try:
+                    delta = round(float(ov) - float(iv), 3)
+                except Exception:
+                    delta = None
+                st.metric(lbl, f"{ov:.1f}{unit}" if isinstance(ov, float) else f"{ov}{unit}", delta=delta)
+
     # ── Run new backtest ──────────────────────────────────────────────────────
     if PIPELINE_OK:
         cfg = _load_config_fresh() or {}
+
+        def _cfg_run_params():
+            return dict(
+                pullback_lookback    = int(cfg.get("pullback_lookback", 4)),
+                stop_buffer          = int(cfg.get("stop_buffer", 5)),
+                tp_mode              = cfg.get("tp_mode", "full"),
+                risk_pct             = float(cfg.get("risk_per_trade", 0.005)),
+                session_start        = int(cfg.get("session_start_utc", 7)),
+                session_end          = int(cfg.get("session_end_utc", 20)),
+                min_stop_pips        = 5, max_lot=10.0,
+                max_open_lots        = float(cfg.get("max_open_lots", 0.0)),
+                min_pyramid_bars     = int(cfg.get("min_pyramid_bars", 4)),
+                pyramid_min_profit_r = float(cfg.get("pyramid_min_profit_r", 0.5)),
+                close_strength       = float(cfg.get("close_strength", 0.6)),
+            )
+
         with st.expander("▶ Run Backtest", expanded=False):
-            rb1, rb2, rb3 = st.columns(3)
-            bars            = rb1.number_input("Bars to fetch",       min_value=100, max_value=50000, value=9999,  step=100)
-            split_pct       = rb2.number_input("In-sample split %",   min_value=10,  max_value=90,    value=70,    step=5)
-            initial_balance = rb3.number_input("Initial balance ($)",  min_value=100, max_value=10_000_000, value=10000, step=500)
+            rb1, rb2, rb3, rb4 = st.columns(4)
+            sym_choice      = rb1.selectbox("Symbol", ["All Symbols"] + ALL_SYMBOLS,
+                                            index=ALL_SYMBOLS.index(selected) + 1)
+            bars            = rb2.number_input("Bars to fetch",      min_value=100, max_value=50000,      value=9999,  step=100)
+            split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
+            initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
             run_btn = st.button("▶ Run with current Bot Settings", type="primary")
 
         if run_btn:
-            prog = st.progress(0, "Fetching data from MT5...")
-            try:
-                df_raw = get_data(bars=bars)
-            except Exception as e:
-                st.error(f"MT5 fetch failed: {e}")
-                return
-
-            prog.progress(40, "Simulating trades...")
-            all_trades = run_trades(
-                df_raw,
-                account_balance=initial_balance,
-                pullback_lookback=int(cfg.get("pullback_lookback", 4)),
-                stop_buffer=int(cfg.get("stop_buffer", 5)),
-                tp_mode=cfg.get("tp_mode", "full"),
-                risk_pct=float(cfg.get("risk_per_trade", 0.005)),
-                session_start=int(cfg.get("session_start_utc", 7)),
-                session_end=int(cfg.get("session_end_utc", 20)),
-                min_stop_pips=5, max_lot=10.0,
-                max_open_lots=float(cfg.get("max_open_lots", 0.0)),
-                min_pyramid_bars=int(cfg.get("min_pyramid_bars", 4)),
-                pyramid_min_profit_r=float(cfg.get("pyramid_min_profit_r", 0.5)),
-                close_strength=float(cfg.get("close_strength", 0.6)),
-            )
-
-            prog.progress(80, "Computing metrics...")
             split_ratio = split_pct / 100
-            split_dt    = df_raw.index[0] + (df_raw.index[-1] - df_raw.index[0]) * split_ratio
-            is_t        = [t for t in all_trades if t.entry_date <  split_dt]
-            oos_t       = [t for t in all_trades if t.entry_date >= split_dt]
-            all_m = compute_metrics(all_trades, initial=initial_balance)
-            is_m  = compute_metrics(is_t,       initial=initial_balance)
-            oos_m = compute_metrics(oos_t,      initial=initial_balance)
-            prog.progress(100, "Done.")
+            params      = _cfg_run_params()
 
-            oos_ev = oos_m.get("net_ev", 0) or 0
-            if oos_ev >= 0:
-                st.success(f"{len(all_trades)} trades  |  OOS net EV: +{oos_ev:.4f} R/trade")
-            else:
-                st.error(f"{len(all_trades)} trades  |  OOS net EV: {oos_ev:.4f} R/trade")
-
-            def _mcol(col, label, m):
-                with col:
-                    st.markdown(f"**{label}**")
-                    st.metric("Trades",     m.get("total_trades", "—"))
-                    st.metric("Win Rate",   f"{m.get('win_rate_pct', 0):.1f}%")
-                    st.metric("Expectancy", f"{m.get('expectancy_net_r', 0):.4f} R")
-                    st.metric("Net EV",     f"{m.get('net_ev', 0):.4f} R")
-                    st.metric("Max DD",     f"{m.get('max_drawdown_pct', 0):.1f}%")
-                    st.metric("T/month",    f"{m.get('trades_per_month', 0):.1f}")
-
-            c1, c2, c3 = st.columns(3)
-            _mcol(c1, "Full Dataset", all_m)
-            _mcol(c2, f"In-Sample ({split_pct}%)", is_m)
-            _mcol(c3, f"Out-of-Sample ({100 - split_pct}%)", oos_m)
-
-            eq = build_equity(all_trades, initial=initial_balance)
-            if not eq.empty:
-                st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
-
-            if all_trades:
-                tbl = pd.DataFrame([{
-                    "id": t.trade_id, "dir": t.direction,
-                    "entry": str(t.entry_date)[:16], "exit": str(t.exit_date)[:16],
-                    "reason": t.exit_reason, "net_pips": t.net_pips,
-                    "net_r": t.net_r, "lot": t.lot_size,
-                } for t in all_trades])
-                st.subheader("Trade Log")
-                st.dataframe(tbl, use_container_width=True, height=350)
-                st.download_button(
-                    "⬇ Download trade log",
-                    data=tbl.to_csv(index=False).encode(),
-                    file_name="trade_log_run.csv", mime="text/csv",
+            def _run_sym(sym):
+                df       = get_data(symbol=sym, bars=bars)
+                trades   = run_trades(df, account_balance=initial_balance, **params)
+                split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
+                is_t     = [t for t in trades if t.entry_date <  split_dt]
+                oos_t    = [t for t in trades if t.entry_date >= split_dt]
+                return (
+                    compute_metrics(is_t,  initial=initial_balance),
+                    compute_metrics(oos_t, initial=initial_balance),
+                    is_t, oos_t, trades,
+                    build_equity(trades, initial=initial_balance),
                 )
+
+            if sym_choice == "All Symbols":
+                prog    = st.progress(0, "Running all symbols...")
+                results = {}
+                for i, sym in enumerate(ALL_SYMBOLS):
+                    prog.progress(int(i / len(ALL_SYMBOLS) * 95), f"Running {sym}...")
+                    try:
+                        results[sym] = _run_sym(sym)
+                    except Exception as e:
+                        results[sym] = None
+                        st.warning(f"{sym}: failed — {e}")
+                prog.progress(100, "Done.")
+
+                # Summary comparison table
+                rows = []
+                for sym, r in results.items():
+                    if r is None:
+                        rows.append({"Symbol": sym, "Trades": "—", "Win Rate %": "—",
+                                     "Expectancy R": "—", "OOS Net EV R": "—",
+                                     "Max DD %": "—", "T/Month": "—"})
+                    else:
+                        _, oos_m = r[0], r[1]
+                        rows.append({
+                            "Symbol":       sym,
+                            "Trades":       oos_m.get("total_trades", 0),
+                            "Win Rate %":   round(oos_m.get("win_rate_pct", 0), 1),
+                            "Expectancy R": round(oos_m.get("expectancy_net_r", 0), 4),
+                            "OOS Net EV R": round(oos_m.get("net_ev", 0) or 0, 4),
+                            "Max DD %":     round(oos_m.get("max_drawdown_pct", 0), 2),
+                            "T/Month":      round(oos_m.get("trades_per_month", 0), 1),
+                        })
+                tbl_df = pd.DataFrame(rows).set_index("Symbol")
+
+                def _color_ev(val):
+                    try:
+                        return "color: green" if float(val) >= 0 else "color: red"
+                    except Exception:
+                        return ""
+
+                st.subheader(f"All Symbols — Out-of-Sample Summary (last {100 - split_pct}%)")
+                st.dataframe(
+                    tbl_df.style.map(_color_ev, subset=["OOS Net EV R"]),
+                    use_container_width=True,
+                )
+
+                # Per-symbol tabs
+                tabs = st.tabs(ALL_SYMBOLS)
+                for tab, sym in zip(tabs, ALL_SYMBOLS):
+                    with tab:
+                        r = results.get(sym)
+                        if r is None:
+                            st.error("Failed to run.")
+                            continue
+                        is_m, oos_m, is_t, oos_t, trades, eq = r
+                        oos_ev = oos_m.get("net_ev", 0) or 0
+                        lbl = f"{sym} — {len(oos_t)} OOS trades | EV: {'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade"
+                        (st.success if oos_ev >= 0 else st.error)(lbl)
+                        if not eq.empty:
+                            st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
+                        _metric_pair(*st.columns(2), is_m, oos_m, split_pct)
+
+            else:
+                prog = st.progress(0, f"Fetching {sym_choice} from MT5...")
+                try:
+                    is_m, oos_m, is_t, oos_t, all_trades, eq = _run_sym(sym_choice)
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+                    return
+                prog.progress(100, "Done.")
+
+                oos_ev = oos_m.get("net_ev", 0) or 0
+                lbl = f"{sym_choice} — {len(all_trades)} trades | OOS EV: {'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade"
+                (st.success if oos_ev >= 0 else st.error)(lbl)
+
+                if not eq.empty:
+                    st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
+
+                _metric_pair(*st.columns(2), is_m, oos_m, split_pct)
+
+                with st.expander("Trade Log", expanded=False):
+                    if all_trades:
+                        tbl = pd.DataFrame([{
+                            "id": t.trade_id, "dir": t.direction,
+                            "entry": str(t.entry_date)[:16], "exit": str(t.exit_date)[:16],
+                            "reason": t.exit_reason,
+                            "net_pips": round(t.net_pips, 1), "net_r": round(t.net_r, 4),
+                            "lot": t.lot_size,
+                        } for t in all_trades])
+                        st.dataframe(tbl, use_container_width=True, height=350)
+                        st.download_button(
+                            "⬇ Download", data=tbl.to_csv(index=False).encode(),
+                            file_name=f"trade_log_{sym_choice}.csv", mime="text/csv",
+                        )
+                    else:
+                        st.warning("No trades generated.")
+
             return
 
         st.divider()
 
-    # ── Saved runs selector ───────────────────────────────────────────────────
+    # ── Saved runs ────────────────────────────────────────────────────────────
     runs = _list_runs()
     if not runs:
         st.info("No saved runs found in `results/`. Use Run Backtest above or run `python backtest_engine.py`.")
         return
 
-    selected_run = st.selectbox(
-        "Select backtest run",
-        options=runs,
-        format_func=lambda p: p.name,
-    )
+    selected_run = st.selectbox("Saved run", options=runs, format_func=lambda p: p.name)
 
     with open(selected_run / "summary.json") as f:
         run_summary = json.load(f)
 
+    sym_label = run_summary.get("symbol", "not recorded (pre-multi-symbol run)")
+    st.caption(f"Symbol: {sym_label}")
+
     is_m_run  = run_summary.get("is",  {})
     oos_m_run = run_summary.get("oos", {})
 
-    # ── Summary metrics from selected run ─────────────────────────────────────
-    compare = [
-        ("total_trades",     "Total Trades",   ""),
-        ("win_rate_pct",     "Win Rate",        "%"),
-        ("expectancy_net_r", "Expectancy",      " R"),
-        ("net_ev",           "Net EV",          " R"),
-        ("net_r",            "Total Net R",     " R"),
-        ("max_drawdown_pct", "Max Drawdown",    "%"),
-        ("trades_per_month", "Trades / Month",  ""),
-    ]
+    ev = oos_m_run.get("net_ev")
+    if ev is not None:
+        lbl = f"{selected_run.name} — OOS Net EV: {'+' if float(ev) >= 0 else ''}{float(ev):.4f} R/trade"
+        (st.success if float(ev) >= 0 else st.error)(lbl)
 
+    eq_path = selected_run / "equity_curve.csv"
+    if eq_path.exists():
+        st.plotly_chart(
+            equity_fig(pd.read_csv(eq_path), split_n=int(is_m_run.get("total_trades", 0)) or None),
+            use_container_width=True,
+        )
+
+    compare = [
+        ("total_trades",     "Trades",        ""),
+        ("win_rate_pct",     "Win Rate",       "%"),
+        ("expectancy_net_r", "Expectancy",     " R"),
+        ("net_ev",           "Net EV",         " R"),
+        ("net_r",            "Total Net R",    " R"),
+        ("max_drawdown_pct", "Max Drawdown",   "%"),
+        ("trades_per_month", "Trades / Month", ""),
+    ]
     col_is, col_oos = st.columns(2)
     with col_is:
-        st.markdown("**In-Sample (first 70%)**")
+        st.markdown("**In-Sample**")
         for key, label, unit in compare:
             v = is_m_run.get(key)
             st.metric(label, f"{v}{unit}" if v is not None else "—")
-        ev = is_m_run.get("net_ev")
-        if ev is not None:
-            if float(ev) >= 0:
-                st.success(f"Net EV: **+{ev:.4f} R/trade**")
-            else:
-                st.error(f"Net EV: **{ev:.4f} R/trade**")
     with col_oos:
-        st.markdown("**Out-of-Sample (last 30%)**")
+        st.markdown("**Out-of-Sample**")
         for key, label, unit in compare:
-            iv = is_m_run.get(key)
-            ov = oos_m_run.get(key)
+            iv, ov = is_m_run.get(key), oos_m_run.get(key)
             delta = None
             if iv is not None and ov is not None:
                 try:
@@ -439,52 +522,32 @@ def page_backtest() -> None:
                 except Exception:
                     pass
             st.metric(label, f"{ov}{unit}" if ov is not None else "—", delta=delta)
-        ev = oos_m_run.get("net_ev")
-        if ev is not None:
-            if float(ev) >= 0:
-                st.success(f"Net EV: **+{ev:.4f} R/trade**")
-            else:
-                st.error(f"Net EV: **{ev:.4f} R/trade**")
 
-    st.divider()
-
-    # ── Equity curve ──────────────────────────────────────────────────────────
-    eq_path = selected_run / "equity_curve.csv"
-    if eq_path.exists():
-        eq_df = pd.read_csv(eq_path)
-        split_n = int(is_m_run.get("total_trades", 0)) or None
-        st.subheader("Equity Curve")
-        st.plotly_chart(equity_fig(eq_df, split_n=split_n), use_container_width=True)
-
-    # ── Recent trades chart ───────────────────────────────────────────────────
     chart_path = selected_run / "chart_trades.png"
     if chart_path.exists():
-        st.subheader("Recent Trades Chart (last 7 days)")
+        st.subheader("Recent Trades Chart")
         st.image(str(chart_path), use_container_width=True)
 
-    # ── Trade log ─────────────────────────────────────────────────────────────
     trade_path = selected_run / "trade_log.csv"
     if trade_path.exists():
-        trade_df = pd.read_csv(trade_path)
-        for c in ("entry_date", "exit_date"):
-            if c in trade_df.columns:
-                trade_df[c] = pd.to_datetime(trade_df[c])
-        show_cols = [c for c in [
-            "trade_id", "direction", "entry_date", "entry_price",
-            "exit_date", "exit_price", "exit_reason",
-            "net_pips", "net_r", "duration_hours",
-        ] if c in trade_df.columns]
-        show = trade_df[show_cols].copy()
-        if "net_pips" in show.columns:
-            show["net_pips"] = show["net_pips"].round(0).astype("Int64")
-        st.subheader("Trade Log")
-        st.dataframe(show, use_container_width=True, height=360)
-        st.download_button(
-            "⬇  Download trade log",
-            data=trade_df.to_csv(index=False).encode(),
-            file_name=f"trade_log_{selected_run.name}.csv",
-            mime="text/csv",
-        )
+        with st.expander("Trade Log", expanded=False):
+            trade_df = pd.read_csv(trade_path)
+            for c in ("entry_date", "exit_date"):
+                if c in trade_df.columns:
+                    trade_df[c] = pd.to_datetime(trade_df[c])
+            show_cols = [c for c in [
+                "trade_id", "direction", "entry_date", "entry_price",
+                "exit_date", "exit_price", "exit_reason", "net_pips", "net_r", "duration_hours",
+            ] if c in trade_df.columns]
+            show = trade_df[show_cols].copy()
+            if "net_pips" in show.columns:
+                show["net_pips"] = show["net_pips"].round(0).astype("Int64")
+            st.dataframe(show, use_container_width=True, height=360)
+            st.download_button(
+                "⬇ Download trade log",
+                data=trade_df.to_csv(index=False).encode(),
+                file_name=f"trade_log_{selected_run.name}.csv", mime="text/csv",
+            )
 
 
 
