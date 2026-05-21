@@ -770,6 +770,12 @@ def _live_mode_confirmation(config: dict, logger: logging.Logger) -> None:
         + sep
     )
     print(banner)
+
+    if "--live-confirmed" in sys.argv:
+        logger.info("Live mode confirmed via --live-confirmed flag.")
+        print("\nConfirmed. Starting live trading engine...\n")
+        return
+
     logger.critical("LIVE TRADING MODE ACTIVE — awaiting terminal confirmation")
 
     answer: list[str] = []
