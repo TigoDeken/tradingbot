@@ -5,3 +5,6 @@ __pycache__/
 results/
 *.png
 *.csv
+state_*.json
+trading_log.txt
+run_comparison.py

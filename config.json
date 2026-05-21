@@ -14,7 +14,7 @@
   "pullback_lookback": 4,
   "stop_buffer": 5,
   "paper_mode": false,
-  "max_drawdown_pct": 5.0,
+  "max_drawdown_pct": 15.0,
   "max_open_lots": 0.0,
   "min_pyramid_bars": 4,
   "pyramid_min_profit_r": 0.5,
