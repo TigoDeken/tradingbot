@@ -87,8 +87,10 @@ def _bar_setup(
             return None
         entry = curr["High"] - pullback_pips * pip
         stop  = prev1["Low"] - stop_buf * pip
-        if entry <= stop or (entry - stop) / pip < min_stop_pips:
+        if entry <= stop:
             return None
+        if (entry - stop) / pip < min_stop_pips:
+            stop = entry - min_stop_pips * pip
         tp1 = entry + 2.0 * (entry - stop)
         return "long", round(entry, 5), round(stop, 5), round(tp1, 5)
 
@@ -98,8 +100,10 @@ def _bar_setup(
             return None
         entry = curr["Low"] + pullback_pips * pip
         stop  = prev1["High"] + stop_buf * pip
-        if entry >= stop or (stop - entry) / pip < min_stop_pips:
+        if entry >= stop:
             return None
+        if (stop - entry) / pip < min_stop_pips:
+            stop = entry + min_stop_pips * pip
         tp1 = entry - 2.0 * (stop - entry)
         return "short", round(entry, 5), round(stop, 5), round(tp1, 5)
 

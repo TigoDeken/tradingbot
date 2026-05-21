@@ -654,6 +654,7 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
                         config.get("stop_buffer", 5), pip, min_stop,
                         close_strength=close_strength)
     if result is None:
+        logger.info(f"[{symbol}] No entry — bar geometry invalid (pullback offset exceeded swing range)")
         return
 
     direction, entry, stop, tp1 = result
