@@ -10,6 +10,7 @@
   "paper_mode": true,
   "max_drawdown_pct": 5.0,
   "max_open_lots": 0.4,
-  "min_pyramid_bars": 2,
+  "min_pyramid_bars": 4,
+  "pyramid_min_profit_r": 0.5,
   "close_strength": 0.6
 }

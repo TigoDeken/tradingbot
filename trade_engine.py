@@ -163,9 +163,10 @@ def run_trades(
     session_end:      int   = 20,
     min_stop_pips:    float = MIN_STOP_PIPS,
     max_lot:          float = MAX_LOT,
-    max_open_lots:    float = 0.0,
-    min_pyramid_bars: int   = 2,
-    close_strength:   float = 0.0,
+    max_open_lots:        float = 0.0,
+    min_pyramid_bars:     int   = 2,
+    pyramid_min_profit_r: float = 0.0,
+    close_strength:       float = 0.0,
     **_kwargs,
 ) -> list[Trade]:
     """
@@ -185,6 +186,7 @@ def run_trades(
         pullback_lookback=pullback_lookback,
         stop_buffer=stop_buffer, tp_mode=tp_mode,
         slippage_pips=slippage_pips, close_strength=close_strength,
+        pyramid_min_profit_r=pyramid_min_profit_r,
     )
 
     for i in range(len(df)):
@@ -291,13 +293,21 @@ def run_trades(
         if open_trades:
             if any(t.direction != direction for t in open_trades):
                 continue  # only add in the same direction
-            # Add's stop must be above original entry (long) / below (short)
-            # — proves price has moved in our favour
             original = open_trades[0]
+            # Add's stop must be beyond original entry — proves price moved our way
             if direction == "long"  and stop <= original.entry_price:
                 continue
             if direction == "short" and stop >= original.entry_price:
                 continue
+            # Minimum profit gate: original must be pyramid_min_profit_r in profit
+            if pyramid_min_profit_r > 0:
+                orig_1r = abs(original.tp1_price - original.entry_price) / 2.0
+                if orig_1r > 0:
+                    profit_r = ((c - original.entry_price) / orig_1r
+                                if direction == "long"
+                                else (original.entry_price - c) / orig_1r)
+                    if profit_r < pyramid_min_profit_r:
+                        continue
 
         lot = _lot_size(account_balance, entry, stop, pip, pip_value, risk_pct,
                         min_stop_pips=min_stop_pips, max_lot=max_lot)
@@ -314,14 +324,19 @@ def run_trades(
             continue
 
         # ── Confirmed fill ────────────────────────────────────────────────────
-        # Lock the most-recent open trade at breakeven + slippage (costs covered)
+        # Lock the most-recent open trade: move stop to prev bar structure,
+        # but never below breakeven + slippage (floor protects against losses)
         if open_trades:
             prev_trade = open_trades[-1]
             be_offset  = round(slippage_pips * pip, 5)
             if direction == "long":
-                prev_trade.stop_price = round(prev_trade.entry_price + be_offset, 5)
+                structure  = df.iloc[i - 1]["Low"] - stop_buffer * pip
+                new_stop   = max(prev_trade.entry_price + be_offset, structure)
+                prev_trade.stop_price = round(new_stop, 5)
             else:
-                prev_trade.stop_price = round(prev_trade.entry_price - be_offset, 5)
+                structure  = df.iloc[i - 1]["High"] + stop_buffer * pip
+                new_stop   = min(prev_trade.entry_price - be_offset, structure)
+                prev_trade.stop_price = round(new_stop, 5)
 
         last_entry_setup = setup_key
         last_open_bar    = i

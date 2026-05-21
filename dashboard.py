@@ -442,11 +442,12 @@ def page_parameter_studio() -> None:
             risk_pct_pct    = rm1.number_input("Risk per trade %",          min_value=0.01, max_value=10.0,  value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f", help="Percentage of account balance risked per trade.")
             min_stop_pips   = rm1.number_input("Min stop distance (pips)",  min_value=1,    max_value=100,   value=5,                              step=1,    help="Setups with a stop smaller than this are skipped (prevents oversizing).")
             max_drawdown_pct= rm1.number_input("Max drawdown % (circuit breaker)", min_value=1.0, max_value=50.0, value=_f("max_drawdown_pct", 5.0), step=0.5, help="Live trader halts if session drawdown hits this level.")
-            max_open_lots   = rm1.number_input("Max open lots (pyramid cap)", min_value=0.0, max_value=100.0, value=_f("max_open_lots", 0.0),       step=0.01, format="%.2f", help="0 = pyramiding disabled. Set to e.g. 0.4 to allow adds up to that total lot exposure.")
+            max_open_lots        = rm1.number_input("Max open lots (pyramid cap)",    min_value=0.0,  max_value=100.0, value=_f("max_open_lots", 0.0),           step=0.01, format="%.2f", help="0 = pyramiding disabled. Set to e.g. 0.4 to allow adds up to that total lot exposure.")
+            pyramid_min_profit_r = rm1.number_input("Min profit before add (R)",     min_value=0.0,  max_value=5.0,   value=_f("pyramid_min_profit_r", 0.5),    step=0.1,  format="%.1f", help="Original trade must be this many R in profit before a pyramid add is allowed. 0 = disabled.")
         with rm2:
             initial_balance = rm2.number_input("Initial balance ($)",       min_value=100,  max_value=10000000, value=10000,                       step=500,  help="Starting capital for the backtest equity simulation.")
             max_lot         = rm2.number_input("Max lot size",              min_value=0.01, max_value=100.0, value=10.0,                           step=0.5,  format="%.2f", help="Hard cap on position size regardless of the risk formula result.")
-            min_pyramid_bars= rm2.number_input("Min bars between adds",     min_value=1,    max_value=20,    value=_i("min_pyramid_bars", 2),       step=1,    help="Minimum 4H bars that must pass before a pyramid add is allowed.")
+            min_pyramid_bars= rm2.number_input("Min bars between adds",     min_value=1,    max_value=20,    value=_i("min_pyramid_bars", 4),       step=1,    help="Minimum 4H bars that must pass before a pyramid add is allowed.")
         risk_pct = risk_pct_pct / 100
         split_ratio = split_pct / 100
 
@@ -468,9 +469,10 @@ def page_parameter_studio() -> None:
             "stop_buffer":       int(stop_buffer),
             "paper_mode":        cfg.get("paper_mode", True),
             "max_drawdown_pct":  float(max_drawdown_pct),
-            "max_open_lots":     float(max_open_lots),
-            "min_pyramid_bars":  int(min_pyramid_bars),
-            "close_strength":    float(close_strength),
+            "max_open_lots":        float(max_open_lots),
+            "min_pyramid_bars":     int(min_pyramid_bars),
+            "pyramid_min_profit_r": float(pyramid_min_profit_r),
+            "close_strength":       float(close_strength),
         }
         Path("config.json").write_text(json.dumps(new_cfg, indent=2))
         st.success("✅ Saved to config.json — live_trader.py will use these on next restart.")
@@ -498,6 +500,7 @@ def page_parameter_studio() -> None:
         session_start=session_start, session_end=session_end,
         min_stop_pips=min_stop_pips, max_lot=max_lot,
         max_open_lots=float(max_open_lots), min_pyramid_bars=int(min_pyramid_bars),
+        pyramid_min_profit_r=float(pyramid_min_profit_r),
         close_strength=float(close_strength),
     )
 
