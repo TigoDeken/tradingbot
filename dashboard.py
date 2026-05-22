@@ -24,7 +24,7 @@ PIPELINE_OK = False
 _import_err  = ""
 try:
     from data_pipeline   import get_data
-    from trade_engine    import run_trades, _grid_levels, _atr
+    from trade_engine    import run_trades, _wm_levels, _atr
     from backtest_engine import build_equity, compute_metrics, _split_date
     PIPELINE_OK = True
 except Exception as e:
@@ -56,7 +56,10 @@ ALL_SYMBOLS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD"]
 
 RESULTS_DIR = Path("results")
 
-PARAM_COLS = ["box_size_pips", "fixed_stop_pips", "tp_rr", "atr_max_pips"]
+PARAM_COLS = ["fixed_stop_pips", "tp_rr", "stop_atr_mult", "atr_max_pips"]
+
+def _pip_for(sym: str) -> float:
+    return 0.01 if "JPY" in sym else PIP
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -250,42 +253,6 @@ def _metric_row(m: dict, prefix: str = "") -> None:
 
 # ── Page 1: Backtest Results ──────────────────────────────────────────────────
 
-# Parameter grid exactly as defined in backtest_engine.py
-_BT_PARAM_DEFS = [
-    # (csv_col,            state_key,  options,                        cast)
-    ("PULLBACK_LOOKBACK",  "bt_pb_lb", [3, 4, 5],                     int),
-    ("STOP_BUFFER",        "bt_sb",    [3, 5, 8, 10],                  int),
-    ("TP_MODE",            "bt_tp",    ["full", "partial", "trail"],   str),
-    ("CLOSE_STRENGTH",     "bt_cs",    [0.0, 0.5, 0.6, 0.7],          float),
-]
-
-
-def _bt_init_state() -> None:
-    for _, sk, opts, _ in _BT_PARAM_DEFS:
-        if sk not in st.session_state:
-            st.session_state[sk] = opts[0]
-
-
-def _bt_set_combo(row) -> None:
-    """Write all parameter values from an opt_df row into session state."""
-    for col, sk, _, cast in _BT_PARAM_DEFS:
-        st.session_state[sk] = cast(row[col])
-
-
-def _bt_lookup(opt_df: pd.DataFrame) -> pd.DataFrame:
-    """Return rows of opt_df matching the current session-state selection."""
-    mask = pd.Series([True] * len(opt_df), index=opt_df.index)
-    for col, sk, _, cast in _BT_PARAM_DEFS:
-        v = st.session_state[sk]
-        if cast is float:
-            mask &= (opt_df[col].astype(float) - float(v)).abs() < 1e-9
-        elif cast is int:
-            mask &= opt_df[col].astype(int) == int(v)
-        else:
-            mask &= opt_df[col].astype(str) == str(v)
-    return opt_df[mask]
-
-
 def _list_runs() -> list[Path]:
     if not RESULTS_DIR.exists():
         return []
@@ -340,20 +307,17 @@ def page_backtest() -> None:
 
         def _cfg_run_params():
             return dict(
-                tp_rr                = float(cfg.get("tp_rr", 1.0)),
-                tp_mode              = cfg.get("tp_mode", "full"),
-                risk_pct             = float(cfg.get("risk_per_trade", 0.01)),
-                session_start        = int(cfg.get("session_start_utc", 7)),
-                session_end          = int(cfg.get("session_end_utc", 20)),
-                min_stop_pips        = 5, max_lot=10.0,
-                max_open_lots        = float(cfg.get("max_open_lots", 0.0)),
-                min_pyramid_bars     = int(cfg.get("min_pyramid_bars", 4)),
-                pyramid_min_profit_r = float(cfg.get("pyramid_min_profit_r", 0.5)),
-                fixed_stop_pips      = float(cfg.get("fixed_stop_pips", 25.0)),
-                box_size_pips        = float(cfg.get("box_size_pips", 50.0)),
-                atr_period           = int(cfg.get("atr_period", 14)),
-                atr_max_pips         = float(cfg.get("atr_max_pips", 0)),
-                stop_atr_mult        = float(cfg.get("stop_atr_mult", 0.0)),
+                tp_rr         = float(cfg.get("tp_rr", 1.0)),
+                tp_mode       = cfg.get("tp_mode", "full"),
+                risk_pct      = float(cfg.get("risk_per_trade", 0.01)),
+                session_start = int(cfg.get("session_start_utc", 7)),
+                session_end   = int(cfg.get("session_end_utc", 20)),
+                min_stop_pips = 5, max_lot=10.0,
+                max_open_lots = float(cfg.get("max_open_lots", 0.0)),
+                fixed_stop_pips = float(cfg.get("fixed_stop_pips", 25.0)),
+                atr_period    = int(cfg.get("atr_period", 14)),
+                atr_max_pips  = float(cfg.get("atr_max_pips", 0)),
+                stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8)),
             )
 
         with st.expander("▶ Run Backtest", expanded=False):
@@ -363,12 +327,6 @@ def page_backtest() -> None:
             bars            = rb2.number_input("Bars to fetch",      min_value=100, max_value=50000,      value=9999,  step=100)
             split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
             initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
-            rb5, rb6 = st.columns([1, 3])
-            expiry_bars_input = rb5.number_input(
-                "Pending order expiry (bars)", min_value=1, max_value=4,
-                value=int(cfg.get("pending_order_expiry_bars", 1)), step=1,
-                help="Cancel unfilled limit orders after this many 4H bars. Compare 1-4 to find optimal.",
-            )
             run_btn = st.button("▶ Run with current Bot Settings", type="primary")
 
         if run_btn:
@@ -392,8 +350,7 @@ def page_backtest() -> None:
                 pip, pip_value = _get_pip_info(sym)
                 df       = get_data(symbol=sym, bars=bars)
                 trades, fill_stats = run_trades(df, account_balance=initial_balance,
-                                                pip=pip, pip_value=pip_value,
-                                                expiry_bars=int(expiry_bars_input), **params)
+                                                pip=pip, pip_value=pip_value, **params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]
@@ -484,8 +441,7 @@ def page_backtest() -> None:
                     if _n:
                         st.caption(
                             f"Fill rate (all symbols): **{_f}/{_n} = "
-                            f"{round(_f/_n*100,1)}%** filled · {_e} expired "
-                            f"(expiry = {int(expiry_bars_input)} bar{'s' if expiry_bars_input != 1 else ''})"
+                            f"{round(_f/_n*100,1)}%** filled · {_e} expired"
                         )
                     st.divider()
 
@@ -532,8 +488,7 @@ def page_backtest() -> None:
                 if _sn:
                     st.caption(
                         f"Signal fill rate: **{sym_fill_stats['fills_total']}/{_sn} = {_fr}%** filled · "
-                        f"{sym_fill_stats['expirations_total']} expired "
-                        f"(expiry = {int(expiry_bars_input)} bar{'s' if expiry_bars_input != 1 else ''})"
+                        f"{sym_fill_stats['expirations_total']} expired"
                     )
 
                 with st.expander("Trade Log", expanded=False):
@@ -700,45 +655,32 @@ def page_bot_settings() -> None:
 
     # ── 2. Entry & Stop ───────────────────────────────────────────────────────
     with st.expander("🎯 Entry & Stop", expanded=True):
+        st.caption("Entries at previous week / month high-low levels. Stop scales with ATR.")
         e1, e2, e3 = st.columns(3)
         with e1:
-            box_size_pips = st.number_input(
-                "Box size (pips)", min_value=10.0, max_value=200.0,
-                value=float(cfg.get("box_size_pips", 50.0)), step=5.0, format="%.0f",
-                help="Grid box height in pips. Grid levels = floor(price/box)*box and +box above."
+            stop_atr_mult = st.number_input(
+                "Stop ATR multiplier", min_value=0.0, max_value=3.0,
+                value=float(cfg.get("stop_atr_mult", 0.8)), step=0.1, format="%.1f",
+                help="Stop = multiplier × 14-bar ATR. Adapts per symbol. 0 = use fixed pips fallback."
             )
-            st.caption(f"currently: {float(cfg.get('box_size_pips', 50.0)):.0f}")
+            st.caption(f"currently: {float(cfg.get('stop_atr_mult', 0.8)):.1f}")
         with e2:
             fixed_stop_pips = st.number_input(
-                "Stop loss (pips)", min_value=5.0, max_value=100.0,
+                "Fixed stop fallback (pips)", min_value=5.0, max_value=100.0,
                 value=float(cfg.get("fixed_stop_pips", 25.0)), step=5.0, format="%.0f",
-                help="Fixed stop loss distance in pips from entry."
+                help="Used when stop_atr_mult = 0."
             )
             st.caption(f"currently: {float(cfg.get('fixed_stop_pips', 25.0)):.0f}")
         with e3:
             tp_rr = st.number_input(
                 "TP R:R target", min_value=0.5, max_value=5.0,
                 value=float(cfg.get("tp_rr", 1.0)), step=0.25, format="%.2f",
-                help="Take profit distance as a multiple of risk (1.0R = 1:1)."
+                help="Take profit = entry ± tp_rr × stop distance."
             )
             st.caption(f"currently: {float(cfg.get('tp_rr', 1.0)):.2f}")
 
-        atr_cols = st.columns(2)
-        with atr_cols[0]:
-            stop_atr_mult = st.number_input(
-                "Stop ATR multiplier (0=fixed pips)", min_value=0.0, max_value=3.0,
-                value=float(cfg.get("stop_atr_mult", 0.0)), step=0.1, format="%.1f",
-                help="Stop = multiplier × 14-bar ATR. Adapts to each symbol's volatility. 0 = use fixed stop pips."
-            )
-            st.caption(f"currently: {float(cfg.get('stop_atr_mult', 0.0)):.1f}")
-        with atr_cols[1]:
-            atr_max_pips = st.number_input(
-                "ATR filter (pips, 0=off)", min_value=0.0, max_value=200.0,
-                value=float(cfg.get("atr_max_pips", 0)), step=1.0, format="%.0f",
-                help="Skip session if 14-bar H4 ATR exceeds this. 0 = disabled."
-            )
-            st.caption(f"currently: {float(cfg.get('atr_max_pips', 0)):.0f}")
-        tp_mode = cfg.get("tp_mode", "full")
+        atr_max_pips = float(cfg.get("atr_max_pips", 0))
+        tp_mode      = cfg.get("tp_mode", "full")
 
     # ── 3. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):
@@ -759,52 +701,15 @@ def page_bot_settings() -> None:
             st.caption(f"currently: {_f('max_drawdown_pct', 5.0):.1f}%")
         risk_pct = risk_pct_pct / 100
 
-    # ── 4. Pyramiding ─────────────────────────────────────────────────────────
-    with st.expander("📈 Pyramiding", expanded=True):
-        max_open_lots = st.number_input(
-            "Max open lots (0 = pyramiding off)", min_value=0.0, max_value=100.0,
-            value=_f("max_open_lots", 0.0), step=0.01, format="%.2f",
-            help="Total lot cap across all adds. 0 disables pyramiding entirely."
-        )
-        st.caption(f"currently: {_f('max_open_lots', 0.0):.2f}")
-
-        pyramid_on = max_open_lots > 0.0
-        if pyramid_on:
-            p1, p2 = st.columns(2)
-            with p1:
-                min_pyramid_bars = st.number_input(
-                    "Min bars between adds", min_value=1, max_value=20,
-                    value=_i("min_pyramid_bars", 4), step=1,
-                    help="Minimum 4H bars that must pass before adding to a position."
-                )
-                st.caption(f"currently: {_i('min_pyramid_bars', 4)}")
-            with p2:
-                pyramid_min_profit_r = st.number_input(
-                    "Min profit before adding (R)", min_value=0.0, max_value=5.0,
-                    value=_f("pyramid_min_profit_r", 0.5), step=0.1, format="%.1f",
-                    help="Original trade must be this many R in profit before an add is allowed."
-                )
-                st.caption(f"currently: {_f('pyramid_min_profit_r', 0.5):.1f}")
-        else:
-            st.caption("Set max open lots > 0 to enable pyramiding settings.")
-            min_pyramid_bars     = _i("min_pyramid_bars", 4)
-            pyramid_min_profit_r = _f("pyramid_min_profit_r", 0.5)
-
     # ── Unsaved changes detection + save ─────────────────────────────────────
     new_vals = {
-        "session_start_utc":    int(session_start),
-        "session_end_utc":      int(session_end),
-        "risk_per_trade":       round(risk_pct, 4),
-        "tp_mode":              tp_mode,
-        "tp_rr":                round(float(tp_rr), 2),
-        "box_size_pips":        float(box_size_pips),
-        "fixed_stop_pips":      float(fixed_stop_pips),
-        "atr_max_pips":         float(atr_max_pips),
-        "stop_atr_mult":        float(stop_atr_mult),
-        "max_drawdown_pct":     float(max_drawdown_pct),
-        "max_open_lots":        float(max_open_lots),
-        "min_pyramid_bars":     int(min_pyramid_bars),
-        "pyramid_min_profit_r": float(pyramid_min_profit_r),
+        "session_start_utc": int(session_start),
+        "session_end_utc":   int(session_end),
+        "risk_per_trade":    round(risk_pct, 4),
+        "tp_rr":             round(float(tp_rr), 2),
+        "stop_atr_mult":     round(float(stop_atr_mult), 1),
+        "fixed_stop_pips":   float(fixed_stop_pips),
+        "max_drawdown_pct":  float(max_drawdown_pct),
     }
 
     changed_keys = [k for k, v in new_vals.items() if _val_changed(k, v)]
@@ -865,24 +770,30 @@ def page_live() -> None:
     c2.metric("Last Candle", str(last_time)[:16])
     st.divider()
 
-    # ── Current bar + grid ────────────────────────────────────────────────────
-    live_cfg  = _load_config_fresh() or {}
-    box_pips  = float(live_cfg.get("box_size_pips", 50.0))
-    stop_pips = float(live_cfg.get("fixed_stop_pips", 25.0))
-    tp_rr_val = float(live_cfg.get("tp_rr", 1.0))
-    atr_max   = float(live_cfg.get("atr_max_pips", 0))
-    atr_period_val = int(live_cfg.get("atr_period", 14))
+    # ── W/M levels + current bar ──────────────────────────────────────────────
+    live_cfg      = _load_config_fresh() or {}
+    tp_rr_val     = float(live_cfg.get("tp_rr", 1.0))
+    stop_atr_m    = float(live_cfg.get("stop_atr_mult", 0.8))
+    fixed_sp      = float(live_cfg.get("fixed_stop_pips", 25.0))
+    atr_period_v  = int(live_cfg.get("atr_period", 14))
+    pip_size      = 0.01 if "JPY" in selected else PIP
 
-    curr     = df_raw.iloc[-1]
-    lvl_lo, lvl_hi = _grid_levels(curr["Open"], box_pips, PIP)
-    stop_d   = stop_pips * PIP
-    long_sl  = round(lvl_lo - stop_d, 5)
-    long_tp  = round(lvl_lo + tp_rr_val * stop_d, 5)
-    short_sl = round(lvl_hi + stop_d, 5)
-    short_tp = round(lvl_hi - tp_rr_val * stop_d, 5)
+    curr        = df_raw.iloc[-1]
+    current_atr = _atr(df_raw, len(df_raw), atr_period_v)
+    atr_pips    = current_atr / pip_size
+    stop_d      = (stop_atr_m * current_atr) if stop_atr_m > 0 else (fixed_sp * pip_size)
+    stop_d_pips = stop_d / pip_size
 
-    current_atr = _atr(df_raw, len(df_raw), atr_period_val) / PIP
-    atr_ok = atr_max == 0 or current_atr <= atr_max
+    _agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    weekly_df_live  = df_raw.resample("W").agg(_agg).dropna()
+    monthly_df_live = df_raw.resample("ME").agg(_agg).dropna()
+    all_levels = _wm_levels(weekly_df_live, monthly_df_live, df_raw.index[-1])
+
+    price  = curr["Open"]
+    below  = [lv for lv in all_levels if lv < price - stop_d]
+    above  = [lv for lv in all_levels if lv > price + stop_d]
+    lvl_lo = max(below) if below else None
+    lvl_hi = min(above) if above else None
 
     col_bars, col_sig = st.columns(2)
     with col_bars:
@@ -892,30 +803,40 @@ def page_live() -> None:
             "Low": curr["Low"], "Close": curr["Close"],
         }])
         st.dataframe(bar_data.round(5), use_container_width=True)
-        st.metric("ATR (14-bar H4)", f"{current_atr:.1f} pip",
-                  delta="ranging ✓" if atr_ok else f"trending — skip (>{atr_max:.0f}pip)")
+        st.metric("ATR (14-bar H4)", f"{atr_pips:.1f} pip")
+        st.metric("Stop distance",   f"{stop_d_pips:.1f} pip  ({stop_atr_m:.1f}× ATR)")
+
+        st.markdown("**All W/M Levels**")
+        for lv in sorted(all_levels, reverse=True):
+            dist = (lv - price) / pip_size
+            tag  = "↑" if lv > price else "↓"
+            st.caption(f"{lv:.5f}  {tag}  ({dist:+.1f} pip)")
 
     with col_sig:
-        st.subheader("Grid Levels")
-        if not atr_ok:
-            st.warning(f"ATR {current_atr:.1f}pip > {atr_max:.0f}pip — session skipped (trending)")
-        elif curr["Low"] <= lvl_lo:
-            st.success(f"**LONG** hit @ {lvl_lo:.5f}")
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Entry", f"{lvl_lo:.5f}")
-            p2.metric("Stop",  f"{long_sl:.5f}", delta=f"{stop_pips:.0f}pip")
-            p3.metric("TP",    f"{long_tp:.5f}", delta=f"{stop_pips*tp_rr_val:.0f}pip")
-        elif curr["High"] >= lvl_hi:
-            st.success(f"**SHORT** hit @ {lvl_hi:.5f}")
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Entry", f"{lvl_hi:.5f}")
-            p2.metric("Stop",  f"{short_sl:.5f}", delta=f"{stop_pips:.0f}pip")
-            p3.metric("TP",    f"{short_tp:.5f}", delta=f"{stop_pips*tp_rr_val:.0f}pip")
+        st.subheader("Active Setup")
+        if lvl_lo is None and lvl_hi is None:
+            st.info("No W/M level within range of current price.")
         else:
-            st.info(f"Pending: BUY @ {lvl_lo:.5f}  |  SELL @ {lvl_hi:.5f}")
-            p1, p2 = st.columns(2)
-            p1.metric("Buy level",  f"{lvl_lo:.5f}")
-            p2.metric("Sell level", f"{lvl_hi:.5f}")
+            if lvl_lo and curr["Low"] <= lvl_lo:
+                entry = lvl_lo; sl = round(entry - stop_d, 5); tp = round(entry + tp_rr_val * stop_d, 5)
+                st.success(f"**LONG** — level {entry:.5f} touched")
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Entry", f"{entry:.5f}")
+                p2.metric("Stop",  f"{sl:.5f}", delta=f"-{stop_d_pips:.0f}pip")
+                p3.metric("TP",    f"{tp:.5f}",  delta=f"+{stop_d_pips*tp_rr_val:.0f}pip")
+            elif lvl_hi and curr["High"] >= lvl_hi:
+                entry = lvl_hi; sl = round(entry + stop_d, 5); tp = round(entry - tp_rr_val * stop_d, 5)
+                st.success(f"**SHORT** — level {entry:.5f} touched")
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Entry", f"{entry:.5f}")
+                p2.metric("Stop",  f"{sl:.5f}", delta=f"+{stop_d_pips:.0f}pip")
+                p3.metric("TP",    f"{tp:.5f}",  delta=f"-{stop_d_pips*tp_rr_val:.0f}pip")
+            else:
+                st.info("No level touched this bar — watching for fills.")
+                if lvl_lo:
+                    st.metric("Buy limit", f"{lvl_lo:.5f}", delta=f"{(lvl_lo-price)/pip_size:+.1f} pip")
+                if lvl_hi:
+                    st.metric("Sell limit", f"{lvl_hi:.5f}", delta=f"{(lvl_hi-price)/pip_size:+.1f} pip")
 
     st.divider()
 
@@ -984,11 +905,11 @@ def parse_live_trades(lines: list[str]) -> pd.DataFrame:
     return df
 
 
-def _rolling_ev_df(trd_df: pd.DataFrame) -> pd.DataFrame:
+def _rolling_ev_df(trd_df: pd.DataFrame, pip: float = PIP) -> pd.DataFrame:
     """Compute per-trade R and rolling EV series from a paper-trade DataFrame."""
     if trd_df.empty:
         return pd.DataFrame()
-    _sp = (trd_df["entry_price"] - trd_df["stop_price"]).abs() / 0.0001
+    _sp = (trd_df["entry_price"] - trd_df["stop_price"]).abs() / pip
     nr  = (trd_df["net_pips"] / _sp.replace(0, float("nan"))).values
     idx = trd_df["trade_#"].values if "trade_#" in trd_df.columns else np.arange(1, len(trd_df) + 1)
     s   = pd.Series(nr)
@@ -1021,7 +942,7 @@ def _mt5_account_info() -> dict | None:
         return None
 
 
-def _sidebar_kpis() -> dict:
+def _sidebar_kpis(sym: str = "EURUSD") -> dict:
     """Return net_ev, max_dd, win_rate from best available source.
     Priority: paper trades > backtest OOS CSV.
     (Live trades lack net_pips in current log format.)
@@ -1029,11 +950,12 @@ def _sidebar_kpis() -> dict:
     rk    = st.session_state.get("live_refresh_key", 0)
     lines = load_log_lines(rk)
     paper = parse_paper_trades(lines)
+    _pip  = _pip_for(sym)
 
     if not paper.empty:
         wins  = (paper["net_pips"] > 0).sum()
         total = len(paper)
-        _sp   = (paper["entry_price"] - paper["stop_price"]).abs() / 0.0001
+        _sp   = (paper["entry_price"] - paper["stop_price"]).abs() / _pip
         _nr   = paper["net_pips"] / _sp.replace(0, float("nan"))
         wr_f  = wins / total
         lr_f  = (total - wins) / total
@@ -1238,19 +1160,15 @@ def page_live_trading() -> None:
     if not state:
         st.info(f"state_{selected}.json not found. Start live_trader.py first.")
     else:
-        regime   = state.get("last_regime", "—")
         cb_on    = state.get("circuit_breaker_active", False)
         cb_rsn   = state.get("circuit_breaker_reason", "")
         last_upd = state.get("last_updated", "—")
         open_t   = state.get("open_trade")
         pending  = state.get("pending_limit")
 
-        r_map = {"UPTREND": "🟢 UPTREND", "DOWNTREND": "🔴 DOWNTREND",
-                 "AMBIGUOUS": "⚫ AMBIGUOUS"}
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Regime",          r_map.get(regime, regime))
-        s2.metric("Circuit Breaker", "🔴 TRIGGERED" if cb_on else "🟢 ACTIVE")
-        s3.metric("Last Candle",     str(last_upd)[:19])
+        s1, s2 = st.columns(2)
+        s1.metric("Circuit Breaker", "🔴 TRIGGERED" if cb_on else "🟢 ACTIVE")
+        s2.metric("Last Candle",     str(last_upd)[:19])
 
         if cb_on and cb_rsn:
             st.error(f"CB reason: {cb_rsn}")
@@ -1343,7 +1261,7 @@ def page_live_trading() -> None:
         )
     else:
         _ev_src = _paper_for_ev if not _paper_for_ev.empty else pd.DataFrame()
-        _rev2   = _rolling_ev_df(_ev_src) if not _ev_src.empty else pd.DataFrame()
+        _rev2   = _rolling_ev_df(_ev_src, pip=_pip_for(selected)) if not _ev_src.empty else pd.DataFrame()
 
         if _rev2.empty:
             st.info("Insufficient data for rolling EV chart.")
@@ -1452,13 +1370,14 @@ def page_live_trading() -> None:
         except Exception:
             return None
 
+    _sym_pip = _pip_for(selected)
     def _paper_stats(trd: pd.DataFrame) -> dict:
         if trd.empty:
             return {}
         wins   = (trd["net_pips"] > 0).sum()
         total  = len(trd)
         wr     = wins / total * 100 if total else 0
-        _sp    = (trd["entry_price"] - trd["stop_price"]).abs() / 0.0001
+        _sp    = (trd["entry_price"] - trd["stop_price"]).abs() / _sym_pip
         _nr    = trd["net_pips"] / _sp.replace(0, float("nan"))
         exp    = float(_nr.mean()) if not _nr.empty else 0.0
         avg_w  = float(_nr[trd["net_pips"] > 0].mean()) if wins else None
@@ -1485,7 +1404,7 @@ def page_live_trading() -> None:
 
     # Paper net EV
     if not paper_trd.empty:
-        _rev = _rolling_ev_df(paper_trd)
+        _rev = _rolling_ev_df(paper_trd, pip=_sym_pip)
         if not _rev.empty:
             paper_s["net_ev"] = float(_rev["ev_all"].iloc[-1])
 
@@ -1579,10 +1498,14 @@ def page_live_trading() -> None:
         st.markdown("""
 Use this checklist before increasing `risk_per_trade` from **0.5% to 1.0%** in Bot Settings.
 
+**Strategy reference (W/M level mean-reversion, OOS backtest):**
+- OOS expectancy: **+0.452 R/trade**
+- OOS win rate: **68.8%**
+
 **Minimum requirements:**
 - [ ] 50+ live trades completed across all symbols
-- [ ] Live expectancy ≥ 0.44R  *(within 20% of OOS backtest 0.552R)*
-- [ ] Live win rate ≥ 44%  *(within 20% of OOS 55.5%)*
+- [ ] Live expectancy ≥ 0.36R  *(within 20% of OOS +0.452R)*
+- [ ] Live win rate ≥ 55%  *(within 20% of OOS 68.8%)*
 - [ ] At least one drawdown period observed and recovered from
 - [ ] Max live drawdown has not exceeded 10%  *(at 0.5% risk)*
 - [ ] Bot has run uninterrupted for at least 3 months
@@ -1590,7 +1513,7 @@ Use this checklist before increasing `risk_per_trade` from **0.5% to 1.0%** in B
 **If all boxes are ticked:** change `risk_per_trade` to `0.01` in Bot Settings.
 
 **Do not scale up if:**
-- Live expectancy is below 0.35R after 50+ trades
+- Live expectancy is below 0.25R after 50+ trades
 - You are in an active drawdown
 - You have modified the strategy mid-run
 """)
@@ -1705,7 +1628,7 @@ with st.sidebar:
 
     # ── KPI indicators ────────────────────────────────────────────────────────
     st.divider()
-    _kpis = _sidebar_kpis()
+    _kpis = _sidebar_kpis(selected)
     if _kpis:
         _src_label = "paper" if _kpis.get("source") == "paper" else "backtest OOS"
         st.caption(f"KPIs from {_src_label}")
