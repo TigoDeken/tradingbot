@@ -1,10 +1,9 @@
 {
   "symbols": [
-    "EURUSD",
-    "USDJPY",
-    "GBPUSD",
-    "AUDUSD",
-    "USDCAD"
+    "EURUSD#",
+    "USDJPY#",
+    "GBPUSD#",
+    "AUDUSD#"
   ],
   "timeframe": "H4",
   "session_start_utc": 3,
