@@ -3,7 +3,8 @@
     "EURUSD#",
     "USDJPY#",
     "GBPUSD#",
-    "AUDUSD#"
+    "AUDUSD#",
+    "USDCAD#"
   ],
   "timeframe": "H4",
   "session_start_utc": 3,
