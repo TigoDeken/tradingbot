@@ -16,6 +16,7 @@ PULLBACK_LOOKBACK = 4
 STOP_BUFFER       = 5        # pips
 TP_MODE           = "full"   # "full" | "partial"
 SLIPPAGE_PIPS     = 3
+COMMISSION_RT_USD = 7.0      # round-trip commission per lot (raw account)
 ACCOUNT_BALANCE   = 10_000.0
 MIN_STOP_PIPS     = 10.0     # floor to prevent degenerate lot sizing
 MAX_LOT           = 10.0     # hard cap on position size
@@ -45,6 +46,8 @@ class Trade:
     gross_r:             Optional[float]        = None
     net_r:               Optional[float]        = None
     duration_hours:      Optional[float]        = None
+
+    commission_usd:      Optional[float]        = None
 
     # Internal partial-mode state (not part of output)
     _tp1_hit:            bool            = field(default=False,  repr=False)
@@ -124,12 +127,14 @@ def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: 
 
 
 def _close(
-    trade:     Trade,
-    exit_date: pd.Timestamp,
-    exit_px:   float,
-    reason:    str,
-    pip:       float,
-    slippage:  float,
+    trade:         Trade,
+    exit_date:     pd.Timestamp,
+    exit_px:       float,
+    reason:        str,
+    pip:           float,
+    slippage:      float,
+    pip_value:     float = PIP_VALUE,
+    commission_rt: float = COMMISSION_RT_USD,
 ) -> None:
     sign = 1 if trade.direction == "long" else -1
 
@@ -140,17 +145,20 @@ def _close(
     else:
         gross = sign * (exit_px - trade.entry_price) / pip
 
-    net       = gross - slippage     # slippage always costs (reduces wins, magnifies losses)
+    commission_usd  = commission_rt * trade.lot_size
+    commission_pips = commission_usd / pip_value
+    net       = gross - slippage - commission_pips
     risk_pips = abs(trade.tp1_price - trade.entry_price) / pip / 2.0
 
-    trade.exit_date     = exit_date
-    trade.exit_price    = round(exit_px, 5)
-    trade.exit_reason   = reason
-    trade.gross_pips    = round(gross, 1)
-    trade.net_pips      = round(net,   1)
-    trade.gross_r       = round(gross / risk_pips, 2) if risk_pips else 0.0
-    trade.net_r         = round(net   / risk_pips, 2) if risk_pips else 0.0
+    trade.exit_date      = exit_date
+    trade.exit_price     = round(exit_px, 5)
+    trade.exit_reason    = reason
+    trade.gross_pips     = round(gross, 1)
+    trade.net_pips       = round(net,   1)
+    trade.gross_r        = round(gross / risk_pips, 2) if risk_pips else 0.0
+    trade.net_r          = round(net   / risk_pips, 2) if risk_pips else 0.0
     trade.duration_hours = round((exit_date - trade.entry_date).total_seconds() / 3600, 1)
+    trade.commission_usd = round(commission_usd, 2)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -173,6 +181,7 @@ def run_trades(
     min_pyramid_bars:     int   = 2,
     pyramid_min_profit_r: float = 0.0,
     close_strength:       float = 0.0,
+    commission_rt:        float = COMMISSION_RT_USD,
     **_kwargs,
 ) -> list[Trade]:
     """
@@ -217,7 +226,7 @@ def run_trades(
                             ot._trail_stop = recent_high
                 ts = ot._trail_stop or ot.entry_price
                 if (long and c < ts) or (not long and c > ts):
-                    _close(ot, bar_date, c, "trail_exit", pip, slippage_pips)
+                    _close(ot, bar_date, c, "trail_exit", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(ot); open_trades.remove(ot); any_closed = True; continue
 
             else:
@@ -236,11 +245,11 @@ def run_trades(
                 # Stop takes priority over TP within the same bar
                 if long:
                     if l <= ot.stop_price:
-                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips)
+                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
                         trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                     if h >= ot.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
-                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips)
+                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
                             trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                         else:
                             ot._tp1_hit   = True
@@ -248,11 +257,11 @@ def run_trades(
                             ot._trail_stop = ot.entry_price
                 else:
                     if h >= ot.stop_price:
-                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips)
+                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
                         trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                     if l <= ot.tp1_price and tp_mode != "trail":
                         if tp_mode == "full":
-                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips)
+                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
                             trades.append(ot); open_trades.remove(ot); any_closed = True; continue
                         else:
                             ot._tp1_hit   = True
@@ -358,11 +367,11 @@ def run_trades(
         # Same-bar exit for the newly opened trade
         if direction == "long":
             if l <= stop:
-                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips)
+                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips, pip_value, commission_rt)
                 trades.append(new_trade); open_trades.remove(new_trade)
             elif h >= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
-                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips)
+                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(new_trade); open_trades.remove(new_trade)
                 else:
                     new_trade._tp1_hit   = True
@@ -370,11 +379,11 @@ def run_trades(
                     new_trade._trail_stop = entry
         else:
             if h >= stop:
-                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips)
+                _close(new_trade, bar_date, stop, "stop", pip, slippage_pips, pip_value, commission_rt)
                 trades.append(new_trade); open_trades.remove(new_trade)
             elif l <= tp1 and tp_mode != "trail":
                 if tp_mode == "full":
-                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips)
+                    _close(new_trade, bar_date, tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(new_trade); open_trades.remove(new_trade)
                 else:
                     new_trade._tp1_hit   = True
@@ -383,7 +392,7 @@ def run_trades(
 
     # Close any trades still open at end of data
     for ot in open_trades:
-        _close(ot, df.index[-1], df["Close"].iloc[-1], "end_of_data", pip, slippage_pips)
+        _close(ot, df.index[-1], df["Close"].iloc[-1], "end_of_data", pip, slippage_pips, pip_value, commission_rt)
         trades.append(ot)
 
     return trades

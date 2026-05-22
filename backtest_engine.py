@@ -148,9 +148,11 @@ def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
         "max_drawdown_days":  max_dd_days,
         "avg_duration_hours": round(np.mean([t.duration_hours or 0 for t in trades]), 1),
         "trades_per_month":   tpm,
-        # Slippage
-        "slippage_total_pips": n * SLIPPAGE_PIPS,
-        "gross_expectancy_r":  round(gross_r_total / n, 4),
+        # Costs
+        "slippage_total_pips":  n * SLIPPAGE_PIPS,
+        "commission_total_usd": round(sum(t.commission_usd or 0 for t in trades), 2),
+        "commission_per_trade": round(sum(t.commission_usd or 0 for t in trades) / n, 2),
+        "gross_expectancy_r":   round(gross_r_total / n, 4),
     }
 
 
@@ -221,12 +223,14 @@ def print_metrics(m: dict, label: str = "") -> None:
     print(f"  Avg trade duration       {m['avg_duration_hours']} hours")
     print(f"  Trades per month         {m['trades_per_month']}")
 
-    print(f"\nSLIPPAGE IMPACT")
+    print(f"\nTRADING COSTS")
     print(SEP)
-    print(f"  Total pips lost          {m['slippage_total_pips']}")
+    print(f"  Slippage (total pips)    {m['slippage_total_pips']}")
+    print(f"  Commission (total $)     ${m['commission_total_usd']:,.2f}")
+    print(f"  Commission (per trade)   ${m['commission_per_trade']:.2f}")
     print(f"  Gross expectancy         {m['gross_expectancy_r']} R")
     print(f"  Net expectancy           {m['expectancy_net_r']} R")
-    print(f"  Slippage drag            {round(m['gross_expectancy_r'] - m['expectancy_net_r'], 4)} R/trade")
+    print(f"  Cost drag                {round(m['gross_expectancy_r'] - m['expectancy_net_r'], 4)} R/trade")
 
 
 def compare_is_oos(is_m: dict, oos_m: dict) -> None:
@@ -410,9 +414,10 @@ def export_trades_csv(trades: list, path: str = "trade_log.csv") -> None:
         "gross_r":        t.gross_r,
         "net_r":          t.net_r,
         "duration_hours": t.duration_hours,
-        "lot_size":       t.lot_size,
-        "regime":         t.regime,
-        "trend_strength": t.trend_strength,
+        "lot_size":        t.lot_size,
+        "commission_usd":  t.commission_usd,
+        "regime":          t.regime,
+        "trend_strength":  t.trend_strength,
         **t.params,
     } for t in trades]
     pd.DataFrame(rows).to_csv(path, index=False)
