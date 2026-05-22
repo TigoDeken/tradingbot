@@ -308,34 +308,31 @@ def page_backtest() -> None:
     ]
 
     def _metric_pair(col_is, col_oos, is_m, oos_m, split_pct):
-        with col_is:
-            st.markdown(f"**In-Sample ({split_pct}%)**")
-            for key, lbl, unit in _METRICS:
-                v = is_m.get(key, 0)
-                st.metric(lbl, f"{v:.1f}{unit}" if isinstance(v, float) else f"{v}{unit}")
-            st.divider()
-            st.markdown("**Trading Costs**")
-            st.metric("EV pre-commission",  f"{is_m.get('ev_pre_commission',  0):.4f} R")
-            st.metric("EV post-commission", f"{is_m.get('ev_post_commission', 0):.4f} R")
-            st.metric("Commission drag",    f"{round((is_m.get('ev_pre_commission', 0) or 0) - (is_m.get('ev_post_commission', 0) or 0), 4):.4f} R/trade")
-            st.metric("Commission total",   f"${is_m.get('commission_total_usd', 0):,.0f}")
-        with col_oos:
-            st.markdown(f"**Out-of-Sample ({100 - split_pct}%)**")
-            for key, lbl, unit in _METRICS:
-                iv, ov = is_m.get(key, 0), oos_m.get(key, 0)
-                try:
-                    delta = round(float(ov) - float(iv), 3)
-                except Exception:
-                    delta = None
-                st.metric(lbl, f"{ov:.1f}{unit}" if isinstance(ov, float) else f"{ov}{unit}", delta=delta)
-            st.divider()
-            st.markdown("**Trading Costs**")
-            pre  = oos_m.get('ev_pre_commission',  0) or 0
-            post = oos_m.get('ev_post_commission', 0) or 0
-            st.metric("EV pre-commission",  f"{pre:.4f} R")
-            st.metric("EV post-commission", f"{post:.4f} R")
-            st.metric("Commission drag",    f"{round(pre - post, 4):.4f} R/trade")
-            st.metric("Commission total",   f"${oos_m.get('commission_total_usd', 0):,.0f}")
+        col_is.markdown(f"**In-Sample ({split_pct}%)**")
+        col_oos.markdown(f"**Out-of-Sample ({100 - split_pct}%)**")
+
+        for key, lbl, unit in _METRICS:
+            iv, ov = is_m.get(key, 0), oos_m.get(key, 0)
+            fmt = lambda v, u=unit: f"{v:.1f}{u}" if isinstance(v, float) else f"{v}{u}"
+            try:
+                delta = round(float(ov) - float(iv), 3)
+            except Exception:
+                delta = None
+            col_is.metric(lbl,  fmt(iv))
+            col_oos.metric(lbl, fmt(ov), delta=delta)
+
+        col_is.divider()
+        col_oos.divider()
+        col_is.markdown("**Trading Costs**")
+        col_oos.markdown("**Trading Costs**")
+
+        for m, col in [(is_m, col_is), (oos_m, col_oos)]:
+            pre  = m.get('ev_pre_commission',  0) or 0
+            post = m.get('ev_post_commission', 0) or 0
+            col.metric("EV pre-commission",  f"{pre:.3f} R")
+            col.metric("EV post-commission", f"{post:.3f} R")
+            col.metric("Commission drag",    f"{round(pre - post, 3):.3f} R/trade")
+            col.metric("Commission total",   f"${m.get('commission_total_usd', 0):,.0f}")
 
     # ── Run new backtest ──────────────────────────────────────────────────────
     if PIPELINE_OK:
