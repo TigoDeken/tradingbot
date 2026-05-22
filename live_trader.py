@@ -23,7 +23,7 @@ import pandas as pd
 
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
 from constants     import MAGIC
-from trade_engine  import _bar_setup, MIN_STOP_PIPS
+from trade_engine  import _grid_levels, _atr, MIN_STOP_PIPS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH         = Path("config.json")
@@ -632,7 +632,7 @@ def _check_live_pending(config: dict, state: dict, symbol: str,
 
 def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
                 pip: float, pip_value: float, logger: logging.Logger) -> None:
-    if len(df) < 3:
+    if len(df) < 1:
         return
 
     bar_time = df.index[-1]
@@ -643,65 +643,43 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         )
         return
 
-    prev2 = df.iloc[-3]
-    prev1 = df.iloc[-2]
-    curr  = df.iloc[-1]
-
+    curr = df.iloc[-1]
     logger.info(
-        f"[{symbol}] Evaluating bars:"
-        f"\n  prev2  O={prev2['Open']:.5f}  H={prev2['High']:.5f}  L={prev2['Low']:.5f}  C={prev2['Close']:.5f}"
-        f"\n  prev1  O={prev1['Open']:.5f}  H={prev1['High']:.5f}  L={prev1['Low']:.5f}  C={prev1['Close']:.5f}"
-        f"\n  curr   O={curr['Open']:.5f}  H={curr['High']:.5f}  L={curr['Low']:.5f}  C={curr['Close']:.5f}"
+        f"[{symbol}] Evaluating bar: O={curr['Open']:.5f}  H={curr['High']:.5f}"
+        f"  L={curr['Low']:.5f}  C={curr['Close']:.5f}"
     )
 
-    p1_took_high = prev1["High"] > prev2["High"]
-    p1_took_low  = prev1["Low"]  < prev2["Low"]
-    c_took_high  = curr["High"]  > prev1["High"]
-    c_took_low   = curr["Low"]   < prev1["Low"]
-    bar_range    = curr["High"] - curr["Low"]
-    close_pos    = ((curr["Close"] - curr["Low"]) / bar_range) if bar_range > 0 else 0.5
-    close_strength = config.get("close_strength", 0.6)
+    atr_max = float(config.get("atr_max_pips", 0))
+    if atr_max > 0:
+        current_atr = _atr(df, len(df), int(config.get("atr_period", 14))) / pip
+        if current_atr > atr_max:
+            logger.info(f"[{symbol}] Skip — ATR {current_atr:.1f}pip > threshold {atr_max:.0f}pip (trending)")
+            return
 
-    logger.info(
-        f"[{symbol}] Bar conditions:"
-        f"\n  prev1 broke high={p1_took_high}  prev1 broke low={p1_took_low}"
-        f"\n  curr  broke high={c_took_high}   curr  broke low={c_took_low}"
-        f"\n  close_pos={close_pos:.2f}  "
-        f"(need >={close_strength:.2f} long / <={(1-close_strength):.2f} short)"
-    )
+    tp_rr           = float(config.get("tp_rr", 1.0))
+    fixed_stop_pips = float(config.get("fixed_stop_pips", 25.0))
+    box_size_pips   = float(config.get("box_size_pips", 50.0))
+    stop_d          = fixed_stop_pips * pip
+    lvl_lo, lvl_hi  = _grid_levels(curr["Open"], box_size_pips, pip)
 
-    long_struct  = p1_took_high and not p1_took_low and c_took_high and not c_took_low
-    short_struct = p1_took_low  and not p1_took_high and c_took_low and not c_took_high
+    logger.info(f"[{symbol}] Grid: buy@{lvl_lo:.5f}  sell@{lvl_hi:.5f}  stop={fixed_stop_pips}pip")
 
-    if long_struct:
-        if close_pos < close_strength:
-            logger.info(f"[{symbol}] No entry — LONG structure valid but close too weak ({close_pos:.2f} < {close_strength:.2f})")
-    elif short_struct:
-        if close_pos > (1.0 - close_strength):
-            logger.info(f"[{symbol}] No entry — SHORT structure valid but close too weak ({close_pos:.2f} > {1-close_strength:.2f})")
+    # Determine which level was hit this bar
+    if curr["Low"] <= lvl_lo:
+        direction = "long"
+        entry = lvl_lo
+        stop  = round(lvl_lo - stop_d, 5)
+        tp1   = round(lvl_lo + tp_rr * stop_d, 5)
+    elif curr["High"] >= lvl_hi:
+        direction = "short"
+        entry = lvl_hi
+        stop  = round(lvl_hi + stop_d, 5)
+        tp1   = round(lvl_hi - tp_rr * stop_d, 5)
     else:
-        reasons = []
-        if not (p1_took_high and not p1_took_low):
-            reasons.append("prev1 not clean up-break")
-        if not (p1_took_low and not p1_took_high):
-            reasons.append("prev1 not clean down-break")
-        logger.info(f"[{symbol}] No entry — no clean consecutive breakout ({', '.join(reasons)})")
-
-    lb      = config.get("pullback_lookback", 4)
-    factor  = config.get("pullback_factor", 1.0)
-    pb_pips = float(np.median([
-        (df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
-        for j in range(max(0, len(df) - lb - 1), len(df) - 1)
-    ])) * factor
-    min_stop = config.get("min_stop_pips", MIN_STOP_PIPS)
-    logger.debug(f"[{symbol}] Pullback: {pb_pips:.1f}pip (factor={factor})  min_stop: {min_stop:.0f}pip")
-
-    result = _bar_setup(prev2, prev1, curr, pb_pips,
-                        config.get("stop_buffer", 5), pip, min_stop,
-                        close_strength=close_strength)
-    if result is None:
-        logger.info(f"[{symbol}] No entry — bar geometry invalid (pullback offset exceeded swing range)")
+        logger.info(f"[{symbol}] No entry — bar did not touch either grid level")
         return
+
+    result = (direction, entry, stop, tp1)
 
     direction, entry, stop, tp1 = result
     stop_pips = abs(entry - stop) / pip

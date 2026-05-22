@@ -24,7 +24,7 @@ PIPELINE_OK = False
 _import_err  = ""
 try:
     from data_pipeline   import get_data
-    from trade_engine    import run_trades, _bar_setup
+    from trade_engine    import run_trades, _grid_levels, _atr
     from backtest_engine import build_equity, compute_metrics, _split_date
     PIPELINE_OK = True
 except Exception as e:
@@ -56,7 +56,7 @@ ALL_SYMBOLS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD"]
 
 RESULTS_DIR = Path("results")
 
-PARAM_COLS = ["PULLBACK_LOOKBACK", "STOP_BUFFER", "TP_MODE", "CLOSE_STRENGTH"]
+PARAM_COLS = ["box_size_pips", "fixed_stop_pips", "tp_rr", "atr_max_pips"]
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -340,18 +340,19 @@ def page_backtest() -> None:
 
         def _cfg_run_params():
             return dict(
-                pullback_lookback    = int(cfg.get("pullback_lookback", 4)),
-                pullback_factor      = float(cfg.get("pullback_factor", 1.0)),
-                stop_buffer          = int(cfg.get("stop_buffer", 5)),
+                tp_rr                = float(cfg.get("tp_rr", 1.0)),
                 tp_mode              = cfg.get("tp_mode", "full"),
-                risk_pct             = float(cfg.get("risk_per_trade", 0.005)),
+                risk_pct             = float(cfg.get("risk_per_trade", 0.01)),
                 session_start        = int(cfg.get("session_start_utc", 7)),
                 session_end          = int(cfg.get("session_end_utc", 20)),
                 min_stop_pips        = 5, max_lot=10.0,
                 max_open_lots        = float(cfg.get("max_open_lots", 0.0)),
                 min_pyramid_bars     = int(cfg.get("min_pyramid_bars", 4)),
                 pyramid_min_profit_r = float(cfg.get("pyramid_min_profit_r", 0.5)),
-                close_strength       = float(cfg.get("close_strength", 0.6)),
+                fixed_stop_pips      = float(cfg.get("fixed_stop_pips", 25.0)),
+                box_size_pips        = float(cfg.get("box_size_pips", 50.0)),
+                atr_period           = int(cfg.get("atr_period", 14)),
+                atr_max_pips         = float(cfg.get("atr_max_pips", 0)),
             )
 
         with st.expander("▶ Run Backtest", expanded=False):
@@ -698,44 +699,39 @@ def page_bot_settings() -> None:
 
     # ── 2. Entry & Stop ───────────────────────────────────────────────────────
     with st.expander("🎯 Entry & Stop", expanded=True):
-        e1, e2, e3, e4 = st.columns(4)
+        e1, e2, e3 = st.columns(3)
         with e1:
-            pullback_lookback = st.number_input(
-                "Entry offset lookback (bars)", min_value=1, max_value=20,
-                value=_i("pullback_lookback", 4), step=1,
-                help="Bars used to calculate the median pullback distance for the limit entry."
+            box_size_pips = st.number_input(
+                "Box size (pips)", min_value=10.0, max_value=200.0,
+                value=float(cfg.get("box_size_pips", 50.0)), step=5.0, format="%.0f",
+                help="Grid box height in pips. Grid levels = floor(price/box)*box and +box above."
             )
-            st.caption(f"currently: {_i('pullback_lookback', 4)}")
+            st.caption(f"currently: {float(cfg.get('box_size_pips', 50.0)):.0f}")
         with e2:
-            pullback_factor = st.number_input(
-                "Pullback factor", min_value=0.5, max_value=5.0,
-                value=float(cfg.get("pullback_factor", 1.0)), step=0.5, format="%.1f",
-                help="Multiplier on the median H-L range. Higher = deeper pullback entry, higher WR, fewer fills."
+            fixed_stop_pips = st.number_input(
+                "Stop loss (pips)", min_value=5.0, max_value=100.0,
+                value=float(cfg.get("fixed_stop_pips", 25.0)), step=5.0, format="%.0f",
+                help="Fixed stop loss distance in pips from entry."
             )
-            st.caption(f"currently: {float(cfg.get('pullback_factor', 1.0)):.1f}")
+            st.caption(f"currently: {float(cfg.get('fixed_stop_pips', 25.0)):.0f}")
         with e3:
-            stop_buffer = st.number_input(
-                "Stop beyond swing (pips)", min_value=0, max_value=50,
-                value=_i("stop_buffer", 5), step=1,
-                help="Extra pips added beyond the swing low/high for the stop loss."
+            tp_rr = st.number_input(
+                "TP R:R target", min_value=0.5, max_value=5.0,
+                value=float(cfg.get("tp_rr", 1.0)), step=0.25, format="%.2f",
+                help="Take profit distance as a multiple of risk (1.0R = 1:1)."
             )
-            st.caption(f"currently: {_i('stop_buffer', 5)}")
-        with e4:
-            close_strength = st.number_input(
-                "Signal bar close quality (0 = off)", min_value=0.0, max_value=0.9,
-                value=_f("close_strength", 0.6), step=0.05, format="%.2f",
-                help="Signal bar must close in the top/bottom fraction of its range. 0 = disabled."
-            )
-            st.caption(f"currently: {_f('close_strength', 0.6):.2f}")
+            st.caption(f"currently: {float(cfg.get('tp_rr', 1.0)):.2f}")
 
-        tp_opts = ["full", "partial", "trail"]
-        tp_val  = cfg.get("tp_mode", "full")
-        tp_idx  = tp_opts.index(tp_val) if tp_val in tp_opts else 0
-        tp_mode = st.selectbox(
-            "Take profit mode", tp_opts, index=tp_idx,
-            help="full = close entire position at TP1.  partial = half at TP1, trail the rest."
-        )
-        st.caption(f"currently: {cfg.get('tp_mode', 'full')}")
+        atr_cols = st.columns(2)
+        with atr_cols[0]:
+            atr_max_pips = st.number_input(
+                "ATR filter (pips, 0=off)", min_value=0.0, max_value=50.0,
+                value=float(cfg.get("atr_max_pips", 0)), step=1.0, format="%.0f",
+                help="Skip session if 14-bar H4 ATR exceeds this. 0 = disabled. Try 10-15 to cut trending sessions."
+            )
+            st.caption(f"currently: {float(cfg.get('atr_max_pips', 0)):.0f}")
+        with atr_cols[1]:
+            tp_mode = cfg.get("tp_mode", "full")
 
     # ── 3. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):
@@ -793,10 +789,10 @@ def page_bot_settings() -> None:
         "session_end_utc":      int(session_end),
         "risk_per_trade":       round(risk_pct, 4),
         "tp_mode":              tp_mode,
-        "pullback_lookback":    int(pullback_lookback),
-        "pullback_factor":      round(float(pullback_factor), 2),
-        "stop_buffer":          int(stop_buffer),
-        "close_strength":       round(float(close_strength), 2),
+        "tp_rr":                round(float(tp_rr), 2),
+        "box_size_pips":        float(box_size_pips),
+        "fixed_stop_pips":      float(fixed_stop_pips),
+        "atr_max_pips":         float(atr_max_pips),
         "max_drawdown_pct":     float(max_drawdown_pct),
         "max_open_lots":        float(max_open_lots),
         "min_pyramid_bars":     int(min_pyramid_bars),
@@ -830,17 +826,6 @@ def page_live() -> None:
         )
         return
 
-    # Load best params from optimisation results
-    opt_df = load_opt()
-    if opt_df is not None:
-        best   = opt_df.iloc[0]
-        params = {c: best[c] for c in PARAM_COLS}
-        st.caption(f"Using best out-of-sample parameters (rank #1 by OOS expectancy): {dict(params)}")
-    else:
-        from trade_engine  import PULLBACK_LOOKBACK, STOP_BUFFER, TP_MODE
-        params = dict(PULLBACK_LOOKBACK=PULLBACK_LOOKBACK, STOP_BUFFER=STOP_BUFFER, TP_MODE=TP_MODE)
-        st.info("No optimisation results found — using default parameters.")
-
     # Refresh button (bumps cache key)
     if "refresh_key" not in st.session_state:
         st.session_state.refresh_key = 0
@@ -872,52 +857,57 @@ def page_live() -> None:
     c2.metric("Last Candle", str(last_time)[:16])
     st.divider()
 
-    # ── Last 3 bars ───────────────────────────────────────────────────────────
-    if len(df_raw) >= 3:
-        prev2 = df_raw.iloc[-3]
-        prev1 = df_raw.iloc[-2]
-        curr  = df_raw.iloc[-1]
+    # ── Current bar + grid ────────────────────────────────────────────────────
+    live_cfg  = _load_config_fresh() or {}
+    box_pips  = float(live_cfg.get("box_size_pips", 50.0))
+    stop_pips = float(live_cfg.get("fixed_stop_pips", 25.0))
+    tp_rr_val = float(live_cfg.get("tp_rr", 1.0))
+    atr_max   = float(live_cfg.get("atr_max_pips", 0))
+    atr_period_val = int(live_cfg.get("atr_period", 14))
 
-        lb   = int(params.get("PULLBACK_LOOKBACK", 4))
-        sb   = float(params.get("STOP_BUFFER", 5))
-        pb_pips = float(np.median(
-            [(df_raw.iloc[j]["High"] - df_raw.iloc[j]["Low"]) / PIP
-             for j in range(max(0, len(df_raw) - lb), len(df_raw))]
-        ))
+    curr     = df_raw.iloc[-1]
+    lvl_lo, lvl_hi = _grid_levels(curr["Open"], box_pips, PIP)
+    stop_d   = stop_pips * PIP
+    long_sl  = round(lvl_lo - stop_d, 5)
+    long_tp  = round(lvl_lo + tp_rr_val * stop_d, 5)
+    short_sl = round(lvl_hi + stop_d, 5)
+    short_tp = round(lvl_hi - tp_rr_val * stop_d, 5)
 
-        from trade_engine import MIN_STOP_PIPS
-        result = _bar_setup(prev2, prev1, curr, pb_pips, sb, PIP, MIN_STOP_PIPS)
+    current_atr = _atr(df_raw, len(df_raw), atr_period_val) / PIP
+    atr_ok = atr_max == 0 or current_atr <= atr_max
 
-        col_bars, col_sig = st.columns(2)
-        with col_bars:
-            st.subheader("Last 3 Bars")
-            bar_data = pd.DataFrame([
-                {"bar": "prev2", "Open": prev2["Open"], "High": prev2["High"],
-                 "Low": prev2["Low"], "Close": prev2["Close"]},
-                {"bar": "prev1", "Open": prev1["Open"], "High": prev1["High"],
-                 "Low": prev1["Low"], "Close": prev1["Close"]},
-                {"bar": "curr",  "Open": curr["Open"],  "High": curr["High"],
-                 "Low": curr["Low"],  "Close": curr["Close"]},
-            ])
-            st.dataframe(bar_data.round(5), use_container_width=True)
+    col_bars, col_sig = st.columns(2)
+    with col_bars:
+        st.subheader("Current Bar")
+        bar_data = pd.DataFrame([{
+            "Open": curr["Open"], "High": curr["High"],
+            "Low": curr["Low"], "Close": curr["Close"],
+        }])
+        st.dataframe(bar_data.round(5), use_container_width=True)
+        st.metric("ATR (14-bar H4)", f"{current_atr:.1f} pip",
+                  delta="ranging ✓" if atr_ok else f"trending — skip (>{atr_max:.0f}pip)")
 
-        with col_sig:
-            st.subheader("Projected Signal")
-            if result is None:
-                st.info("No consecutive bar setup detected on the last 3 bars.")
-            else:
-                direction, entry, stop, tp1 = result
-                rr = abs(tp1 - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0
-                st.success(f"**{direction.upper()} SETUP**")
-                p1, p2, p3, p4 = st.columns(4)
-                p1.metric("Entry", f"{entry:.5f}")
-                p2.metric("Stop",  f"{stop:.5f}",
-                          delta=f"{int(round(abs(entry - stop) / PIP))} pip risk")
-                p3.metric("TP",    f"{tp1:.5f}",
-                          delta=f"{int(round(abs(tp1 - entry) / PIP))} pip target")
-                p4.metric("R:R",   f"1 : {rr:.2f}")
-    else:
-        st.info("Not enough bars to evaluate setup.")
+    with col_sig:
+        st.subheader("Grid Levels")
+        if not atr_ok:
+            st.warning(f"ATR {current_atr:.1f}pip > {atr_max:.0f}pip — session skipped (trending)")
+        elif curr["Low"] <= lvl_lo:
+            st.success(f"**LONG** hit @ {lvl_lo:.5f}")
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Entry", f"{lvl_lo:.5f}")
+            p2.metric("Stop",  f"{long_sl:.5f}", delta=f"{stop_pips:.0f}pip")
+            p3.metric("TP",    f"{long_tp:.5f}", delta=f"{stop_pips*tp_rr_val:.0f}pip")
+        elif curr["High"] >= lvl_hi:
+            st.success(f"**SHORT** hit @ {lvl_hi:.5f}")
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Entry", f"{lvl_hi:.5f}")
+            p2.metric("Stop",  f"{short_sl:.5f}", delta=f"{stop_pips:.0f}pip")
+            p3.metric("TP",    f"{short_tp:.5f}", delta=f"{stop_pips*tp_rr_val:.0f}pip")
+        else:
+            st.info(f"Pending: BUY @ {lvl_lo:.5f}  |  SELL @ {lvl_hi:.5f}")
+            p1, p2 = st.columns(2)
+            p1.metric("Buy level",  f"{lvl_lo:.5f}")
+            p2.metric("Sell level", f"{lvl_hi:.5f}")
 
     st.divider()
 
