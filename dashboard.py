@@ -313,6 +313,12 @@ def page_backtest() -> None:
             for key, lbl, unit in _METRICS:
                 v = is_m.get(key, 0)
                 st.metric(lbl, f"{v:.1f}{unit}" if isinstance(v, float) else f"{v}{unit}")
+            st.divider()
+            st.markdown("**Trading Costs**")
+            st.metric("EV pre-commission",  f"{is_m.get('ev_pre_commission',  0):.4f} R")
+            st.metric("EV post-commission", f"{is_m.get('ev_post_commission', 0):.4f} R")
+            st.metric("Commission drag",    f"{round((is_m.get('ev_pre_commission', 0) or 0) - (is_m.get('ev_post_commission', 0) or 0), 4):.4f} R/trade")
+            st.metric("Commission total",   f"${is_m.get('commission_total_usd', 0):,.0f}")
         with col_oos:
             st.markdown(f"**Out-of-Sample ({100 - split_pct}%)**")
             for key, lbl, unit in _METRICS:
@@ -322,6 +328,14 @@ def page_backtest() -> None:
                 except Exception:
                     delta = None
                 st.metric(lbl, f"{ov:.1f}{unit}" if isinstance(ov, float) else f"{ov}{unit}", delta=delta)
+            st.divider()
+            st.markdown("**Trading Costs**")
+            pre  = oos_m.get('ev_pre_commission',  0) or 0
+            post = oos_m.get('ev_post_commission', 0) or 0
+            st.metric("EV pre-commission",  f"{pre:.4f} R")
+            st.metric("EV post-commission", f"{post:.4f} R")
+            st.metric("Commission drag",    f"{round(pre - post, 4):.4f} R/trade")
+            st.metric("Commission total",   f"${oos_m.get('commission_total_usd', 0):,.0f}")
 
     # ── Run new backtest ──────────────────────────────────────────────────────
     if PIPELINE_OK:
