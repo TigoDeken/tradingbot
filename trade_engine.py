@@ -48,6 +48,7 @@ class Trade:
     duration_hours:      Optional[float]        = None
 
     commission_usd:      Optional[float]        = None
+    net_r_pre_commission: Optional[float]       = None
 
     # Internal partial-mode state (not part of output)
     _tp1_hit:            bool            = field(default=False,  repr=False)
@@ -157,8 +158,10 @@ def _close(
     trade.net_pips       = round(net,   1)
     trade.gross_r        = round(gross / risk_pips, 2) if risk_pips else 0.0
     trade.net_r          = round(net   / risk_pips, 2) if risk_pips else 0.0
-    trade.duration_hours = round((exit_date - trade.entry_date).total_seconds() / 3600, 1)
-    trade.commission_usd = round(commission_usd, 2)
+    trade.duration_hours      = round((exit_date - trade.entry_date).total_seconds() / 3600, 1)
+    trade.commission_usd      = round(commission_usd, 2)
+    net_pre                   = gross - slippage
+    trade.net_r_pre_commission = round(net_pre / risk_pips, 2) if risk_pips else 0.0
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────

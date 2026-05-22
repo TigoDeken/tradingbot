@@ -149,10 +149,12 @@ def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
         "avg_duration_hours": round(np.mean([t.duration_hours or 0 for t in trades]), 1),
         "trades_per_month":   tpm,
         # Costs
-        "slippage_total_pips":  n * SLIPPAGE_PIPS,
-        "commission_total_usd": round(sum(t.commission_usd or 0 for t in trades), 2),
-        "commission_per_trade": round(sum(t.commission_usd or 0 for t in trades) / n, 2),
-        "gross_expectancy_r":   round(gross_r_total / n, 4),
+        "slippage_total_pips":    n * SLIPPAGE_PIPS,
+        "commission_total_usd":   round(sum(t.commission_usd or 0 for t in trades), 2),
+        "commission_per_trade":   round(sum(t.commission_usd or 0 for t in trades) / n, 2),
+        "gross_expectancy_r":     round(gross_r_total / n, 4),
+        "ev_pre_commission":      round(sum(t.net_r_pre_commission or 0 for t in trades) / n, 4),
+        "ev_post_commission":     round(net_r_total / n, 4),
     }
 
 
@@ -228,9 +230,9 @@ def print_metrics(m: dict, label: str = "") -> None:
     print(f"  Slippage (total pips)    {m['slippage_total_pips']}")
     print(f"  Commission (total $)     ${m['commission_total_usd']:,.2f}")
     print(f"  Commission (per trade)   ${m['commission_per_trade']:.2f}")
-    print(f"  Gross expectancy         {m['gross_expectancy_r']} R")
-    print(f"  Net expectancy           {m['expectancy_net_r']} R")
-    print(f"  Cost drag                {round(m['gross_expectancy_r'] - m['expectancy_net_r'], 4)} R/trade")
+    print(f"  EV pre-commission        {m['ev_pre_commission']} R/trade")
+    print(f"  EV post-commission       {m['ev_post_commission']} R/trade")
+    print(f"  Commission drag          {round(m['ev_pre_commission'] - m['ev_post_commission'], 4)} R/trade")
 
 
 def compare_is_oos(is_m: dict, oos_m: dict) -> None:
