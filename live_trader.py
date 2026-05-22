@@ -343,7 +343,8 @@ def _send_order(request: dict, logger: logging.Logger,
             return result
         logger.error(
             f"{description} attempt {attempt}/{ORDER_RETRY_LIMIT} failed: "
-            f"retcode={getattr(result, 'retcode', None)}"
+            f"retcode={getattr(result, 'retcode', None)}  "
+            f"comment={getattr(result, 'comment', None)}"
         )
         time.sleep(1)
     raise TradingHalt(f"{description} failed after {ORDER_RETRY_LIMIT} attempts")
