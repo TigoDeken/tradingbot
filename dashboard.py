@@ -348,9 +348,12 @@ def page_backtest() -> None:
 
             def _run_sym(sym):
                 pip, pip_value = _get_pip_info(sym)
-                df       = get_data(symbol=sym, bars=bars)
+                df = get_data(symbol=sym, bars=bars)
+                sym_sessions = cfg.get("symbol_sessions", {})
+                sym_s, sym_e = sym_sessions.get(sym, [params["session_start"], params["session_end"]])
+                sym_params = {**params, "session_start": sym_s, "session_end": sym_e}
                 trades, fill_stats = run_trades(df, account_balance=initial_balance,
-                                                pip=pip, pip_value=pip_value, **params)
+                                                pip=pip, pip_value=pip_value, **sym_params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]

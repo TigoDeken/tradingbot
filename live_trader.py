@@ -434,7 +434,17 @@ def live_modify_sl(config: dict, position: mt5.TradePosition, new_sl: float,
 # ── Session check ─────────────────────────────────────────────────────────────
 
 def in_session(config: dict, ts: pd.Timestamp) -> bool:
-    return config["session_start_utc"] <= ts.hour < config["session_end_utc"]
+    sym_sessions = config.get("symbol_sessions", {})
+    sym = config.get("symbol", "")
+    if sym in sym_sessions:
+        s, e = sym_sessions[sym]
+    else:
+        s, e = config["session_start_utc"], config["session_end_utc"]
+    h = ts.hour
+    if s < e:
+        return s <= h < e
+    else:  # wraps midnight
+        return h >= s or h < e
 
 
 # ── Trail stop helper ─────────────────────────────────────────────────────────

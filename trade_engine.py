@@ -60,8 +60,12 @@ class Trade:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _in_session(ts: pd.Timestamp, session_start: int = 7, session_end: int = 20) -> bool:
-    """True if ts (UTC) falls within the configured session window."""
-    return session_start <= ts.hour < session_end
+    """True if ts (UTC) falls within the session window. Supports wrap-around (e.g. 22→10)."""
+    h = ts.hour
+    if session_start < session_end:
+        return session_start <= h < session_end
+    else:  # wraps midnight, e.g. 22→10
+        return h >= session_start or h < session_end
 
 
 def _atr(df: pd.DataFrame, i: int, period: int = 14) -> float:
@@ -131,7 +135,7 @@ def _close(
     commission_usd  = commission_rt * trade.lot_size
     commission_pips = commission_usd / pip_value
     net       = gross - slippage - commission_pips
-    risk_pips = abs(trade.tp1_price - trade.entry_price) / pip / 2.0
+    risk_pips = abs(trade.entry_price - trade.stop_price) / pip
 
     trade.exit_date      = exit_date
     trade.exit_price     = round(exit_px, 5)
