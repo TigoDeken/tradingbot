@@ -285,60 +285,60 @@ def run_trades(
         # ── 2a. Check pending (non-pyramid) limit fill / expiry ──────────────
         if pending_entry and not open_trades:
             elapsed = i - pending_entry["bar_idx"]
-            if elapsed >= expiry_bars:
-                expirations_total += 1
+            _dir    = pending_entry["direction"]
+            _entry  = pending_entry["entry"]
+            _stop   = pending_entry["stop"]
+            _tp1    = pending_entry["tp1"]
+            _lot    = pending_entry["lot"]
+            # Fill is checked before expiry so the final bar still gets a chance
+            _filled = (_dir == "long"  and l <= _entry) or \
+                      (_dir == "short" and h >= _entry)
+            if _filled:
+                fills_total  += 1
                 pending_entry = None
-            else:
-                _dir   = pending_entry["direction"]
-                _entry = pending_entry["entry"]
-                _stop  = pending_entry["stop"]
-                _tp1   = pending_entry["tp1"]
-                _lot   = pending_entry["lot"]
-                _filled = (_dir == "long"  and l <= _entry) or \
-                          (_dir == "short" and h >= _entry)
-                if _filled:
-                    fills_total   += 1
-                    pending_entry  = None
-                    last_open_bar  = i
-                    trade_id      += 1
-                    new_trade = Trade(
-                        trade_id       = trade_id,
-                        direction      = _dir,
-                        entry_date     = bar_date,
-                        entry_price    = _entry,
-                        stop_price     = _stop,
-                        tp1_price      = _tp1,
-                        lot_size       = _lot,
-                        regime         = _dir.upper() + "_SETUP",
-                        trend_strength = None,
-                        params         = params.copy(),
-                    )
-                    open_trades.append(new_trade)
-                    # Same-bar exit check for freshly filled entry
-                    if _dir == "long":
-                        if l <= _stop:
-                            _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                last_open_bar = i
+                trade_id     += 1
+                new_trade = Trade(
+                    trade_id       = trade_id,
+                    direction      = _dir,
+                    entry_date     = bar_date,
+                    entry_price    = _entry,
+                    stop_price     = _stop,
+                    tp1_price      = _tp1,
+                    lot_size       = _lot,
+                    regime         = _dir.upper() + "_SETUP",
+                    trend_strength = None,
+                    params         = params.copy(),
+                )
+                open_trades.append(new_trade)
+                # Same-bar exit check for freshly filled entry
+                if _dir == "long":
+                    if l <= _stop:
+                        _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                        trades.append(new_trade); open_trades.remove(new_trade)
+                    elif h >= _tp1 and tp_mode != "trail":
+                        if tp_mode == "full":
+                            _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                             trades.append(new_trade); open_trades.remove(new_trade)
-                        elif h >= _tp1 and tp_mode != "trail":
-                            if tp_mode == "full":
-                                _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
-                                trades.append(new_trade); open_trades.remove(new_trade)
-                            else:
-                                new_trade._tp1_hit   = True
-                                new_trade._tp1_pips  = (_tp1 - _entry) / pip
-                                new_trade._trail_stop = _entry
-                    else:
-                        if h >= _stop:
-                            _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                        else:
+                            new_trade._tp1_hit   = True
+                            new_trade._tp1_pips  = (_tp1 - _entry) / pip
+                            new_trade._trail_stop = _entry
+                else:
+                    if h >= _stop:
+                        _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                        trades.append(new_trade); open_trades.remove(new_trade)
+                    elif l <= _tp1 and tp_mode != "trail":
+                        if tp_mode == "full":
+                            _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                             trades.append(new_trade); open_trades.remove(new_trade)
-                        elif l <= _tp1 and tp_mode != "trail":
-                            if tp_mode == "full":
-                                _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
-                                trades.append(new_trade); open_trades.remove(new_trade)
-                            else:
-                                new_trade._tp1_hit   = True
-                                new_trade._tp1_pips  = (_entry - _tp1) / pip
-                                new_trade._trail_stop = _entry
+                        else:
+                            new_trade._tp1_hit   = True
+                            new_trade._tp1_pips  = (_entry - _tp1) / pip
+                            new_trade._trail_stop = _entry
+            elif elapsed >= expiry_bars:
+                expirations_total += 1
+                pending_entry      = None
 
         # Skip new signal generation while waiting for a pending entry to fill
         if not open_trades and pending_entry is not None:
