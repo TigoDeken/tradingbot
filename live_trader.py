@@ -40,6 +40,10 @@ POLL_INTERVAL       = 30
 class TradingHalt(Exception):
     pass
 
+class OrderSkip(Exception):
+    """Entry order failed — skip this symbol this candle, do not halt."""
+    pass
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -365,7 +369,10 @@ def live_place_limit(config: dict, state: dict, direction: str, entry: float,
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_RETURN,
     }
-    result = _send_order(request, logger, f"[{sym}] Place {direction.upper()} limit @ {entry:.5f}")
+    try:
+        result = _send_order(request, logger, f"[{sym}] Place {direction.upper()} limit @ {entry:.5f}")
+    except TradingHalt as e:
+        raise OrderSkip(str(e))
     state["pending_limit"] = {
         "direction": direction, "price": entry,
         "stop": stop, "tp1": tp1, "lot": lot, "ticket": result.order,
@@ -898,7 +905,10 @@ def main() -> None:
 
                 if prev_last is None or current_last > prev_last:
                     last_bar_times[sym] = current_last
-                    run_candle(sym_cfg, state, df, sym, pip, pip_value, logger)
+                    try:
+                        run_candle(sym_cfg, state, df, sym, pip, pip_value, logger)
+                    except OrderSkip as e:
+                        logger.error(f"[{sym}] Order placement failed — skipping this candle: {e}")
                     processed_any = True
                 else:
                     logger.debug(f"[{sym}] No new candle. Last: {prev_last}")
@@ -914,7 +924,10 @@ def main() -> None:
                     state   = load_state(sym)
                     df = fetch_data(sym_cfg, logger)
                     last_bar_times[sym] = df.index[-1]
-                    run_candle(sym_cfg, state, df, sym, pip, pip_value, logger)
+                    try:
+                        run_candle(sym_cfg, state, df, sym, pip, pip_value, logger)
+                    except OrderSkip as e:
+                        logger.error(f"[{sym}] Order placement failed — skipping this candle: {e}")
                 logger.info("--once flag: exiting.")
                 break
 
