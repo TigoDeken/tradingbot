@@ -353,6 +353,7 @@ def page_backtest() -> None:
                 box_size_pips        = float(cfg.get("box_size_pips", 50.0)),
                 atr_period           = int(cfg.get("atr_period", 14)),
                 atr_max_pips         = float(cfg.get("atr_max_pips", 0)),
+                stop_atr_mult        = float(cfg.get("stop_atr_mult", 0.0)),
             )
 
         with st.expander("▶ Run Backtest", expanded=False):
@@ -724,14 +725,20 @@ def page_bot_settings() -> None:
 
         atr_cols = st.columns(2)
         with atr_cols[0]:
+            stop_atr_mult = st.number_input(
+                "Stop ATR multiplier (0=fixed pips)", min_value=0.0, max_value=3.0,
+                value=float(cfg.get("stop_atr_mult", 0.0)), step=0.1, format="%.1f",
+                help="Stop = multiplier × 14-bar ATR. Adapts to each symbol's volatility. 0 = use fixed stop pips."
+            )
+            st.caption(f"currently: {float(cfg.get('stop_atr_mult', 0.0)):.1f}")
+        with atr_cols[1]:
             atr_max_pips = st.number_input(
-                "ATR filter (pips, 0=off)", min_value=0.0, max_value=50.0,
+                "ATR filter (pips, 0=off)", min_value=0.0, max_value=200.0,
                 value=float(cfg.get("atr_max_pips", 0)), step=1.0, format="%.0f",
-                help="Skip session if 14-bar H4 ATR exceeds this. 0 = disabled. Try 10-15 to cut trending sessions."
+                help="Skip session if 14-bar H4 ATR exceeds this. 0 = disabled."
             )
             st.caption(f"currently: {float(cfg.get('atr_max_pips', 0)):.0f}")
-        with atr_cols[1]:
-            tp_mode = cfg.get("tp_mode", "full")
+        tp_mode = cfg.get("tp_mode", "full")
 
     # ── 3. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):
@@ -793,6 +800,7 @@ def page_bot_settings() -> None:
         "box_size_pips":        float(box_size_pips),
         "fixed_stop_pips":      float(fixed_stop_pips),
         "atr_max_pips":         float(atr_max_pips),
+        "stop_atr_mult":        float(stop_atr_mult),
         "max_drawdown_pct":     float(max_drawdown_pct),
         "max_open_lots":        float(max_open_lots),
         "min_pyramid_bars":     int(min_pyramid_bars),

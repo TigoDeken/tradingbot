@@ -54,6 +54,7 @@ class Trade:
     _tp1_hit:            bool            = field(default=False,  repr=False)
     _tp1_pips:           float           = field(default=0.0,    repr=False)
     _trail_stop:         Optional[float] = field(default=None,   repr=False)
+    _consec_fav:         int             = field(default=0,      repr=False)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -80,6 +81,19 @@ def _grid_levels(price: float, box_size_pips: float, pip: float) -> tuple[float,
     box = box_size_pips * pip
     idx = math.floor(round(price / box, 6))
     return round(idx * box, 5), round((idx + 1) * box, 5)
+
+
+def _wm_levels(weekly_df: pd.DataFrame, monthly_df: pd.DataFrame,
+               bar_time: pd.Timestamp) -> list[float]:
+    """Previous week H/L and previous month H/L as candidate levels."""
+    levels = []
+    pw = weekly_df[weekly_df.index < bar_time]
+    if len(pw) >= 1:
+        levels += [pw.iloc[-1]["High"], pw.iloc[-1]["Low"]]
+    pm = monthly_df[monthly_df.index < bar_time]
+    if len(pm) >= 1:
+        levels += [pm.iloc[-1]["High"], pm.iloc[-1]["Low"]]
+    return sorted(set(round(l, 5) for l in levels))
 
 
 def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: float,
@@ -158,6 +172,9 @@ def run_trades(
     box_size_pips:        float = 50.0,
     atr_period:           int   = 14,
     atr_max_pips:         float = 0.0,
+    stop_atr_mult:        float = 0.0, # 0 = use fixed_stop_pips; >0 = stop = mult * ATR
+    consec_bars_exit:     int   = 0,
+    strong_bar_exit:      float = 0.0,
     **_kwargs,
 ) -> tuple[list[Trade], dict]:
     """
@@ -172,19 +189,20 @@ def run_trades(
     trade_id          = 0
     last_open_bar:    int             = -999  # bar index when last trade opened
 
-    session_long:     dict | None     = None  # buy limit at box lower level
-    session_short:    dict | None     = None  # sell limit at box upper level
-    current_session_date              = None  # date session orders were last set
+    session_long:      dict | None     = None
+    session_short:     dict | None     = None
+    current_session_date              = None
     signals_total     = 0
     fills_total       = 0
     expirations_total = 0
 
-    params = dict(
-        pullback_lookback=pullback_lookback,
-        stop_buffer=stop_buffer, tp_mode=tp_mode,
-        slippage_pips=slippage_pips, close_strength=close_strength,
-        pyramid_min_profit_r=pyramid_min_profit_r,
-    )
+    params = dict(stop_buffer=stop_buffer, tp_mode=tp_mode,
+                  slippage_pips=slippage_pips, box_size_pips=box_size_pips)
+
+    # Pre-compute weekly and monthly OHLC (used for level lookup)
+    _agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    weekly_df  = df.resample("W").agg(_agg).dropna()
+    monthly_df = df.resample("ME").agg(_agg).dropna()
 
     for i in range(len(df)):
         row      = df.iloc[i]
@@ -251,87 +269,104 @@ def run_trades(
                             ot._tp1_pips  = (ot.entry_price - ot.tp1_price) / pip
                             ot._trail_stop = ot.entry_price
 
-        # ── 2. Box grid entry logic ──────────────────────────────────────────
+                # Consecutive favorable bars exit (close on bar close)
+                if consec_bars_exit > 0:
+                    bar_bullish = c > row["Open"]
+                    fav = bar_bullish if long else not bar_bullish
+                    ot._consec_fav = ot._consec_fav + 1 if fav else 0
+                    if ot._consec_fav >= consec_bars_exit:
+                        _close(ot, bar_date, c, "consec_exit", pip, slippage_pips, pip_value, commission_rt)
+                        trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+
+                # Strong single bar exit (close quality >= threshold on a favorable bar)
+                if strong_bar_exit > 0:
+                    bar_range = h - l
+                    if bar_range > 0:
+                        if long and c > row["Open"] and (c - l) / bar_range >= strong_bar_exit:
+                            _close(ot, bar_date, c, "strong_bar_exit", pip, slippage_pips, pip_value, commission_rt)
+                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+                        elif not long and c < row["Open"] and (h - c) / bar_range >= strong_bar_exit:
+                            _close(ot, bar_date, c, "strong_bar_exit", pip, slippage_pips, pip_value, commission_rt)
+                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+
+        # ── 2. Weekly/monthly level entry logic ──────────────────────────────
         if any_closed and not open_trades:
-            session_long = session_short = None   # day done after a trade closes
+            session_long = session_short = None
             continue
 
-        today = bar_date.date()
+        today   = bar_date.date()
         in_sess = _in_session(bar_date, session_start, session_end)
 
-        # Cancel session orders at session close
         if not in_sess:
             if session_long or session_short:
                 expirations_total += 1
             session_long = session_short = None
             continue
 
-        # Skip if trade already open
         if open_trades:
             continue
 
-        # Check fills for both pending grid orders
-        def _open_grid_trade(direction, order):
+        # Check fills on pending limit orders
+        def _open_limit_trade(direction, order):
             nonlocal fills_total, last_open_bar, trade_id
-            fills_total  += 1
-            last_open_bar = i
-            trade_id     += 1
-            _entry, _stop, _tp1, _lot = order["entry"], order["stop"], order["tp1"], order["lot"]
-            t = Trade(
-                trade_id=trade_id, direction=direction,
-                entry_date=bar_date, entry_price=_entry,
-                stop_price=_stop, tp1_price=_tp1, lot_size=_lot,
-                regime="GRID", trend_strength=None, params=params.copy(),
-            )
+            fills_total  += 1; last_open_bar = i; trade_id += 1
+            _e, _s, _t1, _lot = order["entry"], order["stop"], order["tp1"], order["lot"]
+            t = Trade(trade_id=trade_id, direction=direction,
+                      entry_date=bar_date, entry_price=_e,
+                      stop_price=_s, tp1_price=_t1, lot_size=_lot,
+                      regime="WM_LEVEL", trend_strength=None, params=params.copy())
             open_trades.append(t)
             if direction == "long":
-                if l <= _stop:
-                    _close(t, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                if l <= _s:
+                    _close(t, bar_date, _s, "stop", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
-                elif h >= _tp1:
-                    _close(t, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
+                elif h >= _t1:
+                    _close(t, bar_date, _t1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
             else:
-                if h >= _stop:
-                    _close(t, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                if h >= _s:
+                    _close(t, bar_date, _s, "stop", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
-                elif l <= _tp1:
-                    _close(t, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
+                elif l <= _t1:
+                    _close(t, bar_date, _t1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
 
         if session_long and l <= session_long["entry"]:
-            _open_grid_trade("long", session_long)
-            session_long = session_short = None
-            continue
+            _open_limit_trade("long", session_long)
+            session_long = session_short = None; continue
         if session_short and h >= session_short["entry"]:
-            _open_grid_trade("short", session_short)
-            session_long = session_short = None
-            continue
+            _open_limit_trade("short", session_short)
+            session_long = session_short = None; continue
 
-        # Set new session orders on first bar of a new session day
+        # Set orders on first bar of each session day
         if today != current_session_date and session_long is None:
             current_session_date = today
             if atr_max_pips > 0 and _atr(df, i, atr_period) / pip > atr_max_pips:
-                continue   # trending — skip session
-            price    = row["Open"]
-            stop_d   = fixed_stop_pips * pip
-            lvl_lo, lvl_hi = _grid_levels(price, box_size_pips, pip)
-            lot_lo = _lot_size(account_balance, lvl_lo, lvl_lo - stop_d, pip, pip_value,
-                               risk_pct, min_stop_pips=min_stop_pips, max_lot=max_lot)
-            lot_hi = _lot_size(account_balance, lvl_hi, lvl_hi + stop_d, pip, pip_value,
-                               risk_pct, min_stop_pips=min_stop_pips, max_lot=max_lot)
+                continue
+            price   = row["Open"]
+            current_atr = _atr(df, i, atr_period)
+            stop_d  = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pips * pip)
+            levels  = _wm_levels(weekly_df, monthly_df, bar_date)
+            below   = [lv for lv in levels if lv < price - stop_d]
+            above   = [lv for lv in levels if lv > price + stop_d]
+            if not below or not above:
+                continue
+            lvl_lo, lvl_hi = max(below), min(above)
+            lot_lo = _lot_size(account_balance, lvl_lo, lvl_lo - stop_d,
+                               pip, pip_value, risk_pct, min_stop_pips, max_lot)
+            lot_hi = _lot_size(account_balance, lvl_hi, lvl_hi + stop_d,
+                               pip, pip_value, risk_pct, min_stop_pips, max_lot)
             if lot_lo > 0 and lot_hi > 0:
                 signals_total += 1
                 session_long  = {"entry": lvl_lo, "stop": round(lvl_lo - stop_d, 5),
-                                 "tp1":   round(lvl_lo + tp_rr * stop_d, 5), "lot": lot_lo}
+                                 "tp1": round(lvl_lo + tp_rr * stop_d, 5), "lot": lot_lo}
                 session_short = {"entry": lvl_hi, "stop": round(lvl_hi + stop_d, 5),
-                                 "tp1":   round(lvl_hi - tp_rr * stop_d, 5), "lot": lot_hi}
-                # Check same-bar fill immediately
+                                 "tp1": round(lvl_hi - tp_rr * stop_d, 5), "lot": lot_hi}
                 if l <= lvl_lo:
-                    _open_grid_trade("long", session_long)
+                    _open_limit_trade("long", session_long)
                     session_long = session_short = None
                 elif h >= lvl_hi:
-                    _open_grid_trade("short", session_short)
+                    _open_limit_trade("short", session_short)
                     session_long = session_short = None
 
     # Close any trades still open at end of data

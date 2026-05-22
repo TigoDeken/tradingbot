@@ -23,7 +23,7 @@ import pandas as pd
 
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
 from constants     import MAGIC
-from trade_engine  import _grid_levels, _atr, MIN_STOP_PIPS
+from trade_engine  import _wm_levels, _atr, MIN_STOP_PIPS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH         = Path("config.json")
@@ -649,22 +649,36 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         f"  L={curr['Low']:.5f}  C={curr['Close']:.5f}"
     )
 
+    tp_rr          = float(config.get("tp_rr", 1.0))
+    atr_period     = int(config.get("atr_period", 14))
+    stop_atr_mult  = float(config.get("stop_atr_mult", 0.0))
+    fixed_stop_pip = float(config.get("fixed_stop_pips", 25.0))
+
+    current_atr = _atr(df, len(df), atr_period)
+    stop_d = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pip * pip)
+
     atr_max = float(config.get("atr_max_pips", 0))
-    if atr_max > 0:
-        current_atr = _atr(df, len(df), int(config.get("atr_period", 14))) / pip
-        if current_atr > atr_max:
-            logger.info(f"[{symbol}] Skip — ATR {current_atr:.1f}pip > threshold {atr_max:.0f}pip (trending)")
-            return
+    if atr_max > 0 and (current_atr / pip) > atr_max:
+        logger.info(f"[{symbol}] Skip — ATR {current_atr/pip:.1f}pip > {atr_max:.0f}pip")
+        return
 
-    tp_rr           = float(config.get("tp_rr", 1.0))
-    fixed_stop_pips = float(config.get("fixed_stop_pips", 25.0))
-    box_size_pips   = float(config.get("box_size_pips", 50.0))
-    stop_d          = fixed_stop_pips * pip
-    lvl_lo, lvl_hi  = _grid_levels(curr["Open"], box_size_pips, pip)
+    # Compute weekly/monthly levels
+    _agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    weekly_df  = df.resample("W").agg(_agg).dropna()
+    monthly_df = df.resample("ME").agg(_agg).dropna()
+    bar_time   = df.index[-1]
+    levels     = _wm_levels(weekly_df, monthly_df, bar_time)
+    price      = curr["Open"]
+    below      = [lv for lv in levels if lv < price - stop_d]
+    above      = [lv for lv in levels if lv > price + stop_d]
 
-    logger.info(f"[{symbol}] Grid: buy@{lvl_lo:.5f}  sell@{lvl_hi:.5f}  stop={fixed_stop_pips}pip")
+    if not below or not above:
+        logger.info(f"[{symbol}] No entry — no W/M levels within range (price={price:.5f})")
+        return
 
-    # Determine which level was hit this bar
+    lvl_lo, lvl_hi = max(below), min(above)
+    logger.info(f"[{symbol}] W/M levels: buy@{lvl_lo:.5f}  sell@{lvl_hi:.5f}  stop={stop_d/pip:.1f}pip")
+
     if curr["Low"] <= lvl_lo:
         direction = "long"
         entry = lvl_lo
@@ -676,12 +690,10 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         stop  = round(lvl_hi + stop_d, 5)
         tp1   = round(lvl_hi - tp_rr * stop_d, 5)
     else:
-        logger.info(f"[{symbol}] No entry — bar did not touch either grid level")
+        logger.info(f"[{symbol}] No entry — bar did not touch either level")
         return
 
-    result = (direction, entry, stop, tp1)
-
-    direction, entry, stop, tp1 = result
+    direction, entry, stop, tp1 = direction, entry, stop, tp1
     stop_pips = abs(entry - stop) / pip
     risk_r    = abs(tp1 - entry) / abs(entry - stop)
 

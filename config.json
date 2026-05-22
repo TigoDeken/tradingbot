@@ -25,5 +25,6 @@
   "telegram_chat_id": "",
   "pending_order_expiry_bars": 4,
   "atr_period": 14,
-  "atr_max_pips": 35
+  "atr_max_pips": 0,
+  "stop_atr_mult": 0.8
 }
