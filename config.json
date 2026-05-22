@@ -7,15 +7,8 @@
     "USDCAD"
   ],
   "timeframe": "H4",
-  "session_start_utc": 7,
-  "session_end_utc": 20,
-  "symbol_sessions": {
-    "EURUSD": [7, 20],
-    "GBPUSD": [7, 20],
-    "USDCAD": [12, 22],
-    "USDJPY": [0, 10],
-    "AUDUSD": [22, 10]
-  },
+  "session_start_utc": 0,
+  "session_end_utc": 24,
   "paper_mode": false,
   "risk_per_trade": 0.005,
   "max_drawdown_pct": 15.0,

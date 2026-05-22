@@ -327,11 +327,21 @@ def page_backtest() -> None:
             bars            = rb2.number_input("Bars to fetch",      min_value=100, max_value=50000,      value=9999,  step=100)
             split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
             initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
+
+            rs1, rs2 = st.columns(2)
+            bt_session_start = rs1.number_input("Session start (UTC)", min_value=0, max_value=23,
+                                                value=int(cfg.get("session_start_utc", 0)), step=1,
+                                                help="Override session for this backtest only. 0 = all hours.")
+            bt_session_end   = rs2.number_input("Session end (UTC)",   min_value=1, max_value=24,
+                                                value=int(cfg.get("session_end_utc", 24)), step=1,
+                                                help="Use 24 to cover until midnight. Supports wrap-around.")
             run_btn = st.button("▶ Run with current Bot Settings", type="primary")
 
         if run_btn:
             split_ratio = split_pct / 100
-            params      = _cfg_run_params()
+            params      = {**_cfg_run_params(),
+                           "session_start": int(bt_session_start),
+                           "session_end":   int(bt_session_end)}
 
             def _get_pip_info(sym: str) -> tuple:
                 try:
@@ -349,11 +359,8 @@ def page_backtest() -> None:
             def _run_sym(sym):
                 pip, pip_value = _get_pip_info(sym)
                 df = get_data(symbol=sym, bars=bars)
-                sym_sessions = cfg.get("symbol_sessions", {})
-                sym_s, sym_e = sym_sessions.get(sym, [params["session_start"], params["session_end"]])
-                sym_params = {**params, "session_start": sym_s, "session_end": sym_e}
                 trades, fill_stats = run_trades(df, account_balance=initial_balance,
-                                                pip=pip, pip_value=pip_value, **sym_params)
+                                                pip=pip, pip_value=pip_value, **params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]
