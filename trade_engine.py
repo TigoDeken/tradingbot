@@ -189,9 +189,8 @@ def run_trades(
     trade_id          = 0
     last_open_bar:    int             = -999  # bar index when last trade opened
 
-    session_long:      dict | None     = None
-    session_short:     dict | None     = None
-    current_session_date              = None
+    session_long:  dict | None = None
+    session_short: dict | None = None
     signals_total     = 0
     fills_total       = 0
     expirations_total = 0
@@ -289,14 +288,13 @@ def run_trades(
                             _close(ot, bar_date, c, "strong_bar_exit", pip, slippage_pips, pip_value, commission_rt)
                             trades.append(ot); open_trades.remove(ot); any_closed = True; continue
 
-        # ── 2. Weekly/monthly level entry logic ──────────────────────────────
+        # ── 2. W/M level entry (mirrors live: signal-bar → pending → next-bar fill) ──
+
+        # On trade close: reset pending but stay on this bar (live also re-evaluates same bar)
         if any_closed and not open_trades:
             session_long = session_short = None
-            continue
 
-        today   = bar_date.date()
         in_sess = _in_session(bar_date, session_start, session_end)
-
         if not in_sess:
             if session_long or session_short:
                 expirations_total += 1
@@ -306,10 +304,10 @@ def run_trades(
         if open_trades:
             continue
 
-        # Check fills on pending limit orders
+        # Inner helper — defined once, used for both fill and same-bar close checks
         def _open_limit_trade(direction, order):
             nonlocal fills_total, last_open_bar, trade_id
-            fills_total  += 1; last_open_bar = i; trade_id += 1
+            fills_total += 1; last_open_bar = i; trade_id += 1
             _e, _s, _t1, _lot = order["entry"], order["stop"], order["tp1"], order["lot"]
             t = Trade(trade_id=trade_id, direction=direction,
                       entry_date=bar_date, entry_price=_e,
@@ -331,43 +329,48 @@ def run_trades(
                     _close(t, bar_date, _t1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
 
+        # Fill pending placed on previous bar (no same-bar fill — mirrors live)
         if session_long and l <= session_long["entry"]:
             _open_limit_trade("long", session_long)
-            session_long = session_short = None; continue
+            session_long = session_short = None
+            continue
         if session_short and h >= session_short["entry"]:
             _open_limit_trade("short", session_short)
-            session_long = session_short = None; continue
+            session_long = session_short = None
+            continue
 
-        # Set orders on first bar of each session day
-        if today != current_session_date and session_long is None:
-            current_session_date = today
-            if atr_max_pips > 0 and _atr(df, i, atr_period) / pip > atr_max_pips:
-                continue
-            price   = row["Open"]
-            current_atr = _atr(df, i, atr_period)
-            stop_d  = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pips * pip)
-            levels  = _wm_levels(weekly_df, monthly_df, bar_date)
-            below   = [lv for lv in levels if lv < price - stop_d]
-            above   = [lv for lv in levels if lv > price + stop_d]
-            if not below or not above:
-                continue
-            lvl_lo, lvl_hi = max(below), min(above)
+        # 1-bar expiry: cancel if not filled (mirrors live pending_order_expiry_bars=1)
+        if session_long or session_short:
+            expirations_total += 1
+            session_long = session_short = None
+
+        # New pending: only if this bar already touched a W/M level (mirrors live check_entry)
+        if atr_max_pips > 0 and _atr(df, i, atr_period) / pip > atr_max_pips:
+            continue
+        price       = row["Open"]
+        current_atr = _atr(df, i, atr_period)
+        stop_d      = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pips * pip)
+        levels      = _wm_levels(weekly_df, monthly_df, bar_date)
+        below       = [lv for lv in levels if lv < price - stop_d]
+        above       = [lv for lv in levels if lv > price + stop_d]
+        if not below or not above:
+            continue
+        lvl_lo, lvl_hi = max(below), min(above)
+
+        if l <= lvl_lo:
             lot_lo = _lot_size(account_balance, lvl_lo, lvl_lo - stop_d,
                                pip, pip_value, risk_pct, min_stop_pips, max_lot)
+            if lot_lo > 0:
+                signals_total += 1
+                session_long = {"entry": lvl_lo, "stop": round(lvl_lo - stop_d, 5),
+                                "tp1": round(lvl_lo + tp_rr * stop_d, 5), "lot": lot_lo}
+        elif h >= lvl_hi:
             lot_hi = _lot_size(account_balance, lvl_hi, lvl_hi + stop_d,
                                pip, pip_value, risk_pct, min_stop_pips, max_lot)
-            if lot_lo > 0 and lot_hi > 0:
+            if lot_hi > 0:
                 signals_total += 1
-                session_long  = {"entry": lvl_lo, "stop": round(lvl_lo - stop_d, 5),
-                                 "tp1": round(lvl_lo + tp_rr * stop_d, 5), "lot": lot_lo}
                 session_short = {"entry": lvl_hi, "stop": round(lvl_hi + stop_d, 5),
                                  "tp1": round(lvl_hi - tp_rr * stop_d, 5), "lot": lot_hi}
-                if l <= lvl_lo:
-                    _open_limit_trade("long", session_long)
-                    session_long = session_short = None
-                elif h >= lvl_hi:
-                    _open_limit_trade("short", session_short)
-                    session_long = session_short = None
 
     # Close any trades still open at end of data
     for ot in open_trades:
