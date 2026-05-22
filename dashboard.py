@@ -341,6 +341,7 @@ def page_backtest() -> None:
         def _cfg_run_params():
             return dict(
                 pullback_lookback    = int(cfg.get("pullback_lookback", 4)),
+                pullback_factor      = float(cfg.get("pullback_factor", 1.0)),
                 stop_buffer          = int(cfg.get("stop_buffer", 5)),
                 tp_mode              = cfg.get("tp_mode", "full"),
                 risk_pct             = float(cfg.get("risk_per_trade", 0.005)),
@@ -697,7 +698,7 @@ def page_bot_settings() -> None:
 
     # ── 2. Entry & Stop ───────────────────────────────────────────────────────
     with st.expander("🎯 Entry & Stop", expanded=True):
-        e1, e2, e3 = st.columns(3)
+        e1, e2, e3, e4 = st.columns(4)
         with e1:
             pullback_lookback = st.number_input(
                 "Entry offset lookback (bars)", min_value=1, max_value=20,
@@ -706,13 +707,20 @@ def page_bot_settings() -> None:
             )
             st.caption(f"currently: {_i('pullback_lookback', 4)}")
         with e2:
+            pullback_factor = st.number_input(
+                "Pullback factor", min_value=0.5, max_value=5.0,
+                value=float(cfg.get("pullback_factor", 1.0)), step=0.5, format="%.1f",
+                help="Multiplier on the median H-L range. Higher = deeper pullback entry, higher WR, fewer fills."
+            )
+            st.caption(f"currently: {float(cfg.get('pullback_factor', 1.0)):.1f}")
+        with e3:
             stop_buffer = st.number_input(
                 "Stop beyond swing (pips)", min_value=0, max_value=50,
                 value=_i("stop_buffer", 5), step=1,
                 help="Extra pips added beyond the swing low/high for the stop loss."
             )
             st.caption(f"currently: {_i('stop_buffer', 5)}")
-        with e3:
+        with e4:
             close_strength = st.number_input(
                 "Signal bar close quality (0 = off)", min_value=0.0, max_value=0.9,
                 value=_f("close_strength", 0.6), step=0.05, format="%.2f",
@@ -786,6 +794,7 @@ def page_bot_settings() -> None:
         "risk_per_trade":       round(risk_pct, 4),
         "tp_mode":              tp_mode,
         "pullback_lookback":    int(pullback_lookback),
+        "pullback_factor":      round(float(pullback_factor), 2),
         "stop_buffer":          int(stop_buffer),
         "close_strength":       round(float(close_strength), 2),
         "max_drawdown_pct":     float(max_drawdown_pct),

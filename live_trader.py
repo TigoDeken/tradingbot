@@ -688,12 +688,13 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         logger.info(f"[{symbol}] No entry — no clean consecutive breakout ({', '.join(reasons)})")
 
     lb      = config.get("pullback_lookback", 4)
+    factor  = config.get("pullback_factor", 1.0)
     pb_pips = float(np.median([
         (df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
-        for j in range(max(0, len(df) - lb), len(df) - 1)
-    ]))
+        for j in range(max(0, len(df) - lb - 1), len(df) - 1)
+    ])) * factor
     min_stop = config.get("min_stop_pips", MIN_STOP_PIPS)
-    logger.debug(f"[{symbol}] Pullback: {pb_pips:.1f}pip  min_stop: {min_stop:.0f}pip")
+    logger.debug(f"[{symbol}] Pullback: {pb_pips:.1f}pip (factor={factor})  min_stop: {min_stop:.0f}pip")
 
     result = _bar_setup(prev2, prev1, curr, pb_pips,
                         config.get("stop_buffer", 5), pip, min_stop,

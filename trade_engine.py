@@ -186,6 +186,7 @@ def run_trades(
     close_strength:       float = 0.0,
     commission_rt:        float = COMMISSION_RT_USD,
     expiry_bars:          int   = 1,
+    pullback_factor:      float = 1.0,
     **_kwargs,
 ) -> tuple[list[Trade], dict]:
     """
@@ -359,9 +360,11 @@ def run_trades(
         prev2 = df.iloc[i - 2]
         prev1 = df.iloc[i - 1]
 
-        pb_start = max(0, i - pullback_lookback)
-        pb_pips  = float(np.median([(df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
-                                     for j in range(pb_start, i)]))
+        pb_start     = max(0, i - pullback_lookback)
+        pb_pips      = float(np.median([
+            (df.iloc[j]["High"] - df.iloc[j]["Low"]) / pip
+            for j in range(pb_start, i)
+        ])) * pullback_factor
 
         result = _bar_setup(prev2, prev1, row, pb_pips, stop_buffer, pip, min_stop_pips,
                             close_strength)
