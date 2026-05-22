@@ -83,7 +83,9 @@ def _dd_duration_days(eq: pd.DataFrame) -> int:
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
+def compute_metrics(trades: list, initial: float = INITIAL_BALANCE,
+                    signals_total: int = 0, fills_total: int = 0,
+                    expirations_total: int = 0) -> dict:
     if not trades:
         return {"total_trades": 0, "expectancy_net_r": 0.0, "_empty": True}
 
@@ -155,6 +157,11 @@ def compute_metrics(trades: list, initial: float = INITIAL_BALANCE) -> dict:
         "gross_expectancy_r":     round(gross_r_total / n, 4),
         "ev_pre_commission":      round(sum(t.net_r_pre_commission or 0 for t in trades) / n, 4),
         "ev_post_commission":     round(net_r_total / n, 4),
+        # Fill rate stats (from run_trades counters)
+        "signals_total":          signals_total,
+        "fills_total":            fills_total,
+        "expirations_total":      expirations_total,
+        "fill_rate_pct":          round(fills_total / signals_total * 100, 1) if signals_total else 0.0,
     }
 
 
@@ -460,7 +467,7 @@ def optimize(df_raw: pd.DataFrame, split_dt: pd.Timestamp) -> pd.DataFrame:
 
     for idx, vals in enumerate(combos):
         c = dict(zip(keys, vals))
-        trades = run_trades(
+        trades, _ = run_trades(
             df_raw,
             pullback_lookback=c["PULLBACK_LOOKBACK"],
             stop_buffer=c["STOP_BUFFER"],
@@ -510,12 +517,14 @@ if __name__ == "__main__":
 
     # 2. Run strategy
     print("\n[2] Running trades...")
-    all_trades = run_trades(df_raw, close_strength=0.6)
+    all_trades, fill_stats = run_trades(df_raw, close_strength=0.6)
     is_t, oos_t = _split_trades(all_trades, split_dt)
     print(f"    Total: {len(all_trades)}  |  IS: {len(is_t)}  |  OOS: {len(oos_t)}")
+    print(f"    Signals: {fill_stats['signals_total']}  Fills: {fill_stats['fills_total']}  "
+          f"Expired: {fill_stats['expirations_total']}  Fill rate: {fill_stats.get('fill_rate_pct', 0)}%")
 
     # 3. Metrics
-    all_m = compute_metrics(all_trades)
+    all_m = compute_metrics(all_trades, **fill_stats)
     is_m  = compute_metrics(is_t)
     oos_m = compute_metrics(oos_t)
 

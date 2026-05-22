@@ -185,8 +185,9 @@ def run_trades(
     pyramid_min_profit_r: float = 0.0,
     close_strength:       float = 0.0,
     commission_rt:        float = COMMISSION_RT_USD,
+    expiry_bars:          int   = 1,
     **_kwargs,
-) -> list[Trade]:
+) -> tuple[list[Trade], dict]:
     """
     Iterate bar-by-bar and simulate consecutive-breakout entries with stop/TP/trail exits.
     max_open_lots > 0 enables pyramiding: adds fire when a new setup forms in the same
@@ -198,6 +199,11 @@ def run_trades(
     open_trades:      list[Trade]     = []
     trade_id          = 0
     last_open_bar:    int             = -999  # bar index when last trade opened
+
+    pending_entry:    dict | None     = None  # non-pyramid limit order waiting to fill
+    signals_total     = 0
+    fills_total       = 0
+    expirations_total = 0
 
     params = dict(
         pullback_lookback=pullback_lookback,
@@ -276,6 +282,68 @@ def run_trades(
         if any_closed and not open_trades:
             continue
 
+        # ── 2a. Check pending (non-pyramid) limit fill / expiry ──────────────
+        if pending_entry and not open_trades:
+            elapsed = i - pending_entry["bar_idx"]
+            if elapsed >= expiry_bars:
+                expirations_total += 1
+                pending_entry = None
+            else:
+                _dir   = pending_entry["direction"]
+                _entry = pending_entry["entry"]
+                _stop  = pending_entry["stop"]
+                _tp1   = pending_entry["tp1"]
+                _lot   = pending_entry["lot"]
+                _filled = (_dir == "long"  and l <= _entry) or \
+                          (_dir == "short" and h >= _entry)
+                if _filled:
+                    fills_total   += 1
+                    pending_entry  = None
+                    last_open_bar  = i
+                    trade_id      += 1
+                    new_trade = Trade(
+                        trade_id       = trade_id,
+                        direction      = _dir,
+                        entry_date     = bar_date,
+                        entry_price    = _entry,
+                        stop_price     = _stop,
+                        tp1_price      = _tp1,
+                        lot_size       = _lot,
+                        regime         = _dir.upper() + "_SETUP",
+                        trend_strength = None,
+                        params         = params.copy(),
+                    )
+                    open_trades.append(new_trade)
+                    # Same-bar exit check for freshly filled entry
+                    if _dir == "long":
+                        if l <= _stop:
+                            _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                            trades.append(new_trade); open_trades.remove(new_trade)
+                        elif h >= _tp1 and tp_mode != "trail":
+                            if tp_mode == "full":
+                                _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
+                                trades.append(new_trade); open_trades.remove(new_trade)
+                            else:
+                                new_trade._tp1_hit   = True
+                                new_trade._tp1_pips  = (_tp1 - _entry) / pip
+                                new_trade._trail_stop = _entry
+                    else:
+                        if h >= _stop:
+                            _close(new_trade, bar_date, _stop, "stop", pip, slippage_pips, pip_value, commission_rt)
+                            trades.append(new_trade); open_trades.remove(new_trade)
+                        elif l <= _tp1 and tp_mode != "trail":
+                            if tp_mode == "full":
+                                _close(new_trade, bar_date, _tp1, "tp1", pip, slippage_pips, pip_value, commission_rt)
+                                trades.append(new_trade); open_trades.remove(new_trade)
+                            else:
+                                new_trade._tp1_hit   = True
+                                new_trade._tp1_pips  = (_entry - _tp1) / pip
+                                new_trade._trail_stop = _entry
+
+        # Skip new signal generation while waiting for a pending entry to fill
+        if not open_trades and pending_entry is not None:
+            continue
+
         if open_trades:
             # Pyramiding gate: disabled, or at lot cap, or too soon after last add
             if max_open_lots <= 0:
@@ -331,12 +399,22 @@ def run_trades(
         if open_trades and (sum(t.lot_size for t in open_trades) + lot > max_open_lots):
             continue
 
+        if not open_trades:
+            # Non-pyramid: store as pending limit, fill on a later bar
+            signals_total += 1
+            pending_entry = {
+                "direction": direction, "entry": entry, "stop": stop,
+                "tp1": tp1, "lot": lot, "bar_idx": i,
+            }
+            continue
+
+        # Pyramid: check same-bar fill
         filled = (direction == "long" and l <= entry) or \
                  (direction == "short" and h >= entry)
         if not filled:
             continue
 
-        # ── Confirmed fill ────────────────────────────────────────────────────
+        # ── Confirmed pyramid fill ────────────────────────────────────────────
         # Lock the most-recent open trade: move stop to prev bar structure,
         # but never below breakeven + slippage (floor protects against losses)
         if open_trades:
@@ -398,7 +476,12 @@ def run_trades(
         _close(ot, df.index[-1], df["Close"].iloc[-1], "end_of_data", pip, slippage_pips, pip_value, commission_rt)
         trades.append(ot)
 
-    return trades
+    fill_stats = {
+        "signals_total":     signals_total,
+        "fills_total":       fills_total,
+        "expirations_total": expirations_total,
+    }
+    return trades, fill_stats
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -506,7 +589,7 @@ if __name__ == "__main__":
     df = get_data()
 
     print("Running trade simulation...")
-    trades = run_trades(
+    trades, fill_stats = run_trades(
         df,
         account_balance   = ACCOUNT_BALANCE,
         pullback_lookback = PULLBACK_LOOKBACK,
@@ -516,6 +599,9 @@ if __name__ == "__main__":
         pip               = PIP,
         pip_value         = PIP_VALUE,
     )
+    print(f"Signals: {fill_stats['signals_total']}  Fills: {fill_stats['fills_total']}  "
+          f"Expired: {fill_stats['expirations_total']}  "
+          f"Fill rate: {round(fill_stats['fills_total']/fill_stats['signals_total']*100, 1) if fill_stats['signals_total'] else 0}%")
 
     validate_trades(trades)
     plot_trades(df, trades)

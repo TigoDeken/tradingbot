@@ -1,10 +1,10 @@
 {
   "symbols": [
-    "EURUSD#",
-    "USDJPY#",
-    "GBPUSD#",
-    "AUDUSD#",
-    "USDCAD#"
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "AUDUSD",
+    "USDCAD"
   ],
   "timeframe": "H4",
   "session_start_utc": 3,
@@ -20,5 +20,6 @@
   "pyramid_min_profit_r": 0.5,
   "close_strength": 0.6,
   "telegram_bot_token": "",
-  "telegram_chat_id": ""
+  "telegram_chat_id": "",
+  "pending_order_expiry_bars": 1
 }

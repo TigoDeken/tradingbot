@@ -346,6 +346,13 @@ def _send_order(request: dict, logger: logging.Logger,
             f"retcode={getattr(result, 'retcode', None)}  "
             f"comment={getattr(result, 'comment', None)}"
         )
+        if getattr(result, 'retcode', None) == mt5.TRADE_RETCODE_TRADE_DISABLED:
+            sym = request.get("symbol", "")
+            available = [s.name for s in (mt5.symbols_get() or []) if sym.rstrip("#. ") in s.name]
+            logger.error(
+                f"retcode 10017 = Trade Disabled — symbol name is likely wrong. "
+                f"Configured: '{sym}'  Available in MT5: {available}"
+            )
         time.sleep(1)
     raise TradingHalt(f"{description} failed after {ORDER_RETRY_LIMIT} attempts")
 
@@ -550,6 +557,20 @@ def _check_paper_pending(config: dict, state: dict, symbol: str,
                           last_bar: pd.Series, pip: float, pip_value: float,
                           logger: logging.Logger) -> None:
     lim  = state["pending_limit"]
+
+    # Expiry check: cancel if N bars have passed without fill
+    expiry_bars = config.get("pending_order_expiry_bars", 1)
+    if lim.get("placed_time"):
+        placed      = pd.Timestamp(lim["placed_time"])
+        current_bar = pd.Timestamp(last_bar.name)
+        elapsed     = (current_bar - placed) / pd.Timedelta(hours=4)
+        if elapsed >= expiry_bars:
+            logger.info(
+                f"[{symbol}] [PAPER] Pending limit expired after {elapsed:.1f} bars — cancelling"
+            )
+            paper_cancel_limit(state, symbol, "expired", logger)
+            return
+
     h, l = float(last_bar["High"]), float(last_bar["Low"])
     dist = (l - lim["price"]) / pip if lim["direction"] == "long" else (lim["price"] - h) / pip
     logger.info(
@@ -575,7 +596,23 @@ def _check_paper_pending(config: dict, state: dict, symbol: str,
 
 
 def _check_live_pending(config: dict, state: dict, symbol: str,
-                         logger: logging.Logger) -> None:
+                         last_bar: pd.Series, logger: logging.Logger) -> None:
+    lim = state.get("pending_limit", {})
+
+    # Expiry check: cancel GTC order if N bars have passed without fill
+    expiry_bars = config.get("pending_order_expiry_bars", 1)
+    if lim.get("placed_time"):
+        placed      = pd.Timestamp(lim["placed_time"])
+        current_bar = pd.Timestamp(last_bar.name)
+        elapsed     = (current_bar - placed) / pd.Timedelta(hours=4)
+        if elapsed >= expiry_bars:
+            logger.info(
+                f"[{symbol}] Pending limit expired after {elapsed:.1f} bars — cancelling"
+            )
+            live_cancel_limits(config, logger)
+            state["pending_limit"] = None
+            return
+
     positions = mt5.positions_get(symbol=config["symbol"]) or []
     our_pos   = next((p for p in positions if p.magic == MAGIC), None)
     if our_pos:
@@ -723,7 +760,7 @@ def run_candle(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         if config["paper_mode"]:
             _check_paper_pending(config, state, symbol, last_bar, pip, pip_value, logger)
         else:
-            _check_live_pending(config, state, symbol, logger)
+            _check_live_pending(config, state, symbol, last_bar, logger)
 
     if not state.get("open_trade") and not state.get("pending_limit"):
         check_entry(config, state, df, symbol, pip, pip_value, logger)

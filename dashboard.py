@@ -360,6 +360,12 @@ def page_backtest() -> None:
             bars            = rb2.number_input("Bars to fetch",      min_value=100, max_value=50000,      value=9999,  step=100)
             split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
             initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
+            rb5, rb6 = st.columns([1, 3])
+            expiry_bars_input = rb5.number_input(
+                "Pending order expiry (bars)", min_value=1, max_value=4,
+                value=int(cfg.get("pending_order_expiry_bars", 1)), step=1,
+                help="Cancel unfilled limit orders after this many 4H bars. Compare 1-4 to find optimal.",
+            )
             run_btn = st.button("▶ Run with current Bot Settings", type="primary")
 
         if run_btn:
@@ -382,8 +388,9 @@ def page_backtest() -> None:
             def _run_sym(sym):
                 pip, pip_value = _get_pip_info(sym)
                 df       = get_data(symbol=sym, bars=bars)
-                trades   = run_trades(df, account_balance=initial_balance,
-                                      pip=pip, pip_value=pip_value, **params)
+                trades, fill_stats = run_trades(df, account_balance=initial_balance,
+                                                pip=pip, pip_value=pip_value,
+                                                expiry_bars=int(expiry_bars_input), **params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]
@@ -392,6 +399,7 @@ def page_backtest() -> None:
                     compute_metrics(oos_t, initial=initial_balance),
                     is_t, oos_t, trades,
                     build_equity(trades, initial=initial_balance),
+                    fill_stats,
                 )
 
             if sym_choice == "All Symbols":
@@ -404,6 +412,11 @@ def page_backtest() -> None:
                     except Exception as e:
                         results[sym] = None
                         st.warning(f"{sym}: failed — {e}")
+                all_fill_stats = {
+                    "signals_total":     sum(r[6]["signals_total"]     for r in results.values() if r),
+                    "fills_total":       sum(r[6]["fills_total"]       for r in results.values() if r),
+                    "expirations_total": sum(r[6]["expirations_total"] for r in results.values() if r),
+                }
                 prog.progress(100, "Done.")
 
                 # Summary comparison table
@@ -462,6 +475,15 @@ def page_backtest() -> None:
                     if not comb_eq.empty:
                         st.plotly_chart(equity_fig(comb_eq, split_n=len(comb_is_t)), use_container_width=True)
                     _metric_pair(*st.columns(2), comb_is_m, comb_oos_m, split_pct)
+                    _n = all_fill_stats.get("signals_total", 0)
+                    _f = all_fill_stats.get("fills_total", 0)
+                    _e = all_fill_stats.get("expirations_total", 0)
+                    if _n:
+                        st.caption(
+                            f"Fill rate (all symbols): **{_f}/{_n} = "
+                            f"{round(_f/_n*100,1)}%** filled · {_e} expired "
+                            f"(expiry = {int(expiry_bars_input)} bar{'s' if expiry_bars_input != 1 else ''})"
+                        )
                     st.divider()
 
                 # Per-symbol tabs
@@ -472,9 +494,12 @@ def page_backtest() -> None:
                         if r is None:
                             st.error("Failed to run.")
                             continue
-                        is_m, oos_m, is_t, oos_t, trades, eq = r
+                        is_m, oos_m, is_t, oos_t, trades, eq, fs = r
                         oos_ev = oos_m.get("net_ev", 0) or 0
-                        lbl = f"{sym} — {len(oos_t)} OOS trades | EV: {'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade"
+                        _fr = round(fs["fills_total"]/fs["signals_total"]*100, 1) if fs.get("signals_total") else 0
+                        lbl = (f"{sym} — {len(oos_t)} OOS trades | EV: "
+                               f"{'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade | "
+                               f"Fill rate: {_fr}%")
                         (st.success if oos_ev >= 0 else st.error)(lbl)
                         if not eq.empty:
                             st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
@@ -483,20 +508,30 @@ def page_backtest() -> None:
             else:
                 prog = st.progress(0, f"Fetching {sym_choice} from MT5...")
                 try:
-                    is_m, oos_m, is_t, oos_t, all_trades, eq = _run_sym(sym_choice)
+                    is_m, oos_m, is_t, oos_t, all_trades, eq, sym_fill_stats = _run_sym(sym_choice)
                 except Exception as e:
                     st.error(f"Failed: {e}")
                     return
                 prog.progress(100, "Done.")
 
                 oos_ev = oos_m.get("net_ev", 0) or 0
-                lbl = f"{sym_choice} — {len(all_trades)} trades | OOS EV: {'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade"
+                _fr = round(sym_fill_stats["fills_total"]/sym_fill_stats["signals_total"]*100, 1) if sym_fill_stats.get("signals_total") else 0
+                lbl = (f"{sym_choice} — {len(all_trades)} trades | OOS EV: "
+                       f"{'+' if oos_ev >= 0 else ''}{oos_ev:.4f} R/trade | "
+                       f"Fill rate: {_fr}%")
                 (st.success if oos_ev >= 0 else st.error)(lbl)
 
                 if not eq.empty:
                     st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
 
                 _metric_pair(*st.columns(2), is_m, oos_m, split_pct)
+                _sn = sym_fill_stats.get("signals_total", 0)
+                if _sn:
+                    st.caption(
+                        f"Signal fill rate: **{sym_fill_stats['fills_total']}/{_sn} = {_fr}%** filled · "
+                        f"{sym_fill_stats['expirations_total']} expired "
+                        f"(expiry = {int(expiry_bars_input)} bar{'s' if expiry_bars_input != 1 else ''})"
+                    )
 
                 with st.expander("Trade Log", expanded=False):
                     if all_trades:
