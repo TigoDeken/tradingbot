@@ -647,18 +647,25 @@ def page_bot_settings() -> None:
 
     # ── 1. Trading Session ────────────────────────────────────────────────────
     with st.expander("🕐 Trading Session", expanded=True):
+        pr1, pr2, _ = st.columns([1, 1, 3])
+        preset_7_22  = pr1.button("07–22 (Eur+US)", use_container_width=True)
+        preset_12_22 = pr2.button("12–22 (US only)", use_container_width=True)
+
+        default_start = 12 if preset_12_22 else (7 if preset_7_22 else _i("session_start_utc", 7))
+        default_end   = 22 if (preset_12_22 or preset_7_22) else _i("session_end_utc", 20)
+
         s1, s2 = st.columns(2)
         with s1:
             session_start = st.number_input(
                 "Session start (UTC hour)", min_value=0, max_value=23,
-                value=_i("session_start_utc", 7), step=1,
+                value=default_start, step=1,
                 help="Only take new trades at or after this UTC hour."
             )
             st.caption(f"currently: {_i('session_start_utc', 7)}")
         with s2:
             session_end = st.number_input(
                 "Session end (UTC hour)", min_value=1, max_value=24,
-                value=_i("session_end_utc", 20), step=1,
+                value=default_end, step=1,
                 help="Stop taking new trades after this UTC hour."
             )
             st.caption(f"currently: {_i('session_end_utc', 20)}")
