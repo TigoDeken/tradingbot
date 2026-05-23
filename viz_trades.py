@@ -157,7 +157,7 @@ def plot_trade(ax, df, trade, weekly_df, monthly_df):
 
 
 def main():
-    print("Fetching H4 EURUSD data from MT5...")
+    print("Fetching M5 EURUSD data from MT5...")
     df = get_data()
     print(f"Got {len(df)} bars")
 
@@ -187,7 +187,7 @@ def main():
                facecolor="#1e222d", edgecolor="#444", labelcolor="white",
                fontsize=8, bbox_to_anchor=(0.5, 1.01))
 
-    fig.suptitle("EURUSD H4  |  W/M Level Strategy  |  3 Trade Examples",
+    fig.suptitle("EURUSD M5  |  W/M Level Strategy  |  3 Trade Examples",
                  fontsize=12, color="white", y=1.04)
     plt.tight_layout(pad=2.0)
 

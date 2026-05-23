@@ -331,7 +331,7 @@ def page_backtest() -> None:
             rb1, rb2, rb3, rb4 = st.columns(4)
             sym_choice      = rb1.selectbox("Symbol", ["All Symbols"] + ALL_SYMBOLS,
                                             index=ALL_SYMBOLS.index(selected) + 1)
-            bars            = rb2.number_input("Bars to fetch",      min_value=100, max_value=50000,      value=9999,  step=100)
+            bars            = rb2.number_input("Bars to fetch",      min_value=1000, max_value=500000,    value=100000, step=1000)
             split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
             initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
 
@@ -866,7 +866,7 @@ def page_live() -> None:
             "Low": curr["Low"], "Close": curr["Close"],
         }])
         st.dataframe(bar_data.round(5), use_container_width=True)
-        st.metric("ATR (14-bar H4)", f"{atr_pips:.1f} pip")
+        st.metric("ATR (14-bar M5)", f"{atr_pips:.1f} pip")
         st.metric("Stop distance",   f"{stop_d_pips:.1f} pip  ({stop_atr_m:.1f}× ATR)")
 
         st.markdown("**All W/M Levels**")

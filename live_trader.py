@@ -1,6 +1,6 @@
 """
 live_trader.py
-Live and paper-mode execution engine. Runs on every 4H candle close.
+Live and paper-mode execution engine. Runs on every M5 candle close.
 Supports multiple symbols simultaneously via per-symbol state files.
 
 Usage:
@@ -176,15 +176,16 @@ def ensure_connected(logger: logging.Logger) -> None:
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
 _TF_MAP = {
-    "H4": mt5.TIMEFRAME_H4, "H1": mt5.TIMEFRAME_H1,
-    "D1": mt5.TIMEFRAME_D1, "M15": mt5.TIMEFRAME_M15,
+    "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+    "D1": mt5.TIMEFRAME_D1,
 }
 
 
 def fetch_data(config: dict, logger: logging.Logger) -> pd.DataFrame:
     ensure_connected(logger)
-    tf = _TF_MAP.get(config["timeframe"], mt5.TIMEFRAME_H4)
-    df = fetch_ohlc(symbol=config["symbol"], timeframe=tf, bars=5000)
+    tf = _TF_MAP.get(config["timeframe"], mt5.TIMEFRAME_M5)
+    df = fetch_ohlc(symbol=config["symbol"], timeframe=tf, bars=15000)
     logger.debug(f"[{config['symbol']}] Fetched {len(df)} bars. Last: {df.index[-1]}")
     return df
 
@@ -510,7 +511,7 @@ def _check_paper_pending(config: dict, state: dict, symbol: str,
     if lim.get("placed_time"):
         placed      = pd.Timestamp(lim["placed_time"])
         current_bar = pd.Timestamp(last_bar.name)
-        elapsed     = (current_bar - placed) / pd.Timedelta(hours=4)
+        elapsed     = (current_bar - placed) / pd.Timedelta(minutes=5)
         if elapsed >= expiry_bars:
             logger.info(
                 f"[{symbol}] [PAPER] Pending limit expired after {elapsed:.1f} bars — cancelling"
@@ -547,7 +548,7 @@ def _check_live_pending(config: dict, state: dict, symbol: str,
     if lim.get("placed_time"):
         placed      = pd.Timestamp(lim["placed_time"])
         current_bar = pd.Timestamp(last_bar.name)
-        elapsed     = (current_bar - placed) / pd.Timedelta(hours=4)
+        elapsed     = (current_bar - placed) / pd.Timedelta(minutes=5)
         if elapsed >= expiry_bars:
             logger.info(
                 f"[{symbol}] Pending limit expired after {elapsed:.1f} bars — cancelling"
@@ -712,12 +713,12 @@ def wait_for_next_candle(last_bar_times: dict, logger: logging.Logger) -> None:
     if not last_bar_times:
         time.sleep(60)
         return
-    earliest_next = min(t + pd.Timedelta(hours=4, seconds=30) for t in last_bar_times.values())
+    earliest_next = min(t + pd.Timedelta(minutes=5, seconds=30) for t in last_bar_times.values())
     now        = pd.Timestamp.now(tz="UTC")
     sleep_secs = (earliest_next - now).total_seconds()
     if sleep_secs > 0:
         logger.info(
-            f"Sleeping {sleep_secs/3600:.2f}h until next candle close "
+            f"Sleeping {sleep_secs:.0f}s until next candle close "
             f"({earliest_next.strftime('%Y-%m-%d %H:%M UTC')})"
         )
         time.sleep(sleep_secs)

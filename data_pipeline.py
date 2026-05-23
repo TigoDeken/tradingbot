@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 
 SYMBOL = "EURUSD"
-TIMEFRAME = mt5.TIMEFRAME_H4
-NUM_BARS = 9999
+TIMEFRAME = mt5.TIMEFRAME_M5
+NUM_BARS = 100_000
 
 
 def connect() -> bool:
@@ -46,7 +46,7 @@ def get_data(symbol: str = SYMBOL, timeframe: int = TIMEFRAME, bars: int = NUM_B
 
 if __name__ == "__main__":
     df = get_data()
-    print(f"\nFetched {len(df)} bars of {SYMBOL} 4H data")
+    print(f"\nFetched {len(df)} bars of {SYMBOL} M5 data")
     print(f"Range: {df.index[0]} → {df.index[-1]}")
     print(f"\nColumns: {list(df.columns)}")
     print(f"Dtypes:\n{df.dtypes}")

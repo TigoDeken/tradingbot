@@ -102,7 +102,7 @@ for spine in ax.spines.values():
 ax.grid(axis="y", color="#1e2a38", linewidth=0.5)
 ax.set_ylabel("Price", color="#aaaaaa", fontsize=9)
 ax.set_title(
-    f"EURUSD 4H — Pyramid Example (LONG)\n"
+    f"EURUSD M5 — Pyramid Example (LONG)\n"
     f"T1: +{t1.net_r:.2f}R  |  T2 add: +{t2.net_r:.2f}R  |  Combined: +{t1.net_r + t2.net_r:.2f}R",
     color="#e0e0e0", fontsize=11, pad=10
 )

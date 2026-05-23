@@ -308,19 +308,15 @@ def run_trades(
                       stop_price=_s, tp1_price=_t1, lot_size=_lot,
                       regime="WM_LEVEL", trend_strength=None, params=params.copy())
             open_trades.append(t)
+            # Only allow stop on the fill bar (unambiguous — price went through the level).
+            # TP on the fill bar is skipped: we can't know if TP was hit before or after fill.
             if direction == "long":
                 if l <= _s:
                     _close(t, bar_date, _s, "stop", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
-                elif h >= _t1:
-                    _close(t, bar_date, _t1, "tp1", pip, slippage_pips, pip_value, commission_rt)
-                    trades.append(t); open_trades.remove(t)
             else:
                 if h >= _s:
                     _close(t, bar_date, _s, "stop", pip, slippage_pips, pip_value, commission_rt)
-                    trades.append(t); open_trades.remove(t)
-                elif l <= _t1:
-                    _close(t, bar_date, _t1, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(t); open_trades.remove(t)
 
         # Fill pending from previous bars
@@ -355,12 +351,6 @@ def run_trades(
                                  "tp1": round(lvl_lo + tp_rr * stop_d, 5), "lot": lot_lo}
                 session_short = {"entry": lvl_hi, "stop": round(lvl_hi + stop_d, 5),
                                  "tp1": round(lvl_hi - tp_rr * stop_d, 5), "lot": lot_hi}
-                if l <= lvl_lo:
-                    _open_limit_trade("long", session_long)
-                    session_long = session_short = None
-                elif h >= lvl_hi:
-                    _open_limit_trade("short", session_short)
-                    session_long = session_short = None
 
     # Close any trades still open at end of data
     for ot in open_trades:
@@ -462,7 +452,7 @@ def plot_trades(df: pd.DataFrame, trades: list[Trade], last_n: int = 500) -> Non
         Line2D([0], [0], marker="x", color="red",    label="Exit (loss)", markersize=9, linestyle="None"),
     ]
     ax.legend(handles=legend_elements, loc="upper left")
-    ax.set_title(f"EURUSD 4H — Trades  |  {len(visible)} shown of {len(trades)} total")
+    ax.set_title(f"EURUSD M5 — Trades  |  {len(visible)} shown of {len(trades)} total")
     ax.set_xlabel("Date"); ax.set_ylabel("Price")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     plt.xticks(rotation=45, fontsize=7)

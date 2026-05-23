@@ -6,7 +6,7 @@
     "AUDUSD",
     "USDCAD"
   ],
-  "timeframe": "H4",
+  "timeframe": "M5",
   "session_start_utc": 0,
   "session_end_utc": 24,
   "paper_mode": false,
@@ -14,7 +14,7 @@
   "max_drawdown_pct": 15.0,
   "max_open_lots": 0.0,
   "tp_rr": 1.0,
-  "stop_atr_mult": 0.8,
+  "stop_atr_mult": 0,
   "fixed_stop_pips": 50.0,
   "atr_period": 14,
   "atr_max_pips": 0,
@@ -24,7 +24,7 @@
   "fixed_risk_amount": 100.0,
   "slippage_pips": 1,
   "commission_usd_per_lot": 7.0,
-  "pending_order_expiry_bars": 1,
+  "pending_order_expiry_bars": 288,
   "levels": {
     "weekly": {
       "open": false,

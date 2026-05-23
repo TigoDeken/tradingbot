@@ -389,7 +389,7 @@ def plot_recent_trades(df: pd.DataFrame, trades: list, path: str = "recent_trade
     plt.xticks(rotation=40, ha="right")
     ax.yaxis.label.set_color("#aaa")
     ax.xaxis.label.set_color("#aaa")
-    ax.set_title(f"EURUSD 4H — Last {days} days  |  {len(visible)} trades shown",
+    ax.set_title(f"EURUSD M5 — Last {days} days  |  {len(visible)} trades shown",
                  color="white", fontsize=12, pad=10)
     ax.grid(True, alpha=0.12, color="#555")
 
@@ -647,7 +647,7 @@ if __name__ == "__main__":
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 55)
-    print("  EURUSD 4H ALGORITHMIC BACKTEST")
+    print("  EURUSD M5 ALGORITHMIC BACKTEST")
     print("=" * 55)
     print(f"  Results folder: {out_dir}")
 
@@ -688,7 +688,7 @@ if __name__ == "__main__":
         print(f"    Max drawdown: {eq_all['drawdown_pct'].min():.2f}%")
 
     plot_equity_curve(eq_all,
-                      title=f"EURUSD 4H — Equity Curve ({run_id})",
+                      title=f"EURUSD M5 — Equity Curve ({run_id})",
                       path=str(out_dir / "equity_curve.png"),
                       split_trade=split_trade_n)
     recent_path = str(out_dir / "chart_trades.png")
