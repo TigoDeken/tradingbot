@@ -335,20 +335,11 @@ def page_backtest() -> None:
             split_pct       = rb3.number_input("In-sample split %",  min_value=10,  max_value=90,         value=70,    step=5)
             initial_balance = rb4.number_input("Initial balance ($)", min_value=100, max_value=10_000_000, value=10000, step=500)
 
-            rs1, rs2 = st.columns(2)
-            bt_session_start = rs1.number_input("Session start (UTC)", min_value=0, max_value=23,
-                                                value=int(cfg.get("session_start_utc", 0)), step=1,
-                                                help="Override session for this backtest only. 0 = all hours.")
-            bt_session_end   = rs2.number_input("Session end (UTC)",   min_value=1, max_value=24,
-                                                value=int(cfg.get("session_end_utc", 24)), step=1,
-                                                help="Use 24 to cover until midnight. Supports wrap-around.")
             run_btn = st.button("▶ Run with current Bot Settings", type="primary")
 
         if run_btn:
             split_ratio = split_pct / 100
-            params      = {**_cfg_run_params(),
-                           "session_start": int(bt_session_start),
-                           "session_end":   int(bt_session_end)}
+            params      = _cfg_run_params()
 
             def _get_pip_info(sym: str) -> tuple:
                 try:
