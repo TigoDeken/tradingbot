@@ -324,7 +324,8 @@ def page_backtest() -> None:
                 stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8)),
                 slippage_pips = float(cfg.get("slippage_pips", 3)),
                 commission_rt = float(cfg.get("commission_usd_per_lot", 7.0)),
-                level_cfg     = cfg.get("levels"),
+                level_cfg       = cfg.get("levels"),
+                time_exit_bars  = int(cfg.get("time_exit_bars", 0)),
             )
 
         with st.expander("▶ Run Backtest", expanded=False):

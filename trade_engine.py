@@ -50,6 +50,7 @@ class Trade:
     net_r_pre_commission: Optional[float]       = None
 
     _consec_fav:         int             = field(default=0,      repr=False)
+    _fill_bar_idx:       int             = field(default=0,      repr=False)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -189,6 +190,7 @@ def run_trades(
     strong_bar_exit:      float = 0.0,
     fixed_risk:           float = 0.0,  # >0 overrides risk_pct with a fixed currency amount
     level_cfg:            dict | None = None,
+    time_exit_bars:       int   = 0,    # >0: close trade after this many bars regardless of P&L
     **_kwargs,
 ) -> tuple[list[Trade], dict]:
     """
@@ -227,6 +229,11 @@ def run_trades(
         any_closed = False
         for ot in open_trades[:]:
             long = ot.direction == "long"
+
+            # Time-based exit — close at bar close after N bars
+            if time_exit_bars > 0 and (i - ot._fill_bar_idx) >= time_exit_bars:
+                _close(ot, bar_date, c, "time_exit", pip, slippage_pips, pip_value, commission_rt)
+                trades.append(ot); open_trades.remove(ot); any_closed = True; continue
 
             # Stop takes priority over TP within the same bar
             if long:
@@ -286,7 +293,7 @@ def run_trades(
             fills_total += 1; last_open_bar = i; trade_id += 1
             current_session_date = today  # mark fill day as done — no new signal same day
             _e, _s, _t1, _lot = order["entry"], order["stop"], order["tp1"], order["lot"]
-            t = Trade(trade_id=trade_id, direction=direction,
+            t = Trade(trade_id=trade_id, direction=direction, _fill_bar_idx=i,
                       entry_date=bar_date, entry_price=_e,
                       stop_price=_s, tp1_price=_t1, lot_size=_lot,
                       regime="WM_LEVEL", trend_strength=None, params=params.copy())

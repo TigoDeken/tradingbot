@@ -27,17 +27,21 @@ def load_trades():
 
 
 def draw_candles(ax, df_window):
+    if len(df_window) < 2:
+        return
+    bar_w = (mdates.date2num(df_window.index[1].to_pydatetime()) -
+             mdates.date2num(df_window.index[0].to_pydatetime())) * 0.75
+    hw = bar_w / 2
     for ts, row in df_window.iterrows():
         o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
-        color = "#26a69a" if c >= o else "#ef5350"
+        color    = "#26a69a" if c >= o else "#ef5350"
         body_bot = min(o, c)
         body_h   = max(abs(c - o), 1e-5)
         x = mdates.date2num(ts.to_pydatetime())
-        rect = mpatches.Rectangle(
-            (x - 0.055, body_bot), 0.11, body_h,
+        ax.add_patch(mpatches.Rectangle(
+            (x - hw, body_bot), bar_w, body_h,
             facecolor=color, edgecolor=color, linewidth=0, zorder=3
-        )
-        ax.add_patch(rect)
+        ))
         ax.plot([x, x], [l, body_bot],   color=color, linewidth=0.8, zorder=2)
         ax.plot([x, x], [max(o, c), h],  color=color, linewidth=0.8, zorder=2)
 

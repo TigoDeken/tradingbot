@@ -25,6 +25,7 @@
   "slippage_pips": 1,
   "commission_usd_per_lot": 7.0,
   "pending_order_expiry_bars": 288,
+  "time_exit_bars": 0,
   "levels": {
     "weekly":  {"open": false, "high": true, "low": true, "close": true},
     "monthly": {"open": false, "high": true, "low": true, "close": true}

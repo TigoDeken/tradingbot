@@ -424,12 +424,17 @@ def plot_last3_trades(df: pd.DataFrame, trades: list, path: str = None):
     monthly_df = df.resample("ME").agg(_agg).dropna()
 
     def _candles(ax, df_win):
+        if len(df_win) < 2:
+            return
+        bar_w = (mdates.date2num(df_win.index[1].to_pydatetime()) -
+                 mdates.date2num(df_win.index[0].to_pydatetime())) * 0.75
+        hw = bar_w / 2
         for ts, row in df_win.iterrows():
             o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
             col = "#26a69a" if c >= o else "#ef5350"
             x   = mdates.date2num(ts.to_pydatetime())
             ax.add_patch(mpatches.Rectangle(
-                (x - 0.055, min(o, c)), 0.11, max(abs(c - o), 1e-5),
+                (x - hw, min(o, c)), bar_w, max(abs(c - o), 1e-5),
                 facecolor=col, edgecolor=col, linewidth=0, zorder=3,
             ))
             ax.plot([x, x], [l, min(o, c)],   color=col, lw=0.8, zorder=2)
@@ -449,8 +454,10 @@ def plot_last3_trades(df: pd.DataFrame, trades: list, path: str = None):
 
     def _panel(ax, t):
         entry_ts, exit_ts = t.entry_date, t.exit_date
-        df_win = df[(df.index >= entry_ts - pd.Timedelta(weeks=5)) &
-                    (df.index <= (exit_ts or df.index[-1]) + pd.Timedelta(weeks=1))]
+        duration = (exit_ts or df.index[-1]) - entry_ts
+        pad = min(pd.Timedelta(hours=48), max(pd.Timedelta(hours=4), duration * 0.5))
+        df_win = df[(df.index >= entry_ts - pad) &
+                    (df.index <= (exit_ts or df.index[-1]) + pad)]
         if df_win.empty:
             return
         _candles(ax, df_win)
@@ -494,8 +501,16 @@ def plot_last3_trades(df: pd.DataFrame, trades: list, path: str = None):
         pr = df_win["High"].max() - df_win["Low"].min()
         ax.set_ylim(df_win["Low"].min()  - pr * 0.10,
                     df_win["High"].max() + pr * 0.10)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0, interval=1))
+        total_span = df_win.index[-1] - df_win.index[0]
+        if total_span <= pd.Timedelta(hours=12):
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        elif total_span <= pd.Timedelta(days=3):
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d %H:%M"))
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+        else:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, fontsize=7, color="#aaa")
         ax.yaxis.set_major_formatter(plt.FormatStrFormatter("%.5f"))
         ax.tick_params(axis="y", labelsize=7, labelcolor="#aaa")
