@@ -86,11 +86,11 @@ def _wm_levels(
     weekly_df: pd.DataFrame,
     monthly_df: pd.DataFrame,
     bar_time: pd.Timestamp,
-    df: pd.DataFrame | None = None,
     level_cfg: dict | None = None,
+    **_,
 ) -> list[float]:
-    """Current week/month OHLC levels with optional previous-period inclusion."""
-    _default = {"open": False, "high": True, "low": True, "close": False, "include_previous": False}
+    """Previous completed week/month OHLC levels used as limit-order targets."""
+    _default = {"open": False, "high": True, "low": True, "close": True}
     if level_cfg is None:
         level_cfg = {"weekly": _default.copy(), "monthly": _default.copy()}
 
@@ -102,33 +102,15 @@ def _wm_levels(
         if cfg.get("close"): out.append(row["Close"])
         return out
 
-    def _period_ohlc(subset: pd.DataFrame) -> dict:
-        return {"Open": subset.iloc[0]["Open"], "High": float(subset["High"].max()),
-                "Low": float(subset["Low"].min()), "Close": subset.iloc[-1]["Close"]}
-
     levels = []
 
-    wcfg = level_cfg.get("weekly", _default)
-    if df is not None and any(wcfg.get(k) for k in ("open", "high", "low", "close")):
-        week_start = (bar_time - pd.Timedelta(days=bar_time.weekday())).normalize()
-        cw = df[(df.index >= week_start) & (df.index <= bar_time)]
-        if len(cw) > 0:
-            levels += _pick(_period_ohlc(cw), wcfg)
-    if wcfg.get("include_previous"):
-        pw = weekly_df[weekly_df.index < bar_time]
-        if len(pw) >= 1:
-            levels += _pick(dict(pw.iloc[-1]), wcfg)
+    pw = weekly_df[weekly_df.index < bar_time]
+    if len(pw) >= 1:
+        levels += _pick(dict(pw.iloc[-1]), level_cfg.get("weekly", _default))
 
-    mcfg = level_cfg.get("monthly", _default)
-    if df is not None and any(mcfg.get(k) for k in ("open", "high", "low", "close")):
-        month_start = bar_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        cm = df[(df.index >= month_start) & (df.index <= bar_time)]
-        if len(cm) > 0:
-            levels += _pick(_period_ohlc(cm), mcfg)
-    if mcfg.get("include_previous"):
-        pm = monthly_df[monthly_df.index < bar_time]
-        if len(pm) >= 1:
-            levels += _pick(dict(pm.iloc[-1]), mcfg)
+    pm = monthly_df[monthly_df.index < bar_time]
+    if len(pm) >= 1:
+        levels += _pick(dict(pm.iloc[-1]), level_cfg.get("monthly", _default))
 
     return sorted(set(round(l, 5) for l in levels))
 
@@ -300,8 +282,9 @@ def run_trades(
             continue
 
         def _open_limit_trade(direction, order):
-            nonlocal fills_total, last_open_bar, trade_id
+            nonlocal fills_total, last_open_bar, trade_id, current_session_date
             fills_total += 1; last_open_bar = i; trade_id += 1
+            current_session_date = today  # mark fill day as done — no new signal same day
             _e, _s, _t1, _lot = order["entry"], order["stop"], order["tp1"], order["lot"]
             t = Trade(trade_id=trade_id, direction=direction,
                       entry_date=bar_date, entry_price=_e,
@@ -335,7 +318,7 @@ def run_trades(
             price       = row["Open"]
             current_atr = _atr(df, i, atr_period)
             stop_d      = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pips * pip)
-            levels      = _wm_levels(weekly_df, monthly_df, bar_date, df=df, level_cfg=level_cfg)
+            levels      = _wm_levels(weekly_df, monthly_df, bar_date, level_cfg=level_cfg)
             below       = [lv for lv in levels if lv < price - stop_d]
             above       = [lv for lv in levels if lv > price + stop_d]
             if not below or not above:

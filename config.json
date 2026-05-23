@@ -14,7 +14,7 @@
   "max_drawdown_pct": 15.0,
   "max_open_lots": 0.0,
   "tp_rr": 1.0,
-  "stop_atr_mult": 0,
+  "stop_atr_mult": 0.0,
   "fixed_stop_pips": 50.0,
   "atr_period": 14,
   "atr_max_pips": 0,
@@ -26,19 +26,7 @@
   "commission_usd_per_lot": 7.0,
   "pending_order_expiry_bars": 288,
   "levels": {
-    "weekly": {
-      "open": false,
-      "high": true,
-      "low": true,
-      "close": false,
-      "include_previous": false
-    },
-    "monthly": {
-      "open": false,
-      "high": true,
-      "low": true,
-      "close": false,
-      "include_previous": false
-    }
+    "weekly":  {"open": false, "high": true, "low": true, "close": true},
+    "monthly": {"open": false, "high": true, "low": true, "close": true}
   }
 }

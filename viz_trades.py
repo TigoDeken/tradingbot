@@ -49,9 +49,11 @@ def get_levels_at(weekly_df, monthly_df, bar_time):
     if len(pw) >= 1:
         result["prev_week_H"] = pw.iloc[-1]["High"]
         result["prev_week_L"] = pw.iloc[-1]["Low"]
+        result["prev_week_C"] = pw.iloc[-1]["Close"]
     if len(pm) >= 1:
         result["prev_month_H"] = pm.iloc[-1]["High"]
         result["prev_month_L"] = pm.iloc[-1]["Low"]
+        result["prev_month_C"] = pm.iloc[-1]["Close"]
     return result
 
 
@@ -76,8 +78,10 @@ def plot_trade(ax, df, trade, weekly_df, monthly_df):
     level_styles = {
         "prev_week_H":  ("#4fc3f7", "--", "Prev Wk High"),
         "prev_week_L":  ("#4fc3f7", ":",  "Prev Wk Low"),
+        "prev_week_C":  ("#4fc3f7", "-.", "Prev Wk Close"),
         "prev_month_H": ("#ce93d8", "--", "Prev Mo High"),
         "prev_month_L": ("#ce93d8", ":",  "Prev Mo Low"),
+        "prev_month_C": ("#ce93d8", "-.", "Prev Mo Close"),
     }
     for key, (col, ls, lbl) in level_styles.items():
         if key in lvls:
