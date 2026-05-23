@@ -13,12 +13,32 @@
   "risk_per_trade": 0.005,
   "max_drawdown_pct": 15.0,
   "max_open_lots": 0.0,
-  "tp_mode": "full",
   "tp_rr": 1.0,
   "stop_atr_mult": 0.8,
-  "fixed_stop_pips": 25,
+  "fixed_stop_pips": 50.0,
   "atr_period": 14,
   "atr_max_pips": 0,
   "telegram_bot_token": "",
-  "telegram_chat_id": ""
+  "telegram_chat_id": "",
+  "risk_mode": "fixed",
+  "fixed_risk_amount": 100.0,
+  "slippage_pips": 1,
+  "commission_usd_per_lot": 7.0,
+  "pending_order_expiry_bars": 1,
+  "levels": {
+    "weekly": {
+      "open": false,
+      "high": true,
+      "low": true,
+      "close": false,
+      "include_previous": false
+    },
+    "monthly": {
+      "open": false,
+      "high": true,
+      "low": true,
+      "close": false,
+      "include_previous": false
+    }
+  }
 }

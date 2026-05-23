@@ -312,7 +312,6 @@ def page_backtest() -> None:
                       if cfg.get("risk_mode") == "fixed" else 0.0)
             return dict(
                 tp_rr         = float(cfg.get("tp_rr", 1.0)),
-                tp_mode       = cfg.get("tp_mode", "full"),
                 risk_pct      = float(cfg.get("risk_per_trade", 0.01)),
                 fixed_risk    = _fixed,
                 session_start = int(cfg.get("session_start_utc", 7)),
@@ -323,6 +322,9 @@ def page_backtest() -> None:
                 atr_period    = int(cfg.get("atr_period", 14)),
                 atr_max_pips  = float(cfg.get("atr_max_pips", 0)),
                 stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8)),
+                slippage_pips = float(cfg.get("slippage_pips", 3)),
+                commission_rt = float(cfg.get("commission_usd_per_lot", 7.0)),
+                level_cfg     = cfg.get("levels"),
             )
 
         with st.expander("▶ Run Backtest", expanded=False):
@@ -720,7 +722,6 @@ def page_bot_settings() -> None:
             st.caption(f"currently: {float(cfg.get('tp_rr', 1.0)):.2f}")
 
         atr_max_pips = float(cfg.get("atr_max_pips", 0))
-        tp_mode      = cfg.get("tp_mode", "full")
 
     # ── 3. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):

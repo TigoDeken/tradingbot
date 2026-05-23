@@ -14,7 +14,6 @@ from constants import PIP_VALUE, RISK_PCT  # noqa: F401 (PIP_VALUE re-exported)
 
 PULLBACK_LOOKBACK = 4
 STOP_BUFFER       = 5        # pips
-TP_MODE           = "full"   # "full" | "partial"
 SLIPPAGE_PIPS     = 3
 COMMISSION_RT_USD = 7.0      # round-trip commission per lot (raw account)
 ACCOUNT_BALANCE   = 10_000.0
@@ -50,10 +49,6 @@ class Trade:
     commission_usd:      Optional[float]        = None
     net_r_pre_commission: Optional[float]       = None
 
-    # Internal partial-mode state (not part of output)
-    _tp1_hit:            bool            = field(default=False,  repr=False)
-    _tp1_pips:           float           = field(default=0.0,    repr=False)
-    _trail_stop:         Optional[float] = field(default=None,   repr=False)
     _consec_fav:         int             = field(default=0,      repr=False)
 
 
@@ -87,16 +82,54 @@ def _grid_levels(price: float, box_size_pips: float, pip: float) -> tuple[float,
     return round(idx * box, 5), round((idx + 1) * box, 5)
 
 
-def _wm_levels(weekly_df: pd.DataFrame, monthly_df: pd.DataFrame,
-               bar_time: pd.Timestamp) -> list[float]:
-    """Previous week H/L and previous month H/L as candidate levels."""
+def _wm_levels(
+    weekly_df: pd.DataFrame,
+    monthly_df: pd.DataFrame,
+    bar_time: pd.Timestamp,
+    df: pd.DataFrame | None = None,
+    level_cfg: dict | None = None,
+) -> list[float]:
+    """Current week/month OHLC levels with optional previous-period inclusion."""
+    _default = {"open": False, "high": True, "low": True, "close": False, "include_previous": False}
+    if level_cfg is None:
+        level_cfg = {"weekly": _default.copy(), "monthly": _default.copy()}
+
+    def _pick(row: dict, cfg: dict) -> list[float]:
+        out = []
+        if cfg.get("open"):  out.append(row["Open"])
+        if cfg.get("high"):  out.append(row["High"])
+        if cfg.get("low"):   out.append(row["Low"])
+        if cfg.get("close"): out.append(row["Close"])
+        return out
+
+    def _period_ohlc(subset: pd.DataFrame) -> dict:
+        return {"Open": subset.iloc[0]["Open"], "High": float(subset["High"].max()),
+                "Low": float(subset["Low"].min()), "Close": subset.iloc[-1]["Close"]}
+
     levels = []
-    pw = weekly_df[weekly_df.index < bar_time]
-    if len(pw) >= 1:
-        levels += [pw.iloc[-1]["High"], pw.iloc[-1]["Low"]]
-    pm = monthly_df[monthly_df.index < bar_time]
-    if len(pm) >= 1:
-        levels += [pm.iloc[-1]["High"], pm.iloc[-1]["Low"]]
+
+    wcfg = level_cfg.get("weekly", _default)
+    if df is not None and any(wcfg.get(k) for k in ("open", "high", "low", "close")):
+        week_start = (bar_time - pd.Timedelta(days=bar_time.weekday())).normalize()
+        cw = df[(df.index >= week_start) & (df.index <= bar_time)]
+        if len(cw) > 0:
+            levels += _pick(_period_ohlc(cw), wcfg)
+    if wcfg.get("include_previous"):
+        pw = weekly_df[weekly_df.index < bar_time]
+        if len(pw) >= 1:
+            levels += _pick(dict(pw.iloc[-1]), wcfg)
+
+    mcfg = level_cfg.get("monthly", _default)
+    if df is not None and any(mcfg.get(k) for k in ("open", "high", "low", "close")):
+        month_start = bar_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        cm = df[(df.index >= month_start) & (df.index <= bar_time)]
+        if len(cm) > 0:
+            levels += _pick(_period_ohlc(cm), mcfg)
+    if mcfg.get("include_previous"):
+        pm = monthly_df[monthly_df.index < bar_time]
+        if len(pm) >= 1:
+            levels += _pick(dict(pm.iloc[-1]), mcfg)
+
     return sorted(set(round(l, 5) for l in levels))
 
 
@@ -123,14 +156,8 @@ def _close(
     pip_value:     float = PIP_VALUE,
     commission_rt: float = COMMISSION_RT_USD,
 ) -> None:
-    sign = 1 if trade.direction == "long" else -1
-
-    if trade._tp1_hit:
-        # Partial mode: weight 50 % TP1 + 50 % trail exit
-        trail_pips = sign * (exit_px - trade.entry_price) / pip
-        gross = 0.5 * trade._tp1_pips + 0.5 * trail_pips
-    else:
-        gross = sign * (exit_px - trade.entry_price) / pip
+    sign  = 1 if trade.direction == "long" else -1
+    gross = sign * (exit_px - trade.entry_price) / pip
 
     commission_usd  = commission_rt * trade.lot_size
     commission_pips = commission_usd / pip_value
@@ -156,7 +183,6 @@ def run_trades(
     df:               pd.DataFrame,
     pullback_lookback:int   = PULLBACK_LOOKBACK,
     stop_buffer:      float = STOP_BUFFER,
-    tp_mode:          str   = TP_MODE,
     slippage_pips:    float = SLIPPAGE_PIPS,
     pip:              float = PIP,
     pip_value:        float = PIP_VALUE,
@@ -180,6 +206,7 @@ def run_trades(
     consec_bars_exit:     int   = 0,
     strong_bar_exit:      float = 0.0,
     fixed_risk:           float = 0.0,  # >0 overrides risk_pct with a fixed currency amount
+    level_cfg:            dict | None = None,
     **_kwargs,
 ) -> tuple[list[Trade], dict]:
     """
@@ -201,7 +228,7 @@ def run_trades(
     fills_total       = 0
     expirations_total = 0
 
-    params = dict(stop_buffer=stop_buffer, tp_mode=tp_mode,
+    params = dict(stop_buffer=stop_buffer,
                   slippage_pips=slippage_pips, box_size_pips=box_size_pips)
 
     # Pre-compute weekly and monthly OHLC (used for level lookup)
@@ -219,62 +246,23 @@ def run_trades(
         for ot in open_trades[:]:
             long = ot.direction == "long"
 
-            if ot._tp1_hit:
-                # Partial trail: trail stop to previous bar's low/high
-                if i >= 1:
-                    if long:
-                        recent_low = df.iloc[i - 1]["Low"]
-                        if ot._trail_stop is None or recent_low > ot._trail_stop:
-                            ot._trail_stop = recent_low
-                    else:
-                        recent_high = df.iloc[i - 1]["High"]
-                        if ot._trail_stop is None or recent_high < ot._trail_stop:
-                            ot._trail_stop = recent_high
-                ts = ot._trail_stop or ot.entry_price
-                if (long and c < ts) or (not long and c > ts):
-                    _close(ot, bar_date, c, "trail_exit", pip, slippage_pips, pip_value, commission_rt)
+            # Stop takes priority over TP within the same bar
+            if long:
+                if l <= ot.stop_price:
+                    _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
+                    trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+                if h >= ot.tp1_price:
+                    _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
+                    trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+            else:
+                if h >= ot.stop_price:
+                    _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
+                    trades.append(ot); open_trades.remove(ot); any_closed = True; continue
+                if l <= ot.tp1_price:
+                    _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
                     trades.append(ot); open_trades.remove(ot); any_closed = True; continue
 
-            else:
-                # Trail mode: ratchet stop to previous bar's extreme
-                if tp_mode == "trail" and i >= 1:
-                    prev_bar = df.iloc[i - 1]
-                    if long:
-                        new_stop = prev_bar["Low"] - stop_buffer * pip
-                        if new_stop > ot.stop_price:
-                            ot.stop_price = round(new_stop, 5)
-                    else:
-                        new_stop = prev_bar["High"] + stop_buffer * pip
-                        if new_stop < ot.stop_price:
-                            ot.stop_price = round(new_stop, 5)
-
-                # Stop takes priority over TP within the same bar
-                if long:
-                    if l <= ot.stop_price:
-                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
-                        trades.append(ot); open_trades.remove(ot); any_closed = True; continue
-                    if h >= ot.tp1_price and tp_mode != "trail":
-                        if tp_mode == "full":
-                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
-                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
-                        else:
-                            ot._tp1_hit   = True
-                            ot._tp1_pips  = (ot.tp1_price - ot.entry_price) / pip
-                            ot._trail_stop = ot.entry_price
-                else:
-                    if h >= ot.stop_price:
-                        _close(ot, bar_date, ot.stop_price, "stop", pip, slippage_pips, pip_value, commission_rt)
-                        trades.append(ot); open_trades.remove(ot); any_closed = True; continue
-                    if l <= ot.tp1_price and tp_mode != "trail":
-                        if tp_mode == "full":
-                            _close(ot, bar_date, ot.tp1_price, "tp1", pip, slippage_pips, pip_value, commission_rt)
-                            trades.append(ot); open_trades.remove(ot); any_closed = True; continue
-                        else:
-                            ot._tp1_hit   = True
-                            ot._tp1_pips  = (ot.entry_price - ot.tp1_price) / pip
-                            ot._trail_stop = ot.entry_price
-
-                # Consecutive favorable bars exit (close on bar close)
+            # Consecutive favorable bars exit (close on bar close)
                 if consec_bars_exit > 0:
                     bar_bullish = c > row["Open"]
                     fav = bar_bullish if long else not bar_bullish
@@ -351,7 +339,7 @@ def run_trades(
             price       = row["Open"]
             current_atr = _atr(df, i, atr_period)
             stop_d      = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pips * pip)
-            levels      = _wm_levels(weekly_df, monthly_df, bar_date)
+            levels      = _wm_levels(weekly_df, monthly_df, bar_date, df=df, level_cfg=level_cfg)
             below       = [lv for lv in levels if lv < price - stop_d]
             above       = [lv for lv in levels if lv > price + stop_d]
             if not below or not above:
@@ -474,7 +462,7 @@ def plot_trades(df: pd.DataFrame, trades: list[Trade], last_n: int = 500) -> Non
         Line2D([0], [0], marker="x", color="red",    label="Exit (loss)", markersize=9, linestyle="None"),
     ]
     ax.legend(handles=legend_elements, loc="upper left")
-    ax.set_title(f"EURUSD 4H — Trades  |  {len(visible)} shown of {len(trades)} total  |  TP_MODE={TP_MODE}")
+    ax.set_title(f"EURUSD 4H — Trades  |  {len(visible)} shown of {len(trades)} total")
     ax.set_xlabel("Date"); ax.set_ylabel("Price")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     plt.xticks(rotation=45, fontsize=7)
@@ -497,7 +485,6 @@ if __name__ == "__main__":
         account_balance   = ACCOUNT_BALANCE,
         pullback_lookback = PULLBACK_LOOKBACK,
         stop_buffer       = STOP_BUFFER,
-        tp_mode           = TP_MODE,
         slippage_pips     = SLIPPAGE_PIPS,
         pip               = PIP,
         pip_value         = PIP_VALUE,

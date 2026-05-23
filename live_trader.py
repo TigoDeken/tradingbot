@@ -77,7 +77,7 @@ def load_config() -> dict:
     if "symbol" in cfg and "symbols" not in cfg:
         cfg["symbols"] = [cfg["symbol"]]
     required = ["symbols", "timeframe", "session_start_utc", "session_end_utc",
-                "risk_per_trade", "tp_mode", "pullback_lookback", "stop_buffer",
+                "risk_per_trade", "pullback_lookback", "stop_buffer",
                 "paper_mode", "max_drawdown_pct"]
     missing = [k for k in required if k not in cfg]
     if missing:
@@ -303,8 +303,6 @@ def paper_open_trade(state: dict, symbol: str, limit: dict, fill_price: float,
         "stop":       limit["stop"],
         "tp1":        limit["tp1"],
         "lot":        limit["lot"],
-        "tp1_hit":    False,
-        "trail_stop": None,
         "entry_time": pd.Timestamp.now(tz="UTC").isoformat(),
     }
     state["pending_limit"] = None
@@ -317,14 +315,10 @@ def paper_open_trade(state: dict, symbol: str, limit: dict, fill_price: float,
 def paper_close_trade(config: dict, state: dict, symbol: str, exit_price: float,
                        reason: str, pip: float, pip_value: float,
                        logger: logging.Logger) -> None:
-    t    = state["open_trade"]
-    sign = 1 if t["direction"] == "long" else -1
-    if t["tp1_hit"]:
-        trail_pips = sign * (exit_price - t["entry"]) / pip
-        gross = 0.5 * (sign * (t["tp1"] - t["entry"]) / pip) + 0.5 * trail_pips
-    else:
-        gross = sign * (exit_price - t["entry"]) / pip
-    net = gross - 3.0
+    t     = state["open_trade"]
+    sign  = 1 if t["direction"] == "long" else -1
+    gross = sign * (exit_price - t["entry"]) / pip
+    net   = gross - float(config.get("slippage_pips", 3))
     pnl = net * pip_value * t["lot"]
     state["current_balance"] = round((state["current_balance"] or 0) + pnl, 2)
     state["open_trade"] = None
@@ -365,7 +359,7 @@ def live_place_limit(config: dict, state: dict, direction: str, entry: float,
                       logger: logging.Logger) -> None:
     sym        = config["symbol"]
     order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "long" else mt5.ORDER_TYPE_SELL_LIMIT
-    tp_price   = tp1 if config["tp_mode"] == "full" else 0.0
+    tp_price   = tp1
     request = {
         "action":       mt5.TRADE_ACTION_PENDING,
         "symbol":       sym,
@@ -450,24 +444,6 @@ def in_session(config: dict, ts: pd.Timestamp) -> bool:
         return h >= s or h < e
 
 
-# ── Trail stop helper ─────────────────────────────────────────────────────────
-
-def _new_trail_stop(config: dict, direction: str, df: pd.DataFrame,
-                    current_trail: float, pip: float) -> float:
-    stop_buf  = config.get("stop_buffer", 5)
-    prev_bar  = df.iloc[-2]
-    if direction == "long":
-        candidate = float(prev_bar["Low"]) - stop_buf * pip
-        if current_trail is None or candidate > current_trail:
-            return candidate
-        return current_trail
-    else:
-        candidate = float(prev_bar["High"]) + stop_buf * pip
-        if current_trail is None or candidate < current_trail:
-            return candidate
-        return current_trail
-
-
 # ── Per-candle trade management ───────────────────────────────────────────────
 
 def _manage_paper_trade(config: dict, state: dict, symbol: str,
@@ -488,35 +464,13 @@ def _manage_paper_trade(config: dict, state: dict, symbol: str,
         f"\n  Distance to stop: {stop_dist:.1f}pip  Distance to TP: {tp_dist:.1f}pip"
     )
 
-    if t["tp1_hit"]:
-        new_ts = _new_trail_stop(config, direction, df, t["trail_stop"], pip)
-        if new_ts != t["trail_stop"]:
-            t["trail_stop"] = new_ts
-            logger.info(f"[{symbol}] [PAPER] Trail stop moved to {new_ts:.5f}")
-        ts_level = t["trail_stop"] or t["entry"]
-        if (long and c < ts_level) or (not long and c > ts_level):
-            paper_close_trade(config, state, symbol, c, "trail_exit", pip, pip_value, logger)
-        return
-
     if (long and l <= t["stop"]) or (not long and h >= t["stop"]):
         paper_close_trade(config, state, symbol, t["stop"], "stop_hit", pip, pip_value, logger)
         return
 
     tp1 = t["tp1"]
     if (long and h >= tp1) or (not long and l <= tp1):
-        if config["tp_mode"] == "full":
-            paper_close_trade(config, state, symbol, tp1, "tp1_hit", pip, pip_value, logger)
-        else:
-            t["tp1_hit"]    = True
-            t["trail_stop"] = t["entry"]
-            logger.info(
-                f"[{symbol}] [PAPER] TP1 hit @ {tp1:.5f}. 50% closed. "
-                f"Stop moved to breakeven {t['entry']:.5f}"
-            )
-            state["current_balance"] = round(
-                (state["current_balance"] or 0)
-                + 0.5 * (abs(tp1 - t["entry"]) / pip - 3) * pip_value * t["lot"], 2
-            )
+        paper_close_trade(config, state, symbol, tp1, "tp1_hit", pip, pip_value, logger)
 
 
 def _manage_live_trade(config: dict, state: dict, symbol: str,
@@ -541,29 +495,9 @@ def _manage_live_trade(config: dict, state: dict, symbol: str,
         state["open_trade"] = {
             "direction": direction, "entry": our_pos.price_open,
             "stop": our_pos.sl, "tp1": our_pos.tp, "lot": our_pos.volume,
-            "tp1_hit": False, "trail_stop": None,
         }
         logger.warning(f"[{symbol}] Reconciled open position #{our_pos.ticket} from MT5.")
         t = state["open_trade"]
-
-    long = t["direction"] == "long"
-    h, l = float(last_bar["High"]), float(last_bar["Low"])
-    tp1  = t["tp1"]
-
-    if not t["tp1_hit"] and config["tp_mode"] == "partial":
-        if (long and h >= tp1) or (not long and l <= tp1):
-            logger.info(f"[{symbol}] TP1 reached. Closing 50% of position {our_pos.ticket}.")
-            _market_close_live(our_pos, logger, volume=round(our_pos.volume / 2, 2), comment="TP1 partial")
-            live_modify_sl(config, our_pos, our_pos.price_open, logger)
-            t["tp1_hit"]    = True
-            t["trail_stop"] = our_pos.price_open
-            state["current_balance"] = float(mt5.account_info().balance)
-
-    if t["tp1_hit"]:
-        new_ts = _new_trail_stop(config, t["direction"], df, t["trail_stop"], pip)
-        if new_ts != t["trail_stop"]:
-            live_modify_sl(config, our_pos, new_ts, logger)
-            t["trail_stop"] = new_ts
 
 
 def _check_paper_pending(config: dict, state: dict, symbol: str,
@@ -601,11 +535,7 @@ def _check_paper_pending(config: dict, state: dict, symbol: str,
     if (lo and l <= t["stop"]) or (not lo and h >= t["stop"]):
         paper_close_trade(config, state, symbol, t["stop"], "stop_hit_same_bar", pip, pip_value, logger)
     elif (lo and h >= t["tp1"]) or (not lo and l <= t["tp1"]):
-        if config["tp_mode"] == "full":
-            paper_close_trade(config, state, symbol, t["tp1"], "tp1_hit_same_bar", pip, pip_value, logger)
-        else:
-            t["tp1_hit"]    = True
-            t["trail_stop"] = t["entry"]
+        paper_close_trade(config, state, symbol, t["tp1"], "tp1_hit_same_bar", pip, pip_value, logger)
 
 
 def _check_live_pending(config: dict, state: dict, symbol: str,
@@ -635,7 +565,7 @@ def _check_live_pending(config: dict, state: dict, symbol: str,
             "direction": "long" if our_pos.type == 0 else "short",
             "entry": our_pos.price_open, "stop": our_pos.sl,
             "tp1": lim.get("tp1", our_pos.tp), "lot": our_pos.volume,
-            "tp1_hit": False, "trail_stop": None, "ticket": our_pos.ticket,
+            "ticket": our_pos.ticket,
         }
         state["pending_limit"] = None
         state["current_balance"] = float(mt5.account_info().balance)
@@ -680,7 +610,7 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
     weekly_df  = df.resample("W").agg(_agg).dropna()
     monthly_df = df.resample("ME").agg(_agg).dropna()
     bar_time   = df.index[-1]
-    levels     = _wm_levels(weekly_df, monthly_df, bar_time)
+    levels     = _wm_levels(weekly_df, monthly_df, bar_time, df=df, level_cfg=config.get("levels"))
     price      = curr["Open"]
     below      = [lv for lv in levels if lv < price - stop_d]
     above      = [lv for lv in levels if lv > price + stop_d]
