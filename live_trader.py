@@ -259,7 +259,10 @@ def get_balance(config: dict, state: dict) -> float:
 
 def compute_lot(config: dict, balance: float, entry: float, stop: float,
                 pip: float, pip_value: float) -> float:
-    risk      = balance * config["risk_per_trade"]
+    if config.get("risk_mode") == "fixed":
+        risk = float(config.get("fixed_risk_amount", 0.0))
+    else:
+        risk = balance * config["risk_per_trade"]
     stop_pips = abs(entry - stop) / pip
     if stop_pips <= 0 or pip_value <= 0:
         return 0.0

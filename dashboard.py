@@ -25,7 +25,7 @@ _import_err  = ""
 try:
     from data_pipeline   import get_data
     from trade_engine    import run_trades, _wm_levels, _atr
-    from backtest_engine import build_equity, compute_metrics, _split_date
+    from backtest_engine import build_equity, compute_metrics, _split_date, plot_last3_trades
     PIPELINE_OK = True
 except Exception as e:
     _import_err = str(e)
@@ -266,12 +266,14 @@ def page_backtest() -> None:
     st.title("📊 Backtest Results")
 
     _METRICS = [
-        ("total_trades",     "Trades",      ""),
-        ("win_rate_pct",     "Win Rate",    "%"),
-        ("expectancy_net_r", "Expectancy",  " R"),
-        ("net_ev",           "Net EV",      " R"),
-        ("max_drawdown_pct", "Max DD",      "%"),
-        ("trades_per_month", "T/Month",     ""),
+        ("total_trades",     "Trades",       ""),
+        ("win_rate_pct",     "Win Rate",     "%"),
+        ("avg_win_r",        "Avg Winner",   " R"),
+        ("avg_loss_r",       "Avg Loser",    " R"),
+        ("expectancy_net_r", "Expectancy",   " R"),
+        ("net_ev",           "Net EV",       " R"),
+        ("max_drawdown_pct", "Max DD",       "%"),
+        ("trades_per_month", "T/Month",      ""),
     ]
 
     def _metric_pair(col_is, col_oos, is_m, oos_m, split_pct):
@@ -306,10 +308,13 @@ def page_backtest() -> None:
         cfg = _load_config_fresh() or {}
 
         def _cfg_run_params():
+            _fixed = (float(cfg.get("fixed_risk_amount", 0.0))
+                      if cfg.get("risk_mode") == "fixed" else 0.0)
             return dict(
                 tp_rr         = float(cfg.get("tp_rr", 1.0)),
                 tp_mode       = cfg.get("tp_mode", "full"),
                 risk_pct      = float(cfg.get("risk_per_trade", 0.01)),
+                fixed_risk    = _fixed,
                 session_start = int(cfg.get("session_start_utc", 7)),
                 session_end   = int(cfg.get("session_end_utc", 20)),
                 min_stop_pips = 5, max_lot=10.0,
@@ -369,7 +374,7 @@ def page_backtest() -> None:
                     compute_metrics(oos_t, initial=initial_balance),
                     is_t, oos_t, trades,
                     build_equity(trades, initial=initial_balance),
-                    fill_stats,
+                    fill_stats, df,
                 )
 
             if sym_choice == "All Symbols":
@@ -463,7 +468,7 @@ def page_backtest() -> None:
                         if r is None:
                             st.error("Failed to run.")
                             continue
-                        is_m, oos_m, is_t, oos_t, trades, eq, fs = r
+                        is_m, oos_m, is_t, oos_t, trades, eq, fs, df_bt = r
                         oos_ev = oos_m.get("net_ev", 0) or 0
                         _fr = round(fs["fills_total"]/fs["signals_total"]*100, 1) if fs.get("signals_total") else 0
                         lbl = (f"{sym} — {len(oos_t)} OOS trades | EV: "
@@ -473,11 +478,16 @@ def page_backtest() -> None:
                         if not eq.empty:
                             st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
                         _metric_pair(*st.columns(2), is_m, oos_m, split_pct)
+                        if trades and PIPELINE_OK:
+                            png = plot_last3_trades(df_bt, trades)
+                            if png:
+                                st.subheader("Last 3 Trades — W/M Levels")
+                                st.image(png, use_container_width=True)
 
             else:
                 prog = st.progress(0, f"Fetching {sym_choice} from MT5...")
                 try:
-                    is_m, oos_m, is_t, oos_t, all_trades, eq, sym_fill_stats = _run_sym(sym_choice)
+                    is_m, oos_m, is_t, oos_t, all_trades, eq, sym_fill_stats, df_bt = _run_sym(sym_choice)
                 except Exception as e:
                     st.error(f"Failed: {e}")
                     return
@@ -500,6 +510,12 @@ def page_backtest() -> None:
                         f"Signal fill rate: **{sym_fill_stats['fills_total']}/{_sn} = {_fr}%** filled · "
                         f"{sym_fill_stats['expirations_total']} expired"
                     )
+
+                if all_trades:
+                    png = plot_last3_trades(df_bt, all_trades)
+                    if png:
+                        st.subheader("Last 3 Trades — W/M Levels")
+                        st.image(png, use_container_width=True)
 
                 with st.expander("Trade Log", expanded=False):
                     if all_trades:
@@ -554,6 +570,8 @@ def page_backtest() -> None:
     compare = [
         ("total_trades",     "Trades",        ""),
         ("win_rate_pct",     "Win Rate",       "%"),
+        ("avg_win_r",        "Avg Winner",     " R"),
+        ("avg_loss_r",       "Avg Loser",      " R"),
         ("expectancy_net_r", "Expectancy",     " R"),
         ("net_ev",           "Net EV",         " R"),
         ("net_r",            "Total Net R",    " R"),
@@ -582,6 +600,11 @@ def page_backtest() -> None:
     if chart_path.exists():
         st.subheader("Recent Trades Chart")
         st.image(str(chart_path), use_container_width=True)
+
+    l3_path = selected_run / "last_3_trades.png"
+    if l3_path.exists():
+        st.subheader("Last 3 Trades — W/M Levels")
+        st.image(str(l3_path), use_container_width=True)
 
     trade_path = selected_run / "trade_log.csv"
     if trade_path.exists():
@@ -701,14 +724,34 @@ def page_bot_settings() -> None:
 
     # ── 3. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):
+        _cur_mode = cfg.get("risk_mode", "pct")
+        risk_mode = st.radio(
+            "Risk sizing mode",
+            ["% of balance", "Fixed amount"],
+            index=1 if _cur_mode == "fixed" else 0,
+            horizontal=True,
+            help="Fixed amount risks the same currency value every trade regardless of balance."
+        )
+        use_fixed = risk_mode == "Fixed amount"
+
         r1, r2 = st.columns(2)
         with r1:
-            risk_pct_pct = st.number_input(
-                "Risk per trade (%)", min_value=0.01, max_value=10.0,
-                value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f",
-                help="Percentage of account balance risked per trade."
-            )
-            st.caption(f"currently: {_f('risk_per_trade', 0.005) * 100:.2f}%")
+            if use_fixed:
+                fixed_risk_amount = st.number_input(
+                    "Fixed risk per trade (account currency)", min_value=1.0, max_value=100_000.0,
+                    value=_f("fixed_risk_amount", 500.0), step=50.0, format="%.0f",
+                    help="Amount risked per trade in your account currency (e.g. 500 EUR)."
+                )
+                st.caption(f"currently: {_f('fixed_risk_amount', 500.0):.0f}")
+                risk_pct_pct = _f("risk_per_trade", 0.005) * 100  # keep stored value unchanged
+            else:
+                risk_pct_pct = st.number_input(
+                    "Risk per trade (%)", min_value=0.01, max_value=10.0,
+                    value=_f("risk_per_trade", 0.005) * 100, step=0.1, format="%.2f",
+                    help="Percentage of account balance risked per trade."
+                )
+                st.caption(f"currently: {_f('risk_per_trade', 0.005) * 100:.2f}%")
+                fixed_risk_amount = _f("fixed_risk_amount", 500.0)  # keep stored value unchanged
         with r2:
             max_drawdown_pct = st.number_input(
                 "Max drawdown — circuit breaker (%)", min_value=1.0, max_value=50.0,
@@ -722,7 +765,9 @@ def page_bot_settings() -> None:
     new_vals = {
         "session_start_utc": int(session_start),
         "session_end_utc":   int(session_end),
+        "risk_mode":         "fixed" if use_fixed else "pct",
         "risk_per_trade":    round(risk_pct, 4),
+        "fixed_risk_amount": float(fixed_risk_amount),
         "tp_rr":             round(float(tp_rr), 2),
         "stop_atr_mult":     round(float(stop_atr_mult), 1),
         "fixed_stop_pips":   float(fixed_stop_pips),

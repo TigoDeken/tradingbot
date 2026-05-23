@@ -405,6 +405,152 @@ def plot_recent_trades(df: pd.DataFrame, trades: list, path: str = "recent_trade
     plt.close(fig)
 
 
+# ── Last-3-trades level chart ─────────────────────────────────────────────────
+
+def plot_last3_trades(df: pd.DataFrame, trades: list, path: str = None):
+    """3-panel candlestick chart for the last (up to 3) trades showing W/M levels.
+    Saves to path if given; otherwise returns PNG bytes for inline display."""
+    import io
+    import matplotlib.patches as mpatches
+    from matplotlib.transforms import blended_transform_factory
+    from matplotlib.lines import Line2D
+    from trade_engine import _wm_levels
+
+    if not trades:
+        return None
+
+    last3 = trades[-min(3, len(trades)):]
+    _agg  = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    weekly_df  = df.resample("W").agg(_agg).dropna()
+    monthly_df = df.resample("ME").agg(_agg).dropna()
+
+    def _candles(ax, df_win):
+        for ts, row in df_win.iterrows():
+            o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+            col = "#26a69a" if c >= o else "#ef5350"
+            x   = mdates.date2num(ts.to_pydatetime())
+            ax.add_patch(mpatches.Rectangle(
+                (x - 0.055, min(o, c)), 0.11, max(abs(c - o), 1e-5),
+                facecolor=col, edgecolor=col, linewidth=0, zorder=3,
+            ))
+            ax.plot([x, x], [l, min(o, c)],   color=col, lw=0.8, zorder=2)
+            ax.plot([x, x], [max(o, c), h],   color=col, lw=0.8, zorder=2)
+
+    def _wm_at(bar_time):
+        result = {}
+        pw = weekly_df[weekly_df.index < bar_time]
+        pm = monthly_df[monthly_df.index < bar_time]
+        if len(pw) >= 1:
+            result["Prev Wk High"] = (pw.iloc[-1]["High"], "#4fc3f7", "--")
+            result["Prev Wk Low"]  = (pw.iloc[-1]["Low"],  "#4fc3f7", ":")
+        if len(pm) >= 1:
+            result["Prev Mo High"] = (pm.iloc[-1]["High"], "#ce93d8", "--")
+            result["Prev Mo Low"]  = (pm.iloc[-1]["Low"],  "#ce93d8", ":")
+        return result
+
+    def _panel(ax, t):
+        entry_ts, exit_ts = t.entry_date, t.exit_date
+        df_win = df[(df.index >= entry_ts - pd.Timedelta(weeks=5)) &
+                    (df.index <= (exit_ts or df.index[-1]) + pd.Timedelta(weeks=1))]
+        if df_win.empty:
+            return
+        _candles(ax, df_win)
+
+        btL = blended_transform_factory(ax.transAxes, ax.transData)
+        for lbl, (price, col, ls) in _wm_at(entry_ts).items():
+            ax.axhline(price, color=col, ls=ls, lw=1.0, alpha=0.7, zorder=1)
+            ax.text(1.005, price, lbl, color=col, fontsize=6,
+                    va="center", transform=btL, clip_on=False)
+
+        is_long = t.direction == "long"
+        ax.axhline(t.entry_price, color="#FF8F00", lw=1.3, zorder=4, alpha=0.9)
+        ax.axhline(t.stop_price,  color="#ef5350", lw=1.0, ls="--", zorder=4, alpha=0.9)
+        ax.axhline(t.tp1_price,   color="#66bb6a", lw=1.0, ls="--", zorder=4, alpha=0.9)
+        for price, lbl, col in [
+            (t.entry_price, "Entry", "#FF8F00"),
+            (t.stop_price,  "Stop",  "#ef5350"),
+            (t.tp1_price,   "TP",    "#66bb6a"),
+        ]:
+            ax.text(-0.005, price, lbl, color=col, fontsize=6.5, ha="right",
+                    va="center", transform=btL, clip_on=False)
+
+        ex   = mdates.date2num(entry_ts.to_pydatetime())
+        risk = abs(t.entry_price - t.stop_price)
+        dy   = risk * 0.8 * (1 if is_long else -1)
+        ax.annotate("", xy=(ex, t.entry_price),
+                    xytext=(ex, t.entry_price - dy),
+                    arrowprops=dict(arrowstyle="-|>",
+                                   color="#26a69a" if is_long else "#ef5350", lw=2.2),
+                    zorder=7)
+        if exit_ts is not None and t.exit_price is not None:
+            ex2 = mdates.date2num(exit_ts.to_pydatetime())
+            ax.plot(ex2, t.exit_price, "X",
+                    color="#66bb6a" if (t.gross_r or 0) > 0 else "#ef5350",
+                    ms=11, mew=2.0, zorder=8)
+            ax.axvspan(ex, ex2, color=("#26a69a18" if is_long else "#ef535018"), zorder=0)
+
+        x0 = mdates.date2num(df_win.index[0].to_pydatetime())
+        x1 = mdates.date2num(df_win.index[-1].to_pydatetime())
+        ax.set_xlim(x0, x1)
+        pr = df_win["High"].max() - df_win["Low"].min()
+        ax.set_ylim(df_win["Low"].min()  - pr * 0.10,
+                    df_win["High"].max() + pr * 0.10)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0, interval=1))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, fontsize=7, color="#aaa")
+        ax.yaxis.set_major_formatter(plt.FormatStrFormatter("%.5f"))
+        ax.tick_params(axis="y", labelsize=7, labelcolor="#aaa")
+        ax.tick_params(axis="x", colors="#aaa")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#444")
+        ax.grid(True, alpha=0.12, color="#888", zorder=0)
+        ax.set_facecolor("#131722")
+
+        dir_s = "LONG" if is_long else "SHORT"
+        r_s   = f"+{t.gross_r}R  WIN" if (t.gross_r or 0) > 0 else f"{t.gross_r}R  LOSS"
+        r_col = "#66bb6a" if (t.gross_r or 0) > 0 else "#ef5350"
+        ax.set_title(f"Trade {t.trade_id}  |  {dir_s}  |  {t.exit_reason}  |  ",
+                     fontsize=9, color="#ddd", loc="left", pad=6)
+        ax.set_title(f"  {r_s}", fontsize=9, color=r_col, loc="right", pad=6)
+
+    n   = len(last3)
+    fig, axes = plt.subplots(n, 1, figsize=(16, 5.5 * n))
+    fig.patch.set_facecolor("#0d1117")
+    if n == 1:
+        axes = [axes]
+
+    for ax, t in zip(axes, last3):
+        _panel(ax, t)
+
+    legend_items = [
+        Line2D([0],[0], color="#FF8F00", lw=1.5,           label="Entry"),
+        Line2D([0],[0], color="#ef5350", lw=1.0, ls="--",  label="Stop"),
+        Line2D([0],[0], color="#66bb6a", lw=1.0, ls="--",  label="TP"),
+        Line2D([0],[0], color="#4fc3f7", lw=1.0, ls="--",  label="Prev Wk H/L"),
+        Line2D([0],[0], color="#ce93d8", lw=1.0, ls="--",  label="Prev Mo H/L"),
+        Line2D([0],[0], marker="X", color="#66bb6a", ms=8, ls="None", label="Exit win"),
+        Line2D([0],[0], marker="X", color="#ef5350",  ms=8, ls="None", label="Exit loss"),
+    ]
+    fig.legend(handles=legend_items, loc="upper center", ncol=7,
+               facecolor="#1e222d", edgecolor="#444", labelcolor="white",
+               fontsize=8, bbox_to_anchor=(0.5, 1.01))
+    fig.suptitle("Last 3 Trades — W/M Level Strategy", fontsize=12, color="white", y=1.04)
+    plt.tight_layout(pad=2.0)
+
+    if path:
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        print(f"Last-3-trades chart: {path}")
+        plt.close(fig)
+        return path
+    else:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+
 # ── Exports ───────────────────────────────────────────────────────────────────
 
 def export_trades_csv(trades: list, path: str = "trade_log.csv") -> None:
@@ -550,6 +696,7 @@ if __name__ == "__main__":
     recent_path = str(out_dir / "chart_trades.png")
     plot_recent_trades(df_raw, all_trades, path=recent_path, days=7)
     import os; os.startfile(recent_path)
+    plot_last3_trades(df_raw, all_trades, path=str(out_dir / "last_3_trades.png"))
     export_trades_csv(all_trades, path=str(out_dir / "trade_log.csv"))
     export_equity_csv(eq_all,     path=str(out_dir / "equity_curve.csv"))
 

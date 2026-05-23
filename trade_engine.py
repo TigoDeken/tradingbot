@@ -102,8 +102,8 @@ def _wm_levels(weekly_df: pd.DataFrame, monthly_df: pd.DataFrame,
 
 def _lot_size(balance: float, entry: float, stop: float, pip: float, pip_value: float,
               risk_pct: float = RISK_PCT, min_stop_pips: float = MIN_STOP_PIPS,
-              max_lot: float = MAX_LOT) -> float:
-    risk      = balance * risk_pct
+              max_lot: float = MAX_LOT, fixed_risk: float = 0.0) -> float:
+    risk      = fixed_risk if fixed_risk > 0 else balance * risk_pct
     stop_pips = abs(entry - stop) / pip
     if stop_pips < min_stop_pips:
         return 0.0
@@ -179,6 +179,7 @@ def run_trades(
     stop_atr_mult:        float = 0.0, # 0 = use fixed_stop_pips; >0 = stop = mult * ATR
     consec_bars_exit:     int   = 0,
     strong_bar_exit:      float = 0.0,
+    fixed_risk:           float = 0.0,  # >0 overrides risk_pct with a fixed currency amount
     **_kwargs,
 ) -> tuple[list[Trade], dict]:
     """
@@ -357,9 +358,9 @@ def run_trades(
                 continue
             lvl_lo, lvl_hi = max(below), min(above)
             lot_lo = _lot_size(account_balance, lvl_lo, lvl_lo - stop_d,
-                               pip, pip_value, risk_pct, min_stop_pips, max_lot)
+                               pip, pip_value, risk_pct, min_stop_pips, max_lot, fixed_risk)
             lot_hi = _lot_size(account_balance, lvl_hi, lvl_hi + stop_d,
-                               pip, pip_value, risk_pct, min_stop_pips, max_lot)
+                               pip, pip_value, risk_pct, min_stop_pips, max_lot, fixed_risk)
             if lot_lo > 0 and lot_hi > 0:
                 signals_total += 1
                 session_long  = {"entry": lvl_lo, "stop": round(lvl_lo - stop_d, 5),
