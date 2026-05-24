@@ -1,33 +1,32 @@
 {
   "symbols": [
-    "EURUSD",
-    "USDJPY",
-    "GBPUSD",
-    "AUDUSD",
-    "USDCAD"
+    "GOLD#"
   ],
   "timeframe": "M5",
-  "session_start_utc": 0,
-  "session_end_utc": 24,
-  "paper_mode": false,
-  "risk_per_trade": 0.005,
-  "max_drawdown_pct": 15.0,
-  "max_open_lots": 0.0,
-  "tp_rr": 1.0,
-  "stop_atr_mult": 0.0,
-  "fixed_stop_pips": 50.0,
-  "atr_period": 14,
-  "atr_max_pips": 0,
-  "telegram_bot_token": "",
-  "telegram_chat_id": "",
+  "paper_mode": true,
   "risk_mode": "fixed",
   "fixed_risk_amount": 100.0,
-  "slippage_pips": 1,
+  "risk_per_trade": 0.005,
+  "tp_rr": 2.0,
+  "max_drawdown_pct": 15.0,
+  "slippage_pips": 1.0,
   "commission_usd_per_lot": 7.0,
-  "pending_order_expiry_bars": 288,
+  "atr_period": 14,
+  "lookback_bars": 55000,
+  "instrument_sessions": {
+    "GOLD#": {
+      "asia": false,
+      "london": true,
+      "ny": true
+    }
+  },
+  "pending_order_expiry_bars": 1,
   "time_exit_bars": 0,
-  "levels": {
-    "weekly":  {"open": false, "high": true, "low": true, "close": true},
-    "monthly": {"open": false, "high": true, "low": true, "close": true}
-  }
+  "stop_atr_mult": 0.8,
+  "fixed_stop_pips": 25.0,
+  "vol_allow_low": true,
+  "vol_allow_mid": true,
+  "vol_allow_high": true,
+  "struct_window": 12,
+  "min_cleanness": 0
 }

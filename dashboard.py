@@ -24,7 +24,7 @@ PIPELINE_OK = False
 _import_err  = ""
 try:
     from data_pipeline   import get_data
-    from trade_engine    import run_trades, _wm_levels, _atr
+    from trade_engine    import run_trades, _atr
     from backtest_engine import build_equity, compute_metrics, _split_date, plot_last3_trades
     PIPELINE_OK = True
 except Exception as e:
@@ -52,14 +52,17 @@ STATE_JSON  = Path("state.json")
 LOG_FILE    = Path("trading_log.txt")
 CONFIG_PATH = Path("config.json")
 
-ALL_SYMBOLS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD"]
+ALL_SYMBOLS = ["GOLD#", "US100Cash#"]
 
 RESULTS_DIR = Path("results")
 
 PARAM_COLS = ["fixed_stop_pips", "tp_rr", "stop_atr_mult", "atr_max_pips"]
 
 def _pip_for(sym: str) -> float:
-    return 0.01 if "JPY" in sym else PIP
+    if "JPY"  in sym: return 0.01
+    if "GOLD" in sym: return 0.1
+    if "US100" in sym or "NAS" in sym: return 0.1
+    return PIP
 
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
@@ -233,6 +236,181 @@ def equity_fig(eq: pd.DataFrame, split_n: int = None) -> go.Figure:
     return fig
 
 
+def _plot_nbar_trades(
+    df: pd.DataFrame,
+    trades: list,
+    n: int = 3,
+    symbol: str = "GOLD#",
+    fixed_risk: float = 100.0,
+) -> go.Figure | None:
+    """
+    Interactive Plotly chart for the last N nbar trades.
+    Shows candlestick price action with horizontal level lines for
+    entry, stop, TP and the N-bar break level (range).
+    Entry/exit are marked with vertical dotted lines, not arrows.
+    """
+    if not trades:
+        return None
+
+    last_n = trades[-min(n, len(trades)):]
+    num    = len(last_n)
+    p_dec  = 2 if "GOLD" in symbol else 1
+
+    def _fmt(p): return f"{p:.{p_dec}f}"
+
+    VOL_COLORS = {"low": "#42a5f5", "mid": "#bdbdbd", "high": "#66bb6a"}
+
+    titles = []
+    for t in last_n:
+        gr   = t.gross_r or 0
+        nr   = t.net_r   or 0
+        sign = "+" if gr >= 0 else ""
+        win  = "WIN" if gr > 0 else "LOSS"
+        direction = "LONG" if t.direction == "long" else "SHORT"
+        dur  = t.duration_hours or 0
+        lot  = t.lot_size or 0
+        atr  = (t.params or {}).get("atr", 0)
+        vc  = (t.params or {}).get("vol_class") or "—"
+        cs  = (t.params or {}).get("cleanness")
+        cs_str = f"{cs:.0f}%" if cs is not None else "—"
+        titles.append(
+            f"#{t.trade_id}  {direction}  {t.entry_date.strftime('%b %d %H:%M')} UTC  |  "
+            f"{win}  {sign}{gr:.2f}R ({sign}${gr * fixed_risk:.0f})  net {sign}{nr:.2f}R ({sign}${nr * fixed_risk:.0f})  |  "
+            f"{lot:.2f} lots  risk ~${fixed_risk:.0f}  |  ATR {atr:.2f}  vol:{vc}  clean:{cs_str}  |  {t.exit_reason}  {dur:.1f}h"
+        )
+
+    fig = make_subplots(
+        rows=num, cols=1,
+        subplot_titles=titles,
+        vertical_spacing=0.10,
+        shared_xaxes=False,
+    )
+
+    for row_idx, t in enumerate(last_n):
+        row  = row_idx + 1
+        xref = "x" if row == 1 else f"x{row}"
+        yref = "y" if row == 1 else f"y{row}"
+
+        entry_ts = t.entry_date
+        exit_ts  = t.exit_date or df.index[-1]
+        df_win   = df[
+            (df.index >= entry_ts - pd.Timedelta(hours=4)) &
+            (df.index <= exit_ts  + pd.Timedelta(hours=2))
+        ]
+        if len(df_win) < 2:
+            continue
+
+        # Candlestick
+        fig.add_trace(go.Candlestick(
+            x=df_win.index,
+            open=df_win["Open"], high=df_win["High"],
+            low=df_win["Low"],   close=df_win["Close"],
+            increasing=dict(line=dict(color="#26a69a", width=0.7), fillcolor="#1a3d38"),
+            decreasing=dict(line=dict(color="#ef5350", width=0.7), fillcolor="#3d1a1a"),
+            showlegend=False,
+        ), row=row, col=1)
+
+        x0_iso = df_win.index[0].isoformat()
+        x1_iso = df_win.index[-1].isoformat()
+
+        # Horizontal level lines
+        levels = [
+            (t.entry_price, "#FF8F00", f"Entry  {_fmt(t.entry_price)}",  "solid", 2.0),
+            (t.stop_price,  "#ef5350", f"Stop   {_fmt(t.stop_price)}",   "dash",  1.3),
+            (t.tp1_price,   "#66bb6a", f"TP     {_fmt(t.tp1_price)}",    "dash",  1.3),
+        ]
+        break_level = (t.params or {}).get("break_level")
+        if break_level is not None:
+            levels.append((break_level, "#ce93d8", f"Range  {_fmt(break_level)}", "dot", 1.0))
+
+        for price, color, label, dash, lw in levels:
+            fig.add_shape(
+                type="line",
+                x0=x0_iso, x1=x1_iso, y0=price, y1=price,
+                line=dict(color=color, width=lw, dash=dash),
+                row=row, col=1, layer="above",
+            )
+            fig.add_annotation(
+                x=x1_iso, y=price,
+                text=f"  {label}",
+                xanchor="left", yanchor="middle",
+                showarrow=False,
+                font=dict(color=color, size=9, family="monospace"),
+                xref=xref, yref=yref,
+            )
+
+        # Entry vertical line (dotted)
+        fig.add_shape(
+            type="line",
+            x0=entry_ts.isoformat(), x1=entry_ts.isoformat(),
+            y0=0, y1=1, yref="y domain",
+            line=dict(color="#FF8F00", width=1.0, dash="dot"),
+            row=row, col=1,
+        )
+
+        # Vol class annotation near entry
+        vc = (t.params or {}).get("vol_class")
+        if vc and not (isinstance(vc, float) and np.isnan(vc)):
+            vc_color = VOL_COLORS.get(str(vc), "#bdbdbd")
+            fig.add_annotation(
+                x=entry_ts.isoformat(),
+                y=1, yref=f"{yref} domain",
+                text=f"vol:{vc}",
+                xanchor="left", yanchor="top",
+                showarrow=False,
+                font=dict(color=vc_color, size=9, family="monospace"),
+                xref=xref,
+            )
+
+        # Exit vertical line + shaded region
+        if t.exit_date:
+            exit_color = "#66bb6a" if (t.gross_r or 0) >= 0 else "#ef5350"
+            fig.add_shape(
+                type="line",
+                x0=t.exit_date.isoformat(), x1=t.exit_date.isoformat(),
+                y0=0, y1=1, yref="y domain",
+                line=dict(color=exit_color, width=1.0, dash="dot"),
+                row=row, col=1,
+            )
+            fill = "rgba(102,187,106,0.07)" if (t.gross_r or 0) >= 0 else "rgba(239,83,80,0.07)"
+            fig.add_shape(
+                type="rect",
+                x0=entry_ts.isoformat(), x1=t.exit_date.isoformat(),
+                y0=0, y1=1, yref="y domain",
+                fillcolor=fill, line=dict(width=0), layer="below",
+                row=row, col=1,
+            )
+
+        pr  = df_win["High"].max() - df_win["Low"].min()
+        fig.update_yaxes(
+            range=[df_win["Low"].min() - pr * 0.12, df_win["High"].max() + pr * 0.12],
+            tickformat=f".{p_dec}f", tickfont=dict(size=9, color="#aaa"),
+            gridcolor="#1e222d", row=row, col=1,
+        )
+        fig.update_xaxes(
+            rangeslider_visible=False,
+            tickfont=dict(size=8, color="#aaa"),
+            gridcolor="#1e222d", row=row, col=1,
+        )
+
+    # Colour subtitle text by win/loss
+    for ann, t in zip(fig.layout.annotations, last_n):
+        ann.font.color = "#66bb6a" if (t.gross_r or 0) > 0 else "#ef5350"
+        ann.font.size  = 10
+
+    fig.update_layout(
+        height=420 * num,
+        template="plotly_dark",
+        paper_bgcolor="#0d1117",
+        plot_bgcolor="#131722",
+        showlegend=False,
+        margin=dict(r=190, t=50, b=30),
+        title=dict(text=f"Last {num} Trades — {symbol}",
+                   font=dict(color="#ccc", size=13)),
+    )
+    return fig
+
+
 def _metric_row(m: dict, prefix: str = "") -> None:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric(f"{prefix}Trades",
@@ -314,8 +492,6 @@ def page_backtest() -> None:
                 tp_rr         = float(cfg.get("tp_rr", 1.0)),
                 risk_pct      = float(cfg.get("risk_per_trade", 0.01)),
                 fixed_risk    = _fixed,
-                session_start = int(cfg.get("session_start_utc", 7)),
-                session_end   = int(cfg.get("session_end_utc", 20)),
                 min_stop_pips = 5, max_lot=10.0,
                 max_open_lots = float(cfg.get("max_open_lots", 0.0)),
                 fixed_stop_pips = float(cfg.get("fixed_stop_pips", 25.0)),
@@ -324,7 +500,6 @@ def page_backtest() -> None:
                 stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8)),
                 slippage_pips = float(cfg.get("slippage_pips", 3)),
                 commission_rt = float(cfg.get("commission_usd_per_lot", 7.0)),
-                level_cfg       = cfg.get("levels"),
                 time_exit_bars  = int(cfg.get("time_exit_bars", 0)),
             )
 
@@ -356,10 +531,36 @@ def page_backtest() -> None:
                 return (0.01, 9.0) if "JPY" in sym else (0.0001, 10.0)
 
             def _run_sym(sym):
+                from nbar_breakout_engine import run_nbar, NBAR_SYMBOLS
                 pip, pip_value = _get_pip_info(sym)
-                df = get_data(symbol=sym, bars=bars)
-                trades, fill_stats = run_trades(df, account_balance=initial_balance,
-                                                pip=pip, pip_value=pip_value, **params)
+                _bars = int(cfg.get("lookback_bars", bars))
+                df = get_data(symbol=sym, bars=_bars)
+                if sym in NBAR_SYMBOLS:
+                    _vf = [v for v, k in [("low",  "vol_allow_low"),
+                                          ("mid",  "vol_allow_mid"),
+                                          ("high", "vol_allow_high")]
+                           if cfg.get(k, True)]
+                    _sym_sess = cfg.get("instrument_sessions", {}).get(
+                        sym, {"asia": False, "london": True, "ny": True})
+                    _sessions = [k for k, v in _sym_sess.items() if v]
+                    trades, raw = run_nbar(
+                        df, sym,
+                        tp_rr=float(cfg.get("tp_rr", 2.0)),
+                        slippage_pips=float(cfg.get("slippage_pips", 1.0)),
+                        pip=pip, pip_value=pip_value,
+                        commission_rt=float(cfg.get("commission_usd_per_lot", 7.0)),
+                        fixed_risk=float(cfg.get("fixed_risk_amount", 100.0)),
+                        sessions=_sessions,
+                        vol_filter=_vf,
+                        min_cleanness=float(cfg.get("min_cleanness", 0)),
+                        struct_window=int(cfg.get("struct_window", 12)),
+                    )
+                    fill_stats = {"signals_total": raw["signals"],
+                                  "fills_total":   raw["fills"],
+                                  "expirations_total": 0}
+                else:
+                    trades, fill_stats = run_trades(df, account_balance=initial_balance,
+                                                    pip=pip, pip_value=pip_value, **params)
                 split_dt = df.index[0] + (df.index[-1] - df.index[0]) * split_ratio
                 is_t     = [t for t in trades if t.entry_date <  split_dt]
                 oos_t    = [t for t in trades if t.entry_date >= split_dt]
@@ -472,11 +673,12 @@ def page_backtest() -> None:
                         if not eq.empty:
                             st.plotly_chart(equity_fig(eq, split_n=len(is_t)), use_container_width=True)
                         _metric_pair(*st.columns(2), is_m, oos_m, split_pct)
-                        if trades and PIPELINE_OK:
-                            png = plot_last3_trades(df_bt, trades)
-                            if png:
-                                st.subheader("Last 3 Trades — W/M Levels")
-                                st.image(png, use_container_width=True)
+                        if trades:
+                            _fig = _plot_nbar_trades(df_bt, trades, symbol=sym,
+                                                     fixed_risk=float(cfg.get("fixed_risk_amount", 100.0)))
+                            if _fig:
+                                st.subheader("Last 3 Trades — Price Action")
+                                st.plotly_chart(_fig, use_container_width=True)
 
             else:
                 prog = st.progress(0, f"Fetching {sym_choice} from MT5...")
@@ -506,10 +708,11 @@ def page_backtest() -> None:
                     )
 
                 if all_trades:
-                    png = plot_last3_trades(df_bt, all_trades)
-                    if png:
-                        st.subheader("Last 3 Trades — W/M Levels")
-                        st.image(png, use_container_width=True)
+                    _fig = _plot_nbar_trades(df_bt, all_trades, symbol=sym_choice,
+                                             fixed_risk=float(cfg.get("fixed_risk_amount", 100.0)))
+                    if _fig:
+                        st.subheader("Last 3 Trades — Price Action")
+                        st.plotly_chart(_fig, use_container_width=True)
 
                 with st.expander("Trade Log", expanded=False):
                     if all_trades:
@@ -597,7 +800,7 @@ def page_backtest() -> None:
 
     l3_path = selected_run / "last_3_trades.png"
     if l3_path.exists():
-        st.subheader("Last 3 Trades — W/M Levels")
+        st.subheader("Last 3 Trades")
         st.image(str(l3_path), use_container_width=True)
 
     trade_path = selected_run / "trade_log.csv"
@@ -662,34 +865,25 @@ def page_bot_settings() -> None:
         except Exception:
             return old_v != new_v
 
-    # ── 1. Trading Session ────────────────────────────────────────────────────
-    with st.expander("🕐 Trading Session", expanded=True):
-        pr1, pr2, _ = st.columns([1, 1, 3])
-        preset_7_22  = pr1.button("07–22 (Eur+US)", use_container_width=True)
-        preset_12_22 = pr2.button("12–22 (US only)", use_container_width=True)
+    # ── 1. Trading Sessions ───────────────────────────────────────────────────
+    _instr_sess = cfg.get("instrument_sessions", {})
+    instrument_sessions = {}
 
-        default_start = 12 if preset_12_22 else (7 if preset_7_22 else _i("session_start_utc", 7))
-        default_end   = 22 if (preset_12_22 or preset_7_22) else _i("session_end_utc", 20)
+    with st.expander("🕐 Trading Sessions", expanded=True):
+        st.caption("Asia 00–03 UTC  ·  London 07–10 UTC  ·  NY 12–15 UTC")
 
-        s1, s2 = st.columns(2)
-        with s1:
-            session_start = st.number_input(
-                "Session start (UTC hour)", min_value=0, max_value=23,
-                value=default_start, step=1,
-                help="Only take new trades at or after this UTC hour."
-            )
-            st.caption(f"currently: {_i('session_start_utc', 7)}")
-        with s2:
-            session_end = st.number_input(
-                "Session end (UTC hour)", min_value=1, max_value=24,
-                value=default_end, step=1,
-                help="Stop taking new trades after this UTC hour."
-            )
-            st.caption(f"currently: {_i('session_end_utc', 20)}")
+        # GOLD#
+        _gs = _instr_sess.get("GOLD#", {"asia": False, "london": True, "ny": True})
+        st.markdown("**GOLD#**")
+        g1, g2, g3, _ = st.columns([1, 1, 1, 2])
+        gold_asia   = g1.checkbox("Asia",   value=bool(_gs.get("asia",   False)), key="gold_asia")
+        gold_london = g2.checkbox("London", value=bool(_gs.get("london", True)),  key="gold_london")
+        gold_ny     = g3.checkbox("NY",     value=bool(_gs.get("ny",     True)),  key="gold_ny")
+        instrument_sessions["GOLD#"] = {"asia": gold_asia, "london": gold_london, "ny": gold_ny}
 
     # ── 2. Entry & Stop ───────────────────────────────────────────────────────
     with st.expander("🎯 Entry & Stop", expanded=True):
-        st.caption("Entries at previous week / month high-low levels. Stop scales with ATR.")
+        st.caption("Stop scales with ATR or fixed pips.")
         e1, e2, e3 = st.columns(3)
         with e1:
             stop_atr_mult = st.number_input(
@@ -715,7 +909,38 @@ def page_bot_settings() -> None:
 
         atr_max_pips = float(cfg.get("atr_max_pips", 0))
 
-    # ── 3. Risk ───────────────────────────────────────────────────────────────
+    # ── 3. Volatility Filter ──────────────────────────────────────────────────
+    with st.expander("📊 Volatility Filter", expanded=True):
+        st.caption("Only trade bars classified in the selected volatility regimes.")
+        v1, v2, v3 = st.columns(3)
+        with v1:
+            vol_allow_low  = st.checkbox("Low volatility",  value=bool(cfg.get("vol_allow_low",  True)))
+        with v2:
+            vol_allow_mid  = st.checkbox("Mid volatility",  value=bool(cfg.get("vol_allow_mid",  True)))
+        with v3:
+            vol_allow_high = st.checkbox("High volatility", value=bool(cfg.get("vol_allow_high", True)))
+        st.caption("Bars outside Asia/London/NY session windows are always allowed (NaN = pass-through).")
+
+    # ── 4. Structure Filter ───────────────────────────────────────────────────
+    with st.expander("📐 Structure Filter", expanded=True):
+        st.caption("Cleanness = fraction of bars in the window that were clean directional bars (broke high/low AND closed through it).")
+        sw_col, cl_col, _ = st.columns(3)
+        with sw_col:
+            struct_window = st.number_input(
+                "Window (bars)", min_value=4, max_value=48,
+                value=int(cfg.get("struct_window", 12)), step=1,
+                help="Rolling window. 12 bars = 1 hour on M5."
+            )
+            st.caption(f"currently: {int(cfg.get('struct_window', 12))} bars")
+        with cl_col:
+            min_cleanness = st.slider(
+                "Minimum cleanness (%)", min_value=0, max_value=100,
+                value=int(cfg.get("min_cleanness", 0)), step=5,
+                help="0 = no filter. 50 = at least half the window bars must be clean. 100 = all bars clean."
+            )
+            st.caption(f"currently: {int(cfg.get('min_cleanness', 0))}%")
+
+    # ── 5. Risk ───────────────────────────────────────────────────────────────
     with st.expander("🛡️ Risk", expanded=True):
         _cur_mode = cfg.get("risk_mode", "pct")
         risk_mode = st.radio(
@@ -756,15 +981,19 @@ def page_bot_settings() -> None:
 
     # ── Unsaved changes detection + save ─────────────────────────────────────
     new_vals = {
-        "session_start_utc": int(session_start),
-        "session_end_utc":   int(session_end),
-        "risk_mode":         "fixed" if use_fixed else "pct",
+        "instrument_sessions": instrument_sessions,
+        "risk_mode":           "fixed" if use_fixed else "pct",
         "risk_per_trade":    round(risk_pct, 4),
         "fixed_risk_amount": float(fixed_risk_amount),
         "tp_rr":             round(float(tp_rr), 2),
         "stop_atr_mult":     round(float(stop_atr_mult), 1),
         "fixed_stop_pips":   float(fixed_stop_pips),
         "max_drawdown_pct":  float(max_drawdown_pct),
+        "vol_allow_low":        bool(vol_allow_low),
+        "vol_allow_mid":        bool(vol_allow_mid),
+        "vol_allow_high":       bool(vol_allow_high),
+        "struct_window":  int(struct_window),
+        "min_cleanness":  int(min_cleanness),
     }
 
     changed_keys = [k for k, v in new_vals.items() if _val_changed(k, v)]
@@ -825,74 +1054,14 @@ def page_live() -> None:
     c2.metric("Last Candle", str(last_time)[:16])
     st.divider()
 
-    # ── W/M levels + current bar ──────────────────────────────────────────────
-    live_cfg      = _load_config_fresh() or {}
-    tp_rr_val     = float(live_cfg.get("tp_rr", 1.0))
-    stop_atr_m    = float(live_cfg.get("stop_atr_mult", 0.8))
-    fixed_sp      = float(live_cfg.get("fixed_stop_pips", 25.0))
-    atr_period_v  = int(live_cfg.get("atr_period", 14))
-    pip_size      = 0.01 if "JPY" in selected else PIP
-
-    curr        = df_raw.iloc[-1]
-    current_atr = _atr(df_raw, len(df_raw), atr_period_v)
-    atr_pips    = current_atr / pip_size
-    stop_d      = (stop_atr_m * current_atr) if stop_atr_m > 0 else (fixed_sp * pip_size)
-    stop_d_pips = stop_d / pip_size
-
-    _agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-    weekly_df_live  = df_raw.resample("W").agg(_agg).dropna()
-    monthly_df_live = df_raw.resample("ME").agg(_agg).dropna()
-    all_levels = _wm_levels(weekly_df_live, monthly_df_live, df_raw.index[-1])
-
-    price  = curr["Open"]
-    below  = [lv for lv in all_levels if lv < price - stop_d]
-    above  = [lv for lv in all_levels if lv > price + stop_d]
-    lvl_lo = max(below) if below else None
-    lvl_hi = min(above) if above else None
-
-    col_bars, col_sig = st.columns(2)
-    with col_bars:
-        st.subheader("Current Bar")
-        bar_data = pd.DataFrame([{
-            "Open": curr["Open"], "High": curr["High"],
-            "Low": curr["Low"], "Close": curr["Close"],
-        }])
-        st.dataframe(bar_data.round(5), use_container_width=True)
-        st.metric("ATR (14-bar M5)", f"{atr_pips:.1f} pip")
-        st.metric("Stop distance",   f"{stop_d_pips:.1f} pip  ({stop_atr_m:.1f}× ATR)")
-
-        st.markdown("**All W/M Levels**")
-        for lv in sorted(all_levels, reverse=True):
-            dist = (lv - price) / pip_size
-            tag  = "↑" if lv > price else "↓"
-            st.caption(f"{lv:.5f}  {tag}  ({dist:+.1f} pip)")
-
-    with col_sig:
-        st.subheader("Active Setup")
-        if lvl_lo is None and lvl_hi is None:
-            st.info("No W/M level within range of current price.")
-        else:
-            if lvl_lo and curr["Low"] <= lvl_lo:
-                entry = lvl_lo; sl = round(entry - stop_d, 5); tp = round(entry + tp_rr_val * stop_d, 5)
-                st.success(f"**LONG** — level {entry:.5f} touched")
-                p1, p2, p3 = st.columns(3)
-                p1.metric("Entry", f"{entry:.5f}")
-                p2.metric("Stop",  f"{sl:.5f}", delta=f"-{stop_d_pips:.0f}pip")
-                p3.metric("TP",    f"{tp:.5f}",  delta=f"+{stop_d_pips*tp_rr_val:.0f}pip")
-            elif lvl_hi and curr["High"] >= lvl_hi:
-                entry = lvl_hi; sl = round(entry + stop_d, 5); tp = round(entry - tp_rr_val * stop_d, 5)
-                st.success(f"**SHORT** — level {entry:.5f} touched")
-                p1, p2, p3 = st.columns(3)
-                p1.metric("Entry", f"{entry:.5f}")
-                p2.metric("Stop",  f"{sl:.5f}", delta=f"+{stop_d_pips:.0f}pip")
-                p3.metric("TP",    f"{tp:.5f}",  delta=f"-{stop_d_pips*tp_rr_val:.0f}pip")
-            else:
-                st.info("No level touched this bar — watching for fills.")
-                if lvl_lo:
-                    st.metric("Buy limit", f"{lvl_lo:.5f}", delta=f"{(lvl_lo-price)/pip_size:+.1f} pip")
-                if lvl_hi:
-                    st.metric("Sell limit", f"{lvl_hi:.5f}", delta=f"{(lvl_hi-price)/pip_size:+.1f} pip")
-
+    # ── Current bar ───────────────────────────────────────────────────────────
+    curr = df_raw.iloc[-1]
+    bar_data = pd.DataFrame([{
+        "Open": curr["Open"], "High": curr["High"],
+        "Low": curr["Low"], "Close": curr["Close"],
+    }])
+    st.subheader("Current Bar")
+    st.dataframe(bar_data.round(5), use_container_width=True)
     st.divider()
 
 

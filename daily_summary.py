@@ -70,12 +70,15 @@ def read_states(symbols):
 
 def build_message(config, today_str, signals, placed, errors, criticals, positions):
     date_fmt = datetime.now(timezone.utc).strftime("%d %b %Y")
-    start    = config.get("session_start_utc", 3)
-    end      = config.get("session_end_utc", 20)
+    instr_sess = config.get("instrument_sessions", {})
+    sess_str   = "  ".join(
+        f"{sym}: {'+'.join(k for k, v in s.items() if v) or 'none'}"
+        for sym, s in instr_sess.items()
+    ) or "all hours"
 
     lines = [
         f"Trading Bot — Daily Summary",
-        f"{date_fmt} | Session {start:02d}:00–{end:02d}:00 UTC",
+        f"{date_fmt} | Sessions: {sess_str}",
         "",
     ]
 

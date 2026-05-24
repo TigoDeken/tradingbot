@@ -23,7 +23,7 @@ import pandas as pd
 
 from data_pipeline import connect as dp_connect, disconnect as dp_disconnect, fetch_ohlc
 from constants     import MAGIC
-from trade_engine  import _wm_levels, _atr, MIN_STOP_PIPS
+from trade_engine  import _atr, MIN_STOP_PIPS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_PATH         = Path("config.json")
@@ -76,9 +76,7 @@ def load_config() -> dict:
     # Support both old single-symbol ("symbol") and new multi-symbol ("symbols") config
     if "symbol" in cfg and "symbols" not in cfg:
         cfg["symbols"] = [cfg["symbol"]]
-    required = ["symbols", "timeframe", "session_start_utc", "session_end_utc",
-                "risk_per_trade", "pullback_lookback", "stop_buffer",
-                "paper_mode", "max_drawdown_pct"]
+    required = ["symbols", "timeframe", "paper_mode", "max_drawdown_pct"]
     missing = [k for k in required if k not in cfg]
     if missing:
         raise ValueError(f"config.json missing keys: {missing}")
@@ -185,7 +183,8 @@ _TF_MAP = {
 def fetch_data(config: dict, logger: logging.Logger) -> pd.DataFrame:
     ensure_connected(logger)
     tf = _TF_MAP.get(config["timeframe"], mt5.TIMEFRAME_M5)
-    df = fetch_ohlc(symbol=config["symbol"], timeframe=tf, bars=15000)
+    bars = int(config.get("lookback_bars", 55000))
+    df = fetch_ohlc(symbol=config["symbol"], timeframe=tf, bars=bars)
     logger.debug(f"[{config['symbol']}] Fetched {len(df)} bars. Last: {df.index[-1]}")
     return df
 
@@ -330,6 +329,53 @@ def paper_close_trade(config: dict, state: dict, symbol: str, exit_price: float,
     )
 
 
+# ── Market-entry helpers (nbar strategy: enter at signal bar close) ───────────
+
+def paper_market_entry(state: dict, symbol: str, direction: str, entry: float,
+                        stop: float, tp1: float, lot: float,
+                        logger: logging.Logger) -> None:
+    state["open_trade"] = {
+        "direction": direction, "entry": entry,
+        "stop": stop, "tp1": tp1, "lot": lot,
+        "entry_time": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    logger.info(
+        f"[{symbol}] [PAPER] Market entry {direction.upper()} {lot} lots @ {entry:.5f}  "
+        f"SL={stop:.5f}  TP={tp1:.5f}"
+    )
+
+
+def live_market_entry(config: dict, state: dict, direction: str, entry: float,
+                       stop: float, tp1: float, lot: float,
+                       logger: logging.Logger) -> None:
+    sym       = config["symbol"]
+    order_type = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       sym,
+        "volume":       lot,
+        "type":         order_type,
+        "price":        entry,
+        "sl":           stop,
+        "tp":           tp1,
+        "deviation":    20,
+        "magic":        MAGIC,
+        "comment":      "NbarBreakout",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    try:
+        result = _send_order(request, logger, f"[{sym}] Market {direction.upper()} {lot}L @ {entry:.5f}")
+    except TradingHalt as e:
+        raise OrderSkip(str(e))
+    state["open_trade"] = {
+        "direction": direction, "entry": entry,
+        "stop": stop, "tp1": tp1, "lot": lot,
+        "ticket": result.order,
+        "entry_time": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+
+
 # ── Live-mode order helpers ───────────────────────────────────────────────────
 
 def _send_order(request: dict, logger: logging.Logger,
@@ -432,17 +478,16 @@ def live_modify_sl(config: dict, position: mt5.TradePosition, new_sl: float,
 # ── Session check ─────────────────────────────────────────────────────────────
 
 def in_session(config: dict, ts: pd.Timestamp) -> bool:
-    sym_sessions = config.get("symbol_sessions", {})
-    sym = config.get("symbol", "")
-    if sym in sym_sessions:
-        s, e = sym_sessions[sym]
-    else:
-        s, e = config["session_start_utc"], config["session_end_utc"]
-    h = ts.hour
-    if s < e:
-        return s <= h < e
-    else:  # wraps midnight
-        return h >= s or h < e
+    from regime_filter import SESSION_WINDOWS
+    sym        = config.get("symbol", "")
+    sess_cfg   = config.get("instrument_sessions", {}).get(sym, {"london": True, "ny": True})
+    h          = ts.hour
+    for name, enabled in sess_cfg.items():
+        if enabled and name in SESSION_WINDOWS:
+            start, end = SESSION_WINDOWS[name]
+            if start <= h < end:
+                return True
+    return False
 
 
 # ── Per-candle trade management ───────────────────────────────────────────────
@@ -581,10 +626,7 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
 
     bar_time = df.index[-1]
     if not in_session(config, bar_time):
-        logger.info(
-            f"[{symbol}] No entry — outside session "
-            f"({bar_time.hour:02d}:00 UTC, window {config['session_start_utc']}-{config['session_end_utc']})"
-        )
+        logger.info(f"[{symbol}] No entry — outside session ({bar_time.hour:02d}:00 UTC).")
         return
 
     curr = df.iloc[-1]
@@ -593,76 +635,43 @@ def check_entry(config: dict, state: dict, df: pd.DataFrame, symbol: str,
         f"  L={curr['Low']:.5f}  C={curr['Close']:.5f}"
     )
 
-    tp_rr          = float(config.get("tp_rr", 1.0))
-    atr_period     = int(config.get("atr_period", 14))
-    stop_atr_mult  = float(config.get("stop_atr_mult", 0.0))
-    fixed_stop_pip = float(config.get("fixed_stop_pips", 25.0))
+    tp_rr = float(config.get("tp_rr", 2.0))
 
-    current_atr = _atr(df, len(df), atr_period)
-    stop_d = (stop_atr_mult * current_atr) if stop_atr_mult > 0 else (fixed_stop_pip * pip)
+    # ── N-bar breakout engine ──────────────────────────────────────────────────
+    from nbar_breakout_engine import NBAR_SYMBOLS, compute_live_signal
+    if symbol in NBAR_SYMBOLS:
+        sig = compute_live_signal(df, symbol)
+        if sig is None:
+            logger.info(f"[{symbol}] No nbar signal.")
+            return
 
-    atr_max = float(config.get("atr_max_pips", 0))
-    if atr_max > 0 and (current_atr / pip) > atr_max:
-        logger.info(f"[{symbol}] Skip — ATR {current_atr/pip:.1f}pip > {atr_max:.0f}pip")
+        direction = sig["direction"]
+        atr_val   = sig["atr"]
+        entry     = float(curr["Close"])
+        stop      = entry - atr_val if direction == "long" else entry + atr_val
+        tp1       = entry + tp_rr * atr_val if direction == "long" else entry - tp_rr * atr_val
+
+        if abs(entry - stop) <= 0:
+            logger.warning(f"[{symbol}] Nbar signal: zero stop distance — skipping.")
+            return
+
+        balance = get_balance(config, state)
+        lot     = compute_lot(config, balance, entry, stop, pip, pip_value)
+        if lot <= 0:
+            logger.info(f"[{symbol}] Nbar signal: lot=0 (balance=${balance:.0f} stop={abs(entry-stop):.4f}).")
+            return
+
+        logger.info(
+            f"[{symbol}] NBAR {direction.upper()}: "
+            f"entry={entry:.5f}  stop={stop:.5f}  tp={tp1:.5f}  ATR={atr_val:.4f}  lot={lot}"
+        )
+        if config["paper_mode"]:
+            paper_market_entry(state, symbol, direction, entry, stop, tp1, lot, logger)
+        else:
+            live_market_entry(config, state, direction, entry, stop, tp1, lot, logger)
         return
 
-    # Compute weekly/monthly levels
-    _agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-    weekly_df  = df.resample("W").agg(_agg).dropna()
-    monthly_df = df.resample("ME").agg(_agg).dropna()
-    bar_time   = df.index[-1]
-    levels     = _wm_levels(weekly_df, monthly_df, bar_time, df=df, level_cfg=config.get("levels"))
-    price      = curr["Open"]
-    below      = [lv for lv in levels if lv < price - stop_d]
-    above      = [lv for lv in levels if lv > price + stop_d]
-
-    if not below or not above:
-        logger.info(f"[{symbol}] No entry — no W/M levels within range (price={price:.5f})")
-        return
-
-    lvl_lo, lvl_hi = max(below), min(above)
-    logger.info(f"[{symbol}] W/M levels: buy@{lvl_lo:.5f}  sell@{lvl_hi:.5f}  stop={stop_d/pip:.1f}pip")
-
-    if curr["Low"] <= lvl_lo:
-        direction = "long"
-        entry = lvl_lo
-        stop  = round(lvl_lo - stop_d, 5)
-        tp1   = round(lvl_lo + tp_rr * stop_d, 5)
-    elif curr["High"] >= lvl_hi:
-        direction = "short"
-        entry = lvl_hi
-        stop  = round(lvl_hi + stop_d, 5)
-        tp1   = round(lvl_hi - tp_rr * stop_d, 5)
-    else:
-        logger.info(f"[{symbol}] No entry — bar did not touch either level")
-        return
-
-    direction, entry, stop, tp1 = direction, entry, stop, tp1
-    stop_pips = abs(entry - stop) / pip
-    risk_r    = abs(tp1 - entry) / abs(entry - stop)
-
-    logger.info(
-        f"[{symbol}] SIGNAL: {direction.upper()}  "
-        f"entry={entry:.5f}  stop={stop:.5f}  tp={tp1:.5f}  "
-        f"stop_dist={stop_pips:.1f}pip  R:R=1:{risk_r:.1f}"
-    )
-
-    balance = get_balance(config, state)
-    lot     = compute_lot(config, balance, entry, stop, pip, pip_value)
-    if lot <= 0:
-        logger.info(f"[{symbol}] No entry — lot size zero (stop={stop_pips:.1f}pip  balance=${balance:.2f})")
-        return
-
-    logger.info(
-        f"[{symbol}] Placing order: {direction.upper()} {lot} lots  "
-        f"risk=${balance * config['risk_per_trade']:.2f} ({config['risk_per_trade']*100:.1f}%)"
-    )
-    if config["paper_mode"]:
-        paper_cancel_limit(state, symbol, "new signal", logger)
-        paper_place_limit(state, symbol, direction, entry, stop, tp1, lot, logger)
-    else:
-        live_cancel_limits(config, logger)
-        live_place_limit(config, state, direction, entry, stop, tp1, lot, logger)
+    logger.info(f"[{symbol}] No entry strategy configured for this symbol.")
 
 
 # ── Main candle handler ───────────────────────────────────────────────────────
