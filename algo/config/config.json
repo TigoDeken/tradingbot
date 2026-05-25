@@ -1,26 +1,12 @@
 {
-  "symbols": ["SOLUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"],
-  "interval": "5",
-  "risk": {
-    "mode": "fixed",
-    "fixed_risk_usd": 10.0,
-    "risk_per_trade_pct": 0.01,
-    "max_drawdown_pct": 15.0,
-    "max_open_positions": 1
+  "watchlist": {
+    "max_spread_pct": 1.0,
+    "min_volume_usd": 500000,
+    "max_volume_usd": 10000000
   },
-  "strategy": {
-    "name": "nbar_breakout",
-    "n_bars": 8,
-    "atr_period": 14,
-    "atr_mult": 1.2,
-    "depth_thresh": 0.677,
-    "tp_rr": 2.0,
-    "stop_atr_mult": 1.0
-  },
-  "exchange": {
-    "name": "bybit",
-    "testnet": true,
-    "leverage": 1,
-    "order_type": "market"
+  "signal_filter": {
+    "enabled": true,
+    "oi_max_quintile": 3,
+    "oi_lookback_bars": 500
   }
 }
