@@ -6,7 +6,6 @@ import matplotlib.dates as mdates
 from dataclasses import dataclass, field
 from typing import Optional
 
-from data_pipeline import get_data
 from constants import PIP
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -456,6 +455,7 @@ def plot_trades(df: pd.DataFrame, trades: list[Trade], last_n: int = 500) -> Non
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from data_pipeline import get_data
     print("Fetching data...")
     df = get_data()
 

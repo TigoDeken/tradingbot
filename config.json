@@ -1,29 +1,27 @@
 {
-  "symbols": [
-    "GOLD#"
-  ],
+  "exchange": "bybit",
+  "testnet": true,
+
+  "symbols": ["SOLUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"],
   "timeframe": "M5",
   "paper_mode": true,
+
+  "session_filter": false,
+
   "risk_mode": "fixed",
-  "fixed_risk_amount": 100.0,
-  "risk_per_trade": 0.005,
+  "fixed_risk_amount": 10.0,
+  "risk_per_trade": 0.01,
   "tp_rr": 2.0,
+  "stop_atr_mult": 1.0,
+
   "max_drawdown_pct": 15.0,
-  "slippage_pips": 1.0,
-  "commission_usd_per_lot": 7.0,
+
+  "slippage_pips": 0.1,
+  "commission_pct": 0.00055,
+
   "atr_period": 14,
-  "lookback_bars": 55000,
-  "instrument_sessions": {
-    "GOLD#": {
-      "asia": false,
-      "london": true,
-      "ny": true
-    }
-  },
-  "pending_order_expiry_bars": 1,
-  "time_exit_bars": 0,
-  "stop_atr_mult": 0.8,
-  "fixed_stop_pips": 25.0,
+  "lookback_bars": 5000,
+
   "vol_allow_low": true,
   "vol_allow_mid": true,
   "vol_allow_high": true,

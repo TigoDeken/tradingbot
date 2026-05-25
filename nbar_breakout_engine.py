@@ -20,6 +20,7 @@ ATR_PERIOD      = 14
 ATR_MED_MINBARS = 2000   # min bars for 6-month rolling ATR median
 
 SYMBOL_DEFAULTS: dict[str, dict] = {
+    # ── Legacy CFD symbols (MT5) ──────────────────────────────────────────────
     "GOLD#": {
         "pip":          0.1,
         "n_bars":       8,
@@ -36,6 +37,19 @@ SYMBOL_DEFAULTS: dict[str, dict] = {
         "require_maru": True,
         "maru_thresh":  0.80,
     },
+    # ── Bybit linear perpetuals (USDT-margined) ───────────────────────────────
+    # pip=1.0, pip_value=1.0 → lot = risk_usd / stop_distance_usd (qty in coins)
+    # Same signal parameters as GOLD# — to be calibrated per symbol over time.
+    "SOLUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "AVAXUSDT": {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "LINKUSDT": {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "DOTUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "ARBUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "OPUSDT":   {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "INJUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "SUIUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "APTUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
+    "SEIUSDT":  {"pip": 1.0, "n_bars": 8, "atr_mult": 1.2, "depth_thresh": 0.677, "require_maru": False, "maru_thresh": 0.0},
 }
 
 NBAR_SYMBOLS = set(SYMBOL_DEFAULTS.keys())
@@ -214,13 +228,17 @@ def run_nbar(
 
 
 def compute_live_signal(df: pd.DataFrame, symbol: str,
-                        sessions: list | None = None, **overrides) -> dict | None:
+                        sessions: list | None = None,
+                        all_hours: bool = False,
+                        **overrides) -> dict | None:
     """
     Evaluate the N-bar breakout signal on the last closed bar of `df`.
 
     Returns {'direction': str, 'atr': float} or None.
     Called by live_trader.py check_entry() on each new candle.
-    Entry should be placed at the OPEN of the next bar (current market price).
+
+    Args:
+        all_hours: if True, skip session-window filtering (for 24/7 crypto).
     """
     scfg = {**SYMBOL_DEFAULTS.get(symbol, {}), **overrides}
     if not scfg:
@@ -228,10 +246,11 @@ def compute_live_signal(df: pd.DataFrame, symbol: str,
     if len(df) < ATR_MED_MINBARS + int(scfg["n_bars"]):
         return None
 
-    _sessions = sessions if sessions else list(SESSION_WINDOWS.keys())
-    bar_date  = df.index[-1]
-    if not _in_named_sessions(bar_date.hour, _sessions):
-        return None
+    if not all_hours:
+        _sessions = sessions if sessions else list(SESSION_WINDOWS.keys())
+        bar_date  = df.index[-1]
+        if not _in_named_sessions(bar_date.hour, _sessions):
+            return None
 
     feat = _features(df, int(scfg["n_bars"]))
     return _check_signal(feat.iloc[-1], scfg)
