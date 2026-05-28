@@ -1,9 +1,8 @@
 """
-Universe scanner — refreshes cache and computes current signal state for all coins.
+Universe scanner — refreshes data cache and computes signal state for all coins.
 
-Call scan() to get a ranked list of signal states for all 78 coins.
-Results are written to live_state.json so the dashboard can read them without
-running the scanner again.
+Call scan() to get a ranked list of signal states for all coins.
+Results are written to live_state.json so the dashboard reads them directly.
 """
 
 import time
@@ -12,28 +11,29 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from algo.data.zscore_entry_study import load_all, load_daily, load_funding, build_coin_df, CACHE_DIR
-from algo.data.perp_flow_study import load_perp_oi, load_perp_kline, fetch_perp_oi, fetch_perp_kline
-from algo.engine.signals import compute_signals
-from algo.engine.state import load_state, save_state
+from algo.data.perp_flow_study    import load_perp_oi, load_perp_kline, fetch_perp_oi, fetch_perp_kline
+from algo.engine.signals          import compute_signals
+from algo.engine.state            import load_state, save_state
+from algo.live.logger             import get_logger
 
 import os
 from pybit.unified_trading import HTTP
 
 SESSION = HTTP(testnet=False)
+log     = get_logger("scanner")
 
 
 def _refresh_spot(symbol: str):
     """Append any new daily bars to the spot cache."""
-    import time as _time
     cache = os.path.join(CACHE_DIR, f"{symbol}_daily.parquet")
     if not os.path.exists(cache):
         return load_daily(symbol)
 
-    df = pd.read_parquet(cache)
+    df      = pd.read_parquet(cache)
     last_ts = int(df["ts"].max())
+    bars    = []
+    end     = None
 
-    bars = []
-    end = None
     while True:
         p = dict(category="spot", symbol=symbol, interval="D", limit=200)
         if end:
@@ -46,11 +46,12 @@ def _refresh_spot(symbol: str):
         if len(new) < len(raw):
             break
         end = int(raw[-1][0]) - 1
-        _time.sleep(0.05)
+        time.sleep(0.05)
 
     if bars:
-        new_df = pd.DataFrame(bars, columns=["ts","open","high","low","close","volume","turnover"])
-        new_df = new_df.astype({c: float for c in ["open","high","low","close","volume","turnover"]})
+        cols   = ["ts","open","high","low","close","volume","turnover"]
+        new_df = pd.DataFrame(bars, columns=cols)
+        new_df = new_df.astype({c: float for c in cols[1:]})
         new_df["ts"]   = new_df["ts"].astype(int)
         new_df["time"] = pd.to_datetime(new_df["ts"], unit="ms", utc=True)
         df = pd.concat([df, new_df], ignore_index=True).drop_duplicates("ts").sort_values("ts")
@@ -59,22 +60,19 @@ def _refresh_spot(symbol: str):
 
 
 def _refresh_funding(symbol: str):
-    """Append any new funding rates to the funding cache."""
-    import time as _time
-    cache = os.path.join(CACHE_DIR, f"{symbol}_funding.parquet")
-    bars, end = [], None
-
+    """Append any new funding settlements to the funding cache."""
+    cache    = os.path.join(CACHE_DIR, f"{symbol}_funding.parquet")
     existing = pd.DataFrame()
     last_ts  = 0
+
     if os.path.exists(cache):
         existing = pd.read_parquet(cache)
         if not existing.empty and "time" in existing.columns:
             t = existing["time"]
-            if hasattr(t.dtype, "tz") and t.dt.tz is not None:
-                last_ts = int(t.max().timestamp() * 1000)
-            else:
-                last_ts = int(pd.to_datetime(t.max()).timestamp() * 1000)
+            last_ts = int(t.max().timestamp() * 1000) if t.dt.tz is not None \
+                      else int(pd.to_datetime(t.max()).timestamp() * 1000)
 
+    bars, end = [], None
     while True:
         p = dict(category="linear", symbol=symbol, limit=200)
         if end:
@@ -87,13 +85,13 @@ def _refresh_funding(symbol: str):
         if len(new) < len(raw):
             break
         end = int(raw[-1]["fundingRateTimestamp"]) - 1
-        _time.sleep(0.05)
+        time.sleep(0.05)
 
     if bars:
         df = pd.DataFrame(bars)
         df["time"]         = pd.to_datetime(df["fundingRateTimestamp"].astype(int), unit="ms", utc=True)
         df["funding_rate"] = df["fundingRate"].astype(float) * 100
-        df = df[["time","funding_rate"]]
+        df = df[["time", "funding_rate"]]
         if not existing.empty:
             df = pd.concat([existing, df], ignore_index=True).drop_duplicates("time").sort_values("time")
         df.to_parquet(cache)
@@ -102,26 +100,24 @@ def _refresh_funding(symbol: str):
 
 
 def _refresh_perp_oi(symbol: str):
-    """Append new perp OI bars to the perp_oi cache."""
-    cache = os.path.join(CACHE_DIR, f"{symbol}_perp_oi.parquet")
+    """Append new perp OI bars to the OI cache."""
+    cache    = os.path.join(CACHE_DIR, f"{symbol}_perp_oi.parquet")
     existing = pd.DataFrame()
     last_ts  = 0
+
     if os.path.exists(cache):
         existing = pd.read_parquet(cache)
         if not existing.empty:
-            ts_col = existing["time"]
-            if hasattr(ts_col.dtype, "tz") and ts_col.dt.tz is not None:
-                last_ts = int(ts_col.max().timestamp() * 1000)
-            else:
-                last_ts = int(pd.to_datetime(ts_col.max()).timestamp() * 1000)
+            ts_col  = existing["time"]
+            last_ts = int(ts_col.max().timestamp() * 1000) if ts_col.dt.tz is not None \
+                      else int(pd.to_datetime(ts_col.max()).timestamp() * 1000)
 
     bars, cursor = [], None
     while True:
         p = dict(category="linear", symbol=symbol, intervalTime="1d", limit=200)
         if cursor:
             p["cursor"] = cursor
-        resp   = SESSION.get_open_interest(**p)
-        result = resp.get("result", {})
+        result = SESSION.get_open_interest(**p).get("result", {})
         raw    = result.get("list", [])
         if not raw:
             break
@@ -136,7 +132,7 @@ def _refresh_perp_oi(symbol: str):
         df = pd.DataFrame(bars)
         df["time"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms", utc=True)
         df["oi"]   = df["openInterest"].astype(float)
-        df = df[["time","oi"]]
+        df = df[["time", "oi"]]
         if not existing.empty:
             df = pd.concat([existing, df], ignore_index=True).drop_duplicates("time").sort_values("time")
         df.to_parquet(cache)
@@ -145,7 +141,7 @@ def _refresh_perp_oi(symbol: str):
 
 
 def _refresh_perp_kline(symbol: str):
-    """Append new perp klines (for basis/perp_close) to the cache."""
+    """Append new perp klines to the perp cache."""
     cache = os.path.join(CACHE_DIR, f"{symbol}_perp_daily.parquet")
     if not os.path.exists(cache):
         df = fetch_perp_kline(symbol)
@@ -157,10 +153,8 @@ def _refresh_perp_kline(symbol: str):
     last_ts  = 0
     if not existing.empty and "time" in existing.columns:
         t = existing["time"]
-        if hasattr(t.dtype, "tz") and t.dt.tz is not None:
-            last_ts = int(t.max().timestamp() * 1000)
-        else:
-            last_ts = int(pd.to_datetime(t.max()).timestamp() * 1000)
+        last_ts = int(t.max().timestamp() * 1000) if t.dt.tz is not None \
+                  else int(pd.to_datetime(t.max()).timestamp() * 1000)
 
     bars, end = [], None
     while True:
@@ -178,11 +172,12 @@ def _refresh_perp_kline(symbol: str):
         time.sleep(0.05)
 
     if bars:
-        df = pd.DataFrame(bars, columns=["ts","open","high","low","close","volume","turnover"])
-        df = df.astype({c: float for c in ["open","high","low","close","volume","turnover"]})
+        cols = ["ts","open","high","low","close","volume","turnover"]
+        df   = pd.DataFrame(bars, columns=cols)
+        df   = df.astype({c: float for c in cols[1:]})
         df["time"]       = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
         df["perp_close"] = df["close"]
-        df = df[["time","perp_close"]]
+        df = df[["time", "perp_close"]]
         if not existing.empty:
             df = pd.concat([existing, df], ignore_index=True).drop_duplicates("time").sort_values("time")
         df.to_parquet(cache)
@@ -192,13 +187,13 @@ def _refresh_perp_kline(symbol: str):
 
 def scan(refresh: bool = True) -> list[dict]:
     """
-    Scan all coins. Returns list of signal dicts sorted by entry readiness.
-    If refresh=True, fetches latest bars first (takes ~2 min for 78 coins).
+    Scan all coins. Returns signal dicts sorted by entry readiness.
+    If refresh=True, fetches the latest bars first (takes ~2 min for 80 coins).
     """
-    print("Loading coin list...")
+    log.info("Loading coin list...")
     coins_raw = load_all()
     symbols   = sorted(coins_raw.keys())
-    print(f"Scanning {len(symbols)} coins (refresh={refresh})...")
+    log.info("Scanning %d coins (refresh=%s)...", len(symbols), refresh)
 
     results = []
     for i, sym in enumerate(symbols, 1):
@@ -220,31 +215,34 @@ def scan(refresh: bool = True) -> list[dict]:
             spot_df = build_coin_df(spot_raw, fund_raw)
             sig     = compute_signals(spot_df, oi_df, perp_df)
             sig["symbol"] = sym
-
             results.append(sig)
-            flag = " <<< ENTRY" if sig["entry_signal"] else (" EXIT" if sig["exit_signal"] else "")
-            if i % 10 == 0 or sig["entry_signal"] or sig["exit_signal"]:
-                fz  = f"{sig['funding_z']:+.2f}" if not np.isnan(sig.get("funding_z", np.nan) or np.nan) else "n/a"
-                oiz = f"{sig['oi_z']:+.2f}"      if not np.isnan(sig.get("oi_z",     np.nan) or np.nan) else "n/a"
-                atr = f"{sig['atr_ratio']:.2f}"  if not np.isnan(sig.get("atr_ratio", np.nan) or np.nan) else "n/a"
-                print(f"  [{i:2d}/{len(symbols)}] {sym:18} fz={fz}  oiz={oiz}  atr={atr}{flag}")
+
+            if sig["entry_signal"] or sig["exit_signal"] or i % 10 == 0:
+                fz  = f"{sig['funding_z']:+.2f}" if sig.get("funding_z") is not None \
+                      and not np.isnan(sig["funding_z"]) else "n/a"
+                oiz = f"{sig['oi_z']:+.2f}"      if sig.get("oi_z") is not None \
+                      and not np.isnan(sig["oi_z"]) else "n/a"
+                atr = f"{sig['atr_ratio']:.2f}"  if sig.get("atr_ratio") is not None \
+                      and not np.isnan(sig["atr_ratio"]) else "n/a"
+                flag = " <<< ENTRY" if sig["entry_signal"] else (" EXIT" if sig["exit_signal"] else "")
+                log.info("[%2d/%d] %-18s  fz=%s  oiz=%s  atr=%s%s",
+                         i, len(symbols), sym, fz, oiz, atr, flag)
 
         except Exception as e:
-            print(f"  [{i:2d}/{len(symbols)}] {sym:18} ERROR: {e}")
-            continue
+            log.warning("[%2d/%d] %-18s  ERROR: %s", i, len(symbols), sym, e)
 
-    # Sort: entry signals first, then by conditions_met desc, then by fz asc
+    # Sort: entry signals first, then by conditions_met desc, then fz asc (most negative = best)
     results.sort(key=lambda r: (
         -int(r.get("entry_signal", False)),
         -r.get("conditions_met", 0),
         r.get("funding_z", 0) or 0,
     ))
 
-    # Save to state
-    state = load_state()
+    state               = load_state()
     state["scan_results"] = results
     state["last_scan"]    = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
-    print(f"\nScan complete. {sum(r['entry_signal'] for r in results)} entry signals.")
+    n_entry = sum(r["entry_signal"] for r in results)
+    log.info("Scan complete. %d entry signals.", n_entry)
     return results

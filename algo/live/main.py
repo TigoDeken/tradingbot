@@ -1,18 +1,23 @@
 """
-Live trading engine — run once per day after the daily close.
+Live trading engine — run after each 8H funding settlement.
 
 Flow:
-  1. Sync: check if any stops were hit since last run
-  2. Exit: close positions where funding_z has risen above 0
-  3. Scan: refresh data cache, compute signals for all 78 coins
-  4. Enter: open positions for coins with an active entry signal
-  5. Save state
+  1. Scan:  refresh cache, compute signals for all coins (public data only)
+  2. Connect: verify API keys and get current equity
+  3. Sync:  detect stops hit by exchange; re-place disappeared stops
+  4. Exit:  close positions where funding_z has risen above EXIT_Z
+  5. Enter: open positions for coins with a fresh entry signal
+  6. Save:  persist state
 
-Run: python -m algo.live.main
-Schedule: daily at 00:05 UTC (5 min after daily bar closes)
+Schedule: 00:05 / 08:05 / 16:05 UTC (5 min after each funding settlement)
+Run:      python -m algo.live.main
 """
 
+import json
+import os
 import sys
+from datetime import datetime, timezone
+
 from algo.live.logger    import get_logger, setup_logger
 from algo.live.exchange  import BybitExchange
 from algo.live.risk      import RiskManager
@@ -23,51 +28,77 @@ from algo.engine.state   import load_state, save_state
 setup_logger()
 log = get_logger("main")
 
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "config.json")
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 
 def run():
     log.info("=" * 60)
-    log.info("Engine starting")
+    log.info("Engine starting — %s UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
-    ex      = BybitExchange()
+    cfg       = _load_config()
+    strat_cfg = cfg.get("strategy", {})
+    max_stop_pct = float(strat_cfg.get("max_stop_pct", 0.30))
+
+    # ── Step 1: Scan ─────────────────────────────────────────────────────────
+    log.info("Scanning universe...")
+    results       = scan(refresh=True)
+    entry_signals = [r for r in results if r.get("entry_signal")]
+    exit_signals  = [r for r in results if r.get("exit_signal")]
+    log.info(
+        "Entry signals: %d  Exit signals: %d  Watching: %d",
+        len(entry_signals), len(exit_signals),
+        sum(1 for r in results if r.get("conditions_met", 0) >= 2),
+    )
+
+    # ── Step 2: Account connection ───────────────────────────────────────────
+    try:
+        ex     = BybitExchange()
+        equity = ex.get_usdt_balance()
+        if equity <= 0:
+            raise ValueError("Balance is 0 — account may be empty or keys lack permission")
+        trading_enabled = True
+        log.info("Account connected. Equity: %.2f USDT", equity)
+    except Exception as e:
+        log.warning("Account unavailable (%s) — scan-only mode", e)
+        log.info("Scan complete. Add API keys to algo/.env to enable trading.")
+        log.info("=" * 60)
+        return
+
     state   = load_state()
-    equity  = ex.get_usdt_balance()
     risk    = RiskManager(session_start_equity=equity)
     handler = ExecutionHandler(ex)
 
-    log.info("Equity: %.2f USDT  Open positions: %d",
-             equity, len(state["positions"]))
+    log.info("Open positions: %d", len(state["positions"]))
 
-    # ── Step 1: Sync — detect stops hit by exchange ───────────────────────────
+    # ── Step 3: Sync ─────────────────────────────────────────────────────────
     stopped = handler.sync_positions()
     if stopped:
-        log.info("Stops hit: %s", stopped)
+        log.info("Stops hit / positions synced: %s", stopped)
         state  = load_state()
         equity = ex.get_usdt_balance()
 
-    # ── Step 2: Scan — refresh data and compute signals ───────────────────────
-    log.info("Scanning universe...")
-    results = scan(refresh=True)
-    entry_signals = [r for r in results if r.get("entry_signal")]
-    exit_signals  = [r for r in results if r.get("exit_signal")]
-
-    log.info("Entry signals: %d  Exit signals: %d",
-             len(entry_signals), len(exit_signals))
-
-    # ── Step 3: Exit — close positions where signal reversed ──────────────────
+    # ── Step 4: Exit ─────────────────────────────────────────────────────────
     for pos in list(state["positions"]):
         sym = pos["symbol"]
         sig = next((r for r in results if r["symbol"] == sym), None)
         if sig and sig.get("exit_signal"):
             log.info("Exit signal for %s (fz=%.2f)", sym, sig.get("funding_z", 0))
-            handler.close_position(sym, reason="signal")
-            equity = ex.get_usdt_balance()
+            if handler.close_position(sym, reason="signal"):
+                equity = ex.get_usdt_balance()
 
-    # ── Step 4: Enter — open new positions ────────────────────────────────────
+    # ── Step 5: Enter ─────────────────────────────────────────────────────────
     state = load_state()
     for sig in entry_signals:
         sym = sig["symbol"]
 
-        # Skip if already in this position
         if any(p["symbol"] == sym for p in state["positions"]):
             log.info("Already in %s — skip", sym)
             continue
@@ -80,11 +111,17 @@ def run():
             log.error("Circuit breaker active — halting entries")
             break
 
-        entry = sig["close"]  # use last close as proxy; live entry will be next open
+        entry = sig["close"]
         stop  = sig["stop"]
 
         if entry <= stop:
-            log.warning("Invalid stop for %s: entry=%.6f stop=%.6f", sym, entry, stop)
+            log.warning("Invalid stop for %s: entry=%.6f stop=%.6f — skip", sym, entry, stop)
+            continue
+
+        stop_dist = (entry - stop) / entry
+        if stop_dist > max_stop_pct:
+            log.warning("%s stop too wide: %.1f%% > %.1f%% max — skip",
+                        sym, stop_dist * 100, max_stop_pct * 100)
             continue
 
         try:
@@ -93,24 +130,25 @@ def run():
             log.warning("size_position failed for %s: %s", sym, e)
             continue
 
-        # Sanity: position value < 30% of equity
-        pos_value = qty * entry
-        if pos_value > equity * 0.30:
-            log.warning("%s position value %.2f > 30%% of equity — skip", sym, pos_value)
+        # Hard cap: single position cannot exceed 30% of account
+        if qty * entry > equity * 0.30:
+            log.warning("%s position value %.2f > 30%% of equity %.2f — skip",
+                        sym, qty * entry, equity)
             continue
 
-        log.info("ENTRY: %s  entry~%.6f  stop=%.6f  qty=%.6f  fz=%.2f  oiz=%.2f",
-                 sym, entry, stop, qty,
-                 sig.get("funding_z", 0), sig.get("oi_z", 0))
+        log.info(
+            "ENTRY: %s  entry~%.6f  stop=%.6f  qty=%.6f  stop_dist=%.1f%%  fz=%.2f  oiz=%.2f",
+            sym, entry, stop, qty, stop_dist * 100,
+            sig.get("funding_z", 0), sig.get("oi_z", 0),
+        )
 
-        success = handler.open_position(sym, entry, stop, qty, meta=sig)
-        if success:
+        if handler.open_position(sym, entry, stop, qty, meta=sig):
             equity = ex.get_usdt_balance()
             state  = load_state()
 
-    # ── Step 5: Save final state ──────────────────────────────────────────────
-    state   = load_state()
-    equity  = ex.get_usdt_balance()
+    # ── Step 6: Save ─────────────────────────────────────────────────────────
+    state           = load_state()
+    equity          = ex.get_usdt_balance()
     state["equity"] = equity
     save_state(state)
 

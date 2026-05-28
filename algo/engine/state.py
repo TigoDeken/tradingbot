@@ -8,6 +8,8 @@ trade_log.csv    — completed trade history
 import json
 import os
 import csv
+import shutil
+import logging
 from datetime import datetime, timezone
 
 STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "live", "live_state.json")
@@ -17,11 +19,13 @@ LOG_FIELDS = ["closed_at", "symbol", "entry_date", "entry_price", "exit_price",
               "entry_fz", "entry_oiz", "entry_atr"]
 
 _EMPTY_STATE = {
-    "positions":   [],
+    "positions":    [],
     "scan_results": [],
-    "last_scan":   None,
-    "equity":      None,
+    "last_scan":    None,
+    "equity":       None,
 }
+
+log = logging.getLogger("state")
 
 
 def _ensure_dirs():
@@ -33,14 +37,31 @@ def load_state() -> dict:
     _ensure_dirs()
     if not os.path.exists(STATE_PATH):
         return dict(_EMPTY_STATE)
-    with open(STATE_PATH) as f:
-        return json.load(f)
+    # Try main file, fall back to backup if corrupted
+    for path in (STATE_PATH, STATE_PATH + ".bak"):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            log.warning("State file corrupted at %s — trying backup", path)
+    log.error("All state files corrupted — starting with empty state")
+    return dict(_EMPTY_STATE)
 
 
 def save_state(state: dict):
+    """Atomic write: tmp file → rename, with backup of previous state."""
     _ensure_dirs()
-    with open(STATE_PATH, "w") as f:
+    if os.path.exists(STATE_PATH):
+        try:
+            shutil.copy2(STATE_PATH, STATE_PATH + ".bak")
+        except OSError:
+            pass
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2, default=str)
+    os.replace(tmp, STATE_PATH)  # atomic on same filesystem
 
 
 def add_position(state: dict, pos: dict) -> dict:
@@ -65,15 +86,15 @@ def get_position(state: dict, symbol: str) -> dict | None:
 def log_trade(trade: dict):
     _ensure_dirs()
     write_header = not os.path.exists(LOG_PATH)
+    trade.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
     with open(LOG_PATH, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
         if write_header:
             w.writeheader()
-        trade.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
         w.writerow(trade)
 
 
-def load_trade_log():
+def load_trade_log() -> list:
     _ensure_dirs()
     if not os.path.exists(LOG_PATH):
         return []

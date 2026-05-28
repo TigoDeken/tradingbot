@@ -30,13 +30,16 @@ class BybitExchange:
     def get_ticker(self, symbol: str) -> dict:
         r = self._session.get_tickers(category="spot", symbol=symbol)
         t = r["result"]["list"][0]
-        return {"last": float(t["lastPrice"]), "bid": float(t["bid1Price"]),
-                "ask": float(t["ask1Price"])}
+        return {
+            "last": float(t["lastPrice"]),
+            "bid":  float(t["bid1Price"]),
+            "ask":  float(t["ask1Price"]),
+        }
 
     def get_instrument_info(self, symbol: str) -> dict:
         if symbol in self._instruments:
             return self._instruments[symbol]
-        r = self._session.get_instruments_info(category="spot", symbol=symbol)
+        r    = self._session.get_instruments_info(category="spot", symbol=symbol)
         info = r["result"]["list"][0]
         lot  = info["lotSizeFilter"]
         pri  = info["priceFilter"]
@@ -52,16 +55,16 @@ class BybitExchange:
     # ── Account ──────────────────────────────────────────────────────────────
 
     def get_usdt_balance(self) -> float:
-        r = self._session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        r     = self._session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         coins = r["result"]["list"][0]["coin"]
         for c in coins:
             if c["coin"] == "USDT":
-                return float(c["availableToWithdraw"] or c["walletBalance"])
+                return float(c["availableToWithdraw"] or c["walletBalance"] or 0)
         return 0.0
 
     def get_coin_balance(self, symbol: str) -> float:
-        coin = symbol.replace("USDT", "")
-        r    = self._session.get_wallet_balance(accountType="UNIFIED", coin=coin)
+        coin  = symbol.replace("USDT", "")
+        r     = self._session.get_wallet_balance(accountType="UNIFIED", coin=coin)
         items = r["result"]["list"][0]["coin"]
         for c in items:
             if c["coin"] == coin:
@@ -83,18 +86,17 @@ class BybitExchange:
         return r["result"]
 
     def place_stop_sell(self, symbol: str, qty: float, stop_price: float) -> dict:
-        """Place a conditional market-sell that triggers when price falls to stop_price."""
+        """Conditional market-sell that triggers when price falls to stop_price."""
         info       = self.get_instrument_info(symbol)
         qty        = self._round_qty(qty, info["qty_step"])
-        tick       = info["tick_size"]
-        stop_price = self._round_price(stop_price, tick)
+        stop_price = self._round_price(stop_price, info["tick_size"])
         log.info("STOP %s qty=%.6f stop=%.6f", symbol, qty, stop_price)
         r = self._session.place_order(
             category="spot", symbol=symbol,
             side="Sell", orderType="Market",
             qty=str(qty),
             triggerPrice=str(stop_price),
-            triggerDirection=2,   # trigger when price falls below triggerPrice
+            triggerDirection=2,      # trigger when price falls below triggerPrice
             orderFilter="StopOrder",
         )
         return r["result"]
@@ -102,7 +104,7 @@ class BybitExchange:
     def place_market_sell(self, symbol: str, qty: float) -> dict:
         info = self.get_instrument_info(symbol)
         qty  = self._round_qty(qty, info["qty_step"])
-        log.info("SELL %s qty=%.6f (signal exit)", symbol, qty)
+        log.info("SELL %s qty=%.6f", symbol, qty)
         r = self._session.place_order(
             category="spot", symbol=symbol,
             side="Sell", orderType="Market", qty=str(qty),
@@ -119,11 +121,32 @@ class BybitExchange:
             return False
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        """Fetch regular open orders."""
         p = dict(category="spot", openOnly=1)
         if symbol:
             p["symbol"] = symbol
         r = self._session.get_open_orders(**p)
         return r["result"]["list"]
+
+    def get_open_stop_orders(self, symbol: str | None = None) -> list[dict]:
+        """Fetch open conditional (stop) orders."""
+        p = dict(category="spot", openOnly=1, orderFilter="StopOrder")
+        if symbol:
+            p["symbol"] = symbol
+        r = self._session.get_open_orders(**p)
+        return r["result"]["list"]
+
+    def get_order_fill_price(self, symbol: str, order_id: str) -> float | None:
+        """Return average fill price for a completed order, or None if unavailable."""
+        try:
+            r      = self._session.get_order_history(category="spot", symbol=symbol, orderId=order_id)
+            orders = r["result"]["list"]
+            if orders:
+                avg = float(orders[0].get("avgPrice") or 0)
+                return avg if avg > 0 else None
+        except Exception as e:
+            log.warning("get_order_fill_price %s %s: %s", symbol, order_id, e)
+        return None
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
