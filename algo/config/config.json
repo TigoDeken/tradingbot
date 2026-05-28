@@ -4,9 +4,22 @@
     "min_volume_usd": 500000,
     "max_volume_usd": 10000000
   },
-  "signal_filter": {
-    "enabled": true,
-    "oi_max_quintile": 3,
-    "oi_lookback_bars": 500
+  "strategy": {
+    "name": "oi_z_signal",
+    "fz_thresh": -0.5,
+    "atr_thresh": 0.80,
+    "oi_z_thresh": 1.0,
+    "exit_z": 0.0,
+    "risk_frac": 0.01,
+    "max_positions": 5,
+    "stop_days": 10,
+    "min_stop_pct": 0.05,
+    "max_stop_pct": 0.30,
+    "fz_window": 90,
+    "oi_z_window": 90
+  },
+  "engine": {
+    "max_session_drawdown": 0.10,
+    "order_retry_limit": 3
   }
 }

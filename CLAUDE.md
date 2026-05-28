@@ -82,17 +82,56 @@ Horizons: 4h, 24h, 168h forward return. Edge threshold: Q5-Q1 spread ≥ 0.4%.
 - ADA/UNI/ALGO tier: real, consistent edges — better hunting ground
 
 **How signals are used**
-- Funding Z-Score: context signal — calm = look for entries, excited = look for exits
+- Funding Z-Score: context signal — calm (Q1/Q2) = look for entries, excited (Q4/Q5) = look for exits
 - OI 168h: soft veto only — Q5 means trade is crowded, skip it
-- 200d MA regime: hard filter — only trade longs in BULL
-- Nothing is a simple pass/fail gate except the 200d MA
+- 200d MA regime: direction bias, NOT hard on/off filter
+  - Bull (above 200MA): favor longs, short only on strong signal
+  - Bear (below 200MA): favor shorts, long only on strong signal
+  - Reason: "only trade in bull" = dead money in bear markets; price oscillates in both regimes
+
+**Relative Volume — permanently dropped**
+- Tested on real data: never cleared 0.4% edge threshold
+- Practitioner literature says it works — our data says it doesn't. Trust the data.
+
+**Consolidation as setup condition**
+- Tight consolidation = small, well-defined stop = better R:R geometrically
+- Measure with ATR compression: ATR(short) / ATR(longer) — ratio below threshold = quiet
+- Key: use SHORT lookback windows matched to our swing duration (5–15 bars), not 20–125 bar windows designed for position traders
+- Exact windows TBD — to be calibrated empirically on our data
+
+**Trade target framework**
+- Think in R (risk units), not percentages
+- Stop goes at logical structure below/above entry
+- Target 2–3R per trade
+- 5–10% moves are typical but irrelevant — what matters is getting more than we risk
+- High trade frequency preferred over waiting for large moves
+
+**Strategy direction (current)**
+- Trade the oscillation, not trend breakouts — small caps oscillate, they don't trend cleanly
+- Swing trading: buy swing lows (in bull bias), short swing highs (in bear bias)
+- Enter when: coin is quiet (ATR compressed) + funding z-score is calm + price gives swing signal
+- Exit when: target R hit, or crowd arrives (z-score rising into Q4/Q5)
+- Always looking for trades in both directions — no dead capital
+
+**Academic backing**
+- Small caps (98% of crypto by count) are mean-reversion dominant at daily horizon
+- Momentum emerges at 1–4 week horizon post-compression — the window we're targeting
+- Retail follows momentum (buys after moves, not before) — z-score measures this crowding
+- Low-vol regime precedes large moves (MSGARCH literature) — compression is real and measurable
+
+**Carry cost**
+- USDT borrow rate ~0.02%/day baseline → ~0.09% weekly at 3x leverage
+- Negligible against 2–3R target for 1–4 week holds
+- Factor into backtest. Monitor live rate via API before entry (can spike in bull runs)
+- API: GET /v5/spot-margin-trade/data?currency=USDT
 
 **Next step**
-- Define what "waking up" looks like in price (the entry trigger)
-- Build baseline backtest with no signal overlay first
-- Layer signals on top only after baseline is proven
+- Define the entry trigger: what does "swing low is in" look like as a measurable price signal?
+- Calibrate ATR compression window to match swing duration seen in charts
+- Build backtest once entry trigger is defined and hypothesis is clear
 
 ## Key decisions
 - Single Bybit API key (public endpoints don't need auth for market data)
 - Pybit is the Bybit Python SDK
-- Nothing about strategy is decided yet
+- No dead money — strategy must be active in bull and bear regimes
+- Everything applied to live trading must be proven on data first

@@ -1,217 +1,400 @@
-import json
-import time
+"""
+OI-Z Signal Bot — live dashboard.
+
+Sections:
+  1. Engine status + equity
+  2. Open positions (with live P&L)
+  3. Signal scanner (today's setups, ranked)
+  4. Universe overview (all coins, signal state heat map)
+  5. Trade history (equity curve + log)
+
+Run: streamlit run algo/dashboard/app.py
+"""
+
 import os
 import sys
+import json
+import time
+import math
+import numpy as np
 import pandas as pd
 import streamlit as st
+from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from signals.compute import compute_oi_signal, compute_regime, compute_funding
+# Add project root (tradingbot/) so all algo.* imports resolve correctly
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "config.json")
+from algo.engine.state import load_state, load_trade_log
+from algo.engine.signals import FZ_THRESH, ATR_THRESH, OI_Z_THRESH, EXIT_Z
 
-st.set_page_config(page_title="Trading Bot", layout="wide")
+st.set_page_config(page_title="OI-Z Signal Bot", layout="wide", page_icon="📈")
+
+_SESSION = HTTP(testnet=False)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fmt(v, decimals=2, suffix=""):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v:+.{decimals}f}{suffix}" if suffix else f"{v:.{decimals}f}"
 
 
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+def _color_fz(v):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    if v < FZ_THRESH:
+        return "background-color: #1a4a1a"   # dark green — entry zone
+    if v > EXIT_Z:
+        return "background-color: #4a1a1a"   # dark red — exit zone
+    return ""
 
 
-def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+def _signal_badge(row):
+    if row.get("entry_signal"):
+        return "🟢 ENTRY"
+    if row.get("exit_signal"):
+        return "🔴 EXIT"
+    c = row.get("conditions_met", 0)
+    return f"{'🟡' if c >= 2 else '⚪'} {c}/3"
+
+
+@st.cache_data(ttl=30)
+def _live_prices(symbols: list[str]) -> dict:
+    prices = {}
+    try:
+        tickers = _SESSION.get_tickers(category="spot")["result"]["list"]
+        prices  = {t["symbol"]: float(t["lastPrice"]) for t in tickers}
+    except Exception:
+        pass
+    return prices
 
 
 @st.cache_data(ttl=60)
-def fetch_spreads() -> pd.DataFrame:
-    s = HTTP(testnet=False)
-    tickers = s.get_tickers(category="spot")["result"]["list"]
-
-    EXCLUDE = {
-        "USDCUSDT", "USDEUSDT", "USD1USDT", "USDTUSDT", "BUSDUSDT",
-        "TUSDUSDT", "DAIUSDT", "XAUTUSDT", "PAXGUSDT", "RLUSDUSDT",
-        "USDSUSDT", "PYUSDUSDT", "USDYUSDT",
-    }
-
-    symbols = [
-        t["symbol"] for t in tickers
-        if t["symbol"].endswith("USDT") and t["symbol"] not in EXCLUDE
-    ]
-    vol_map = {t["symbol"]: float(t["turnover24h"] or 0) for t in tickers}
-
-    rows = []
-    for sym in symbols:
-        try:
-            ob = s.get_orderbook(category="spot", symbol=sym, limit=1)["result"]
-            bid = float(ob["b"][0][0]) if ob["b"] else None
-            ask = float(ob["a"][0][0]) if ob["a"] else None
-            if not bid or not ask:
-                continue
-            rows.append({
-                "symbol":      sym,
-                "bid":         bid,
-                "ask":         ask,
-                "spread_pct":  round((ask - bid) / bid * 100, 4),
-                "vol_24h_usd": vol_map.get(sym, 0),
-            })
-            time.sleep(0.03)
-        except Exception:
-            pass
-
-    return pd.DataFrame(rows).sort_values("spread_pct").reset_index(drop=True)
-
-
-@st.cache_data(ttl=3600)
-def fetch_regime(symbol: str) -> str:
-    try:
-        return compute_regime(symbol)
-    except Exception:
-        return "ERROR"
-
-
-@st.cache_data(ttl=300)
-def fetch_oi_signal(symbol: str, lookback: int) -> dict:
-    try:
-        return compute_oi_signal(symbol, lookback)
-    except Exception:
-        return {"oi_chg_24h": 0.0, "oi_quintile_num": 0, "oi_quintile": "ERR"}
-
-
-@st.cache_data(ttl=300)
-def fetch_funding(symbol: str) -> float:
-    try:
-        return compute_funding(symbol)
-    except Exception:
-        return 0.0
+def _load_state_cached():
+    return load_state()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
-cfg = load_config()
+with st.sidebar:
+    st.title("OI-Z Bot")
+    st.caption("Frozen spec: funding_z × ATR × oi_z")
+    st.markdown("---")
+    st.markdown(f"**Entry:** funding_z < {FZ_THRESH}  +  ATR < {ATR_THRESH}  +  oi_z > {OI_Z_THRESH}")
+    st.markdown(f"**Exit:**  funding_z > {EXIT_Z}")
+    st.markdown(f"**Risk:**  1% per trade, max 5 positions")
+    st.markdown("---")
+    if st.button("Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    auto = st.checkbox("Auto-refresh (30s)", value=False)
 
-st.sidebar.title("Control Panel")
-
-st.sidebar.subheader("Watchlist filters")
-max_spread = st.sidebar.number_input(
-    "Max spread %",
-    min_value=0.01,
-    max_value=5.0,
-    value=float(cfg["watchlist"]["max_spread_pct"]),
-    step=0.05,
-    format="%.2f",
-)
-min_vol = st.sidebar.number_input(
-    "Min 24h volume (USD)",
-    min_value=0,
-    max_value=50_000_000,
-    value=int(cfg["watchlist"]["min_volume_usd"]),
-    step=100_000,
-    format="%d",
-)
-max_vol = st.sidebar.number_input(
-    "Max 24h volume (USD)",
-    min_value=0,
-    max_value=500_000_000,
-    value=int(cfg["watchlist"]["max_volume_usd"]),
-    step=1_000_000,
-    format="%d",
-)
-changed = (
-    max_spread != cfg["watchlist"]["max_spread_pct"]
-    or min_vol != cfg["watchlist"]["min_volume_usd"]
-    or max_vol != cfg["watchlist"]["max_volume_usd"]
-)
-if changed:
-    cfg["watchlist"]["max_spread_pct"] = max_spread
-    cfg["watchlist"]["min_volume_usd"] = min_vol
-    cfg["watchlist"]["max_volume_usd"] = max_vol
-    save_config(cfg)
-    st.sidebar.success("Saved")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Signal filter")
-filter_enabled = st.sidebar.checkbox(
-    "Enable OI filter",
-    value=cfg["signal_filter"]["enabled"],
-)
-oi_max_q = st.sidebar.selectbox(
-    "Max OI quintile (pre-committed: Q3)",
-    options=[1, 2, 3, 4, 5],
-    index=cfg["signal_filter"]["oi_max_quintile"] - 1,
-)
-sf = cfg["signal_filter"]
-if filter_enabled != sf["enabled"] or oi_max_q != sf["oi_max_quintile"]:
-    cfg["signal_filter"]["enabled"] = filter_enabled
-    cfg["signal_filter"]["oi_max_quintile"] = oi_max_q
-    save_config(cfg)
-    st.sidebar.success("Saved")
-
-st.sidebar.markdown("---")
-if st.sidebar.button("Refresh data"):
-    st.cache_data.clear()
+if auto:
+    time.sleep(30)
     st.rerun()
 
-st.sidebar.caption("Regime: 1h cache  |  OI/funding: 5min  |  Spreads: 1min")
+# ── Load state ────────────────────────────────────────────────────────────────
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+state       = _load_state_cached()
+positions   = state.get("positions", [])
+scan_res    = state.get("scan_results", [])
+last_scan   = state.get("last_scan")
+equity_snap = state.get("equity")
 
-st.title("Trading Bot")
+# ── Section 1: Engine status ──────────────────────────────────────────────────
 
-# Market Conditions
-st.subheader("Market Conditions — BTCUSDT")
-
-with st.spinner("Loading regime (4800 bars, cached 1h)..."):
-    regime = fetch_regime("BTCUSDT")
-
-oi = fetch_oi_signal("BTCUSDT", cfg["signal_filter"]["oi_lookback_bars"])
-funding = fetch_funding("BTCUSDT")
-
-gate_allowed = (
-    not cfg["signal_filter"]["enabled"]
-    or oi["oi_quintile_num"] <= cfg["signal_filter"]["oi_max_quintile"]
-)
+st.title("OI-Z Signal Bot")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Regime", regime)
-c2.metric("OI 24h Change", f'{oi["oi_chg_24h"]:+.2f}%', oi["oi_quintile"])
-c3.metric("Funding Rate", f'{funding:+.4f}%')
-c4.metric("Signal Gate", "OPEN" if gate_allowed else "BLOCKED")
 
-if not gate_allowed:
-    st.warning(
-        f"Gate blocked — OI 24h change is {oi['oi_quintile']} "
-        f"(threshold: max Q{cfg['signal_filter']['oi_max_quintile']})"
+# Try live equity
+live_equity = None
+try:
+    w = _SESSION.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+    for coin in w["result"]["list"][0]["coin"]:
+        if coin["coin"] == "USDT":
+            live_equity = float(coin["availableToWithdraw"] or coin["walletBalance"])
+            break
+except Exception:
+    live_equity = equity_snap
+
+with c1:
+    eq_display = f"${live_equity:,.2f}" if live_equity else "—"
+    st.metric("USDT Balance", eq_display)
+
+with c2:
+    st.metric("Open Positions", len(positions), delta=None)
+
+with c3:
+    n_entry = sum(1 for r in scan_res if r.get("entry_signal"))
+    n_watch = sum(1 for r in scan_res if r.get("conditions_met", 0) >= 2)
+    st.metric("Active Signals", n_entry, delta=f"{n_watch} watching")
+
+with c4:
+    if last_scan:
+        try:
+            dt  = datetime.fromisoformat(last_scan.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - dt)
+            h   = int(age.total_seconds() // 3600)
+            m   = int((age.total_seconds() % 3600) // 60)
+            lbl = f"{h}h {m}m ago" if h else f"{m}m ago"
+        except Exception:
+            lbl = last_scan[:16]
+        st.metric("Last Scan", lbl)
+    else:
+        st.metric("Last Scan", "Never")
+        st.caption("Run: python -m algo.live.main")
+
+st.markdown("---")
+
+# ── Section 2: Open positions ─────────────────────────────────────────────────
+
+st.subheader("Open Positions")
+
+if not positions:
+    st.info("No open positions.")
+else:
+    symbols   = [p["symbol"] for p in positions]
+    prices    = _live_prices(symbols)
+
+    rows = []
+    for pos in positions:
+        sym   = pos["symbol"]
+        entry = float(pos.get("entry_price", 0) or 0)
+        stop  = float(pos.get("stop", 0) or 0)
+        qty   = float(pos.get("qty", 0) or 0)
+        curr  = prices.get(sym, entry)
+        pnl   = (curr - entry) * qty
+        ret   = (curr - entry) / entry * 100 if entry else 0
+        risk  = (entry - stop) * qty
+        rr    = pnl / risk if risk else 0
+        dist_stop = (curr - stop) / curr * 100 if curr else 0
+
+        entry_date = pos.get("entry_date", "")[:10]
+        rows.append({
+            "Symbol":      sym,
+            "Entry Date":  entry_date,
+            "Entry":       entry,
+            "Current":     curr,
+            "Stop":        stop,
+            "Qty":         qty,
+            "P&L $":       pnl,
+            "Ret %":       ret,
+            "R":           rr,
+            "Stop Dist %": dist_stop,
+            "fz entry":    pos.get("entry_fz"),
+            "oiz entry":   pos.get("entry_oiz"),
+        })
+
+    pos_df = pd.DataFrame(rows)
+
+    def _style_pnl(v):
+        if isinstance(v, float):
+            return f"color: {'#2ecc71' if v > 0 else '#e74c3c'}"
+        return ""
+
+    st.dataframe(
+        pos_df.style
+            .applymap(_style_pnl, subset=["P&L $", "Ret %", "R"])
+            .format({
+                "Entry":       "${:.4f}",
+                "Current":     "${:.4f}",
+                "Stop":        "${:.4f}",
+                "Qty":         "{:.4f}",
+                "P&L $":       "${:+.2f}",
+                "Ret %":       "{:+.2f}%",
+                "R":           "{:+.2f}R",
+                "Stop Dist %": "{:.1f}%",
+                "fz entry":    "{:.2f}",
+                "oiz entry":   "{:.2f}",
+            }, na_rep="—"),
+        use_container_width=True,
+        height=200,
     )
 
 st.markdown("---")
 
-# Watchlist
-with st.spinner("Loading spreads from Bybit..."):
-    df = fetch_spreads()
+# ── Section 3: Signal scanner ─────────────────────────────────────────────────
 
-filtered = df[
-    (df["spread_pct"] <= max_spread) &
-    (df["vol_24h_usd"] >= min_vol) &
-    (df["vol_24h_usd"] <= max_vol)
-].copy()
+st.subheader("Signal Scanner")
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Pairs in watchlist", len(filtered))
-col2.metric("Max spread filter", f"{max_spread:.2f}%")
-col3.metric("Total pairs scanned", len(df))
+if not scan_res:
+    st.info("No scan results yet. Run the engine or click Refresh.")
+else:
+    col_a, col_b = st.columns([1, 4])
+    with col_a:
+        show_all = st.checkbox("Show all coins", value=False)
 
-st.subheader("Watchlist")
-st.dataframe(
-    filtered[["symbol", "spread_pct", "vol_24h_usd"]].rename(columns={
-        "symbol":      "Symbol",
-        "spread_pct":  "Spread %",
-        "vol_24h_usd": "24h Volume (USD)",
-    }).style.format({
-        "Spread %":         "{:.4f}%",
-        "24h Volume (USD)": "${:,.0f}",
-    }),
-    use_container_width=True,
-    height=600,
-)
+    display = scan_res if show_all else [r for r in scan_res if r.get("conditions_met", 0) >= 1]
+
+    rows = []
+    for r in display:
+        fz  = r.get("funding_z")
+        oiz = r.get("oi_z")
+        atr = r.get("atr_ratio")
+        rows.append({
+            "Signal":     _signal_badge(r),
+            "Symbol":     r.get("symbol", ""),
+            "funding_z":  fz  if fz  is not None else np.nan,
+            "oi_z":       oiz if oiz is not None else np.nan,
+            "atr_ratio":  atr if atr is not None else np.nan,
+            "Close":      r.get("close"),
+            "Stop":       r.get("stop"),
+            "Stop %":     r.get("stop_pct"),
+            "Cond":       r.get("conditions_met", 0),
+        })
+
+    scan_df = pd.DataFrame(rows)
+
+    def _style_signal_row(row):
+        if row.get("Signal", "").startswith("🟢"):
+            return ["background-color: #1a3a1a"] * len(row)
+        if row.get("Signal", "").startswith("🔴"):
+            return ["background-color: #3a1a1a"] * len(row)
+        return [""] * len(row)
+
+    def _color_fz_cell(v):
+        if not isinstance(v, float) or math.isnan(v):
+            return ""
+        if v < FZ_THRESH:
+            return "color: #2ecc71; font-weight: bold"
+        if v > EXIT_Z:
+            return "color: #e74c3c"
+        if v < 0:
+            return "color: #f39c12"
+        return "color: #95a5a6"
+
+    def _color_oiz(v):
+        if not isinstance(v, float) or math.isnan(v):
+            return ""
+        if v > OI_Z_THRESH:
+            return "color: #2ecc71"
+        if v < 0:
+            return "color: #95a5a6"
+        return ""
+
+    def _color_atr(v):
+        if not isinstance(v, float) or math.isnan(v):
+            return ""
+        return "color: #2ecc71" if v < ATR_THRESH else ""
+
+    st.dataframe(
+        scan_df.style
+            .apply(_style_signal_row, axis=1)
+            .applymap(_color_fz_cell,  subset=["funding_z"])
+            .applymap(_color_oiz,      subset=["oi_z"])
+            .applymap(_color_atr,      subset=["atr_ratio"])
+            .format({
+                "funding_z":  "{:+.2f}",
+                "oi_z":       "{:+.2f}",
+                "atr_ratio":  "{:.3f}",
+                "Close":      "${:.4f}",
+                "Stop":       "${:.4f}",
+                "Stop %":     "{:.1f}%",
+            }, na_rep="—"),
+        use_container_width=True,
+        height=min(600, 35 + len(rows) * 35),
+    )
+
+st.markdown("---")
+
+# ── Section 4: Universe heat map ─────────────────────────────────────────────
+
+st.subheader("Universe Overview")
+
+if scan_res:
+    # Compact grid: 6 columns, each coin shown as a color tile
+    cols_per_row = 6
+    coins_sorted = sorted(scan_res, key=lambda r: r.get("symbol", ""))
+
+    for i in range(0, len(coins_sorted), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, r in enumerate(coins_sorted[i:i + cols_per_row]):
+            sym = r.get("symbol", "")
+            fz  = r.get("funding_z")
+            oiz = r.get("oi_z")
+            atr = r.get("atr_ratio")
+            cond = r.get("conditions_met", 0)
+
+            if r.get("entry_signal"):
+                bg = "#1a4a1a"
+            elif r.get("exit_signal"):
+                bg = "#4a1a1a"
+            elif cond >= 2:
+                bg = "#3a3a1a"
+            else:
+                bg = "#1a1a2a"
+
+            fz_str  = f"{fz:+.2f}"  if fz  is not None and not math.isnan(fz)  else "—"
+            oiz_str = f"{oiz:+.2f}" if oiz is not None and not math.isnan(oiz) else "—"
+            atr_str = f"{atr:.2f}"  if atr is not None and not math.isnan(atr) else "—"
+
+            with cols[j]:
+                st.markdown(
+                    f"""<div style="background:{bg};border-radius:6px;padding:8px 6px;
+                                   text-align:center;font-size:11px;line-height:1.6">
+                        <b>{sym.replace('USDT','')}</b><br>
+                        fz {fz_str}<br>
+                        oiz {oiz_str}<br>
+                        atr {atr_str}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+st.markdown("---")
+
+# ── Section 5: Trade history ──────────────────────────────────────────────────
+
+st.subheader("Trade History")
+
+log_data = load_trade_log()
+
+if not log_data:
+    st.info("No completed trades yet.")
+else:
+    trade_df = pd.DataFrame(log_data)
+    for col in ["entry_price","exit_price","qty","ret_pct","pnl_usdt","entry_fz","entry_oiz","entry_atr"]:
+        if col in trade_df.columns:
+            trade_df[col] = pd.to_numeric(trade_df[col], errors="coerce")
+
+    # Equity curve
+    if "pnl_usdt" in trade_df.columns and "closed_at" in trade_df.columns:
+        eq_df = trade_df[["closed_at","pnl_usdt"]].dropna().copy()
+        eq_df["closed_at"] = pd.to_datetime(eq_df["closed_at"], errors="coerce")
+        eq_df = eq_df.sort_values("closed_at")
+        eq_df["equity"] = 5000 + eq_df["pnl_usdt"].cumsum()
+
+        st.line_chart(eq_df.set_index("closed_at")["equity"], height=200)
+
+    # Summary metrics
+    if "ret_pct" in trade_df.columns:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        wr  = (trade_df["ret_pct"] > 0).mean()
+        avg = trade_df["ret_pct"].mean()
+        tot = trade_df["pnl_usdt"].sum() if "pnl_usdt" in trade_df.columns else 0
+        m1.metric("Trades", len(trade_df))
+        m2.metric("Win Rate", f"{wr*100:.0f}%")
+        m3.metric("Avg Return", f"{avg:+.2f}%")
+        m4.metric("Total P&L", f"${tot:+.2f}")
+        best = trade_df["ret_pct"].max()
+        m5.metric("Best Trade", f"{best:+.2f}%")
+
+    # Trade log table
+    display_cols = [c for c in ["closed_at","symbol","entry_price","exit_price",
+                                 "ret_pct","pnl_usdt","exit_reason","entry_fz","entry_oiz"]
+                    if c in trade_df.columns]
+    st.dataframe(
+        trade_df[display_cols].sort_values("closed_at", ascending=False).style.format({
+            "entry_price":  "${:.4f}",
+            "exit_price":   "${:.4f}",
+            "ret_pct":      "{:+.2f}%",
+            "pnl_usdt":     "${:+.2f}",
+            "entry_fz":     "{:.2f}",
+            "entry_oiz":    "{:.2f}",
+        }, na_rep="—"),
+        use_container_width=True,
+        height=400,
+    )
